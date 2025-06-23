@@ -1,19 +1,25 @@
 #![no_std]
 #![no_main]
 
+mod maple;
+use defmt_rtt as _;
+use heapless::Vec;
+use maple::MaplePacket;
+use panic_probe as _;
+
 use cortex_m_rt::entry;
-use nb::block;
+// use nb::block;
 
-use panic_halt as _;
+// use panic_halt as _;
 
-use nrf52840_dk_bsp::{
-    Board,
-    hal::{
-        prelude::*,
-        timer::{self, Timer},
-    },
-};
-use rtt_target::{rprintln, rtt_init_print};
+// use nrf52840_dk_bsp::{
+//     Board,
+//     hal::{
+//         prelude::*,
+//         timer::{self, Timer},
+//     },
+// };
+// use rtt_target::{rprintln, rtt_init_print};
 
 const MAX_DEVICES: usize = 1;
 
@@ -21,28 +27,25 @@ const MAPLE_HOST_ADDRESSES: u8 = 0x00;
 
 #[entry]
 fn main() -> ! {
-    // Board Support Package
-    // A crate that knows board layout, layer on top of
-    let mut nrf52 = Board::take().unwrap();
+    defmt::info!("Starting mock Maple bus cycle..");
 
-    let mut timer = Timer::new(nrf52.TIMER0);
+    let packet = MaplePacket {
+        sender: MapleDevice::Controller,
+        recipient: MapleDevice::Console,
+        command: MapleCommand::DeviceInfo,
+        payload: Vec::from_slice(&[0xAABBCCDD]).unwrap(),
+    };
 
-    rtt_init_print!();
-    rprintln!("Hello, Dreamcast BLE Adapter!");
+    // defmt::info!("Built test packet: {:?}", packet);
+
+    let mut bus = MockMapleBus::new();
+
+    let now_us = 1000;
+    let status = bus.process_events(now_us);
+
+    defmt::info!("Bus status after processing: {:?}", status);
 
     loop {
-        rprintln!("looping...");
-        nrf52.leds.led_2.enable();
-        delay(&mut timer, 350_000); // 250ms
-        nrf52.leds.led_2.disable();
-        delay(&mut timer, 1_000_000);
+        cortex_m::asm::wfi();
     }
-}
-
-fn delay<T>(timer: &mut Timer<T>, cycles: u32)
-where
-    T: timer::Instance,
-{
-    timer.start(cycles);
-    let _ = block!(timer.wait());
 }

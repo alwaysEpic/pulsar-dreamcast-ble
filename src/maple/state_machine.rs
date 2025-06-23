@@ -1,4 +1,10 @@
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg(debug_assertions)]
+use nrf52840_dk_bsp::embedded_hal::timer;
+
+use crate::maple::{MaplePacket, bus::MapleBus};
+use defmt_rtt as _;
+
+#[derive(Debug, Clone, Copy, PartialEq, defmt::Format)]
 pub enum MapleState {
     Idle,
     WaitingForCommand,
@@ -24,30 +30,31 @@ impl MapleController {
         match self.state {
             MapleState::Idle => {
                 if self.detect_start_signal() {
-                    next_state(MapleState::WaitingForCommand);
+                    self.next_state(MapleState::WaitingForCommand);
                 }
             }
             MapleState::WaitingForCommand => {
                 if self.has_timed_out(now_us) {
-                    next_state(MapleState::Error);
+                    self.next_state(MapleState::Error);
                 } else if self.command_ready() {
-                    next_state(MapleState::Receiving);
+                    self.next_state(MapleState::Receiving);
                 }
             }
             MapleState::Receiving => {
                 if self.receive_success() {
-                    next_state(MapleState::Responding);
+                    self.next_state(MapleState::Responding);
                 } else {
-                    next_state(MapleState::Error);
+                    self.next_state(MapleState::Error);
                 }
             }
             MapleState::Responding => {
-                self.send_response();
-                next_state(MapleState::Idle);
+                let packet = MaplePacket::default();
+                MapleBus::write(self, &packet, false, 0);
+                self.next_state(MapleState::Idle);
             }
             MapleState::Error => {
                 self.reset_bus();
-                next_state(MapleState::Idle);
+                self.next_state(MapleState::Idle);
             }
         }
     }
@@ -70,14 +77,14 @@ impl MapleController {
     }
 
     fn has_timed_out(&self, now_us: u64) -> bool {
-        now_us - self.last_transition_time > 1000 // for example
+        now_us - self.last_transaction_time > 1000 // for example
     }
 
     fn next_state(&mut self, next: MapleState) {
         #[cfg(debug_assertions)]
-        log_transaction(self.state, next, timer.read());
+        Self::log_transaction(&self, self.state, next, 0);
         self.state = next;
-        self.last_transaction_time = time.read();
+        self.last_transaction_time = 0;
     }
 
     fn log_transaction(&self, prev: MapleState, next: MapleState, now_us: u64) {
