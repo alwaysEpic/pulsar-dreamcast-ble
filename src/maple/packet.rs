@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Some methods for future use
+
 use heapless::Vec;
 
 /// Represents a Maple Bus packet ready to send or parse.
@@ -28,7 +30,7 @@ impl MaplePacket {
         ((self.command as u32) << 24)      // Byte 3 = command
             | ((self.recipient as u32) << 16) // Byte 2 = recipient
             | ((self.sender as u32) << 8)     // Byte 1 = sender
-            | (num_words & 0xFF)              // Byte 0 = length
+            | (num_words & 0xFF) // Byte 0 = length
     }
 
     /// Computes the CRC over the frame and payload.
@@ -76,10 +78,10 @@ impl MaplePacket {
             return None;
         }
 
-        let command = ((frame >> 24) & 0xFF) as u8;    // Byte 3
+        let command = ((frame >> 24) & 0xFF) as u8; // Byte 3
         let recipient = ((frame >> 16) & 0xFF) as u8; // Byte 2
-        let sender = ((frame >> 8) & 0xFF) as u8;     // Byte 1
-        let length = (frame & 0xFF) as usize;         // Byte 0
+        let sender = ((frame >> 8) & 0xFF) as u8; // Byte 1
+        let length = (frame & 0xFF) as usize; // Byte 0
 
         if words.len() < length + 2 {
             return None;

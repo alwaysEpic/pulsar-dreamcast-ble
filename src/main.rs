@@ -7,25 +7,20 @@ use nb::block;
 
 use panic_halt as _;
 
-use nrf52840_dk_bsp::{
-    hal::{
-        prelude::*,
-        timer::{self, Timer},
-        gpio::{p0::Parts as P0Parts, Level},
-        pac,
-    },
+use nrf52840_dk_bsp::hal::{
+    gpio::{Level, p0::Parts as P0Parts},
+    pac,
+    prelude::*,
+    timer::{self, Timer},
 };
 
 use rtt_target::{rprintln, rtt_init_print};
 
 // Maple Dependencies
 mod maple;
-mod board;
-mod config;
-mod state;
 
-use crate::maple::{MapleBusGpio, MapleHost};
 use crate::maple::host::MapleResult;
+use crate::maple::{MapleBusGpio, MapleHost};
 
 #[entry]
 fn main() -> ! {
@@ -49,9 +44,9 @@ fn main() -> ! {
 
     // Blink LED1 to show we're starting
     for _ in 0..3 {
-        led1.set_low();  // LED on
+        let _ = led1.set_low(); // LED on
         delay(&mut timer, 100_000);
-        led1.set_high(); // LED off
+        let _ = led1.set_high(); // LED off
         delay(&mut timer, 100_000);
     }
 
@@ -98,21 +93,21 @@ fn main() -> ! {
         MapleResult::Ok(info) => {
             rprintln!("Controller detected!");
             rprintln!("  Functions: 0x{:08X}", info.functions);
-            led2.set_high(); // LED2 off
-            led3.set_low();  // LED3 on = success
+            let _ = led2.set_high(); // LED2 off
+            let _ = led3.set_low(); // LED3 on = success
         }
         MapleResult::Timeout => {
             rprintln!("No response from controller (timeout)");
-            led2.set_high();
-            led4.set_low(); // LED4 on = error
+            let _ = led2.set_high();
+            let _ = led4.set_low(); // LED4 on = error
         }
         MapleResult::CrcError => {
             rprintln!("CRC error in response");
-            led4.set_low();
+            let _ = led4.set_low();
         }
         MapleResult::UnexpectedResponse(cmd) => {
             rprintln!("Unexpected response: 0x{:02X}", cmd);
-            led4.set_low();
+            let _ = led4.set_low();
         }
     }
 

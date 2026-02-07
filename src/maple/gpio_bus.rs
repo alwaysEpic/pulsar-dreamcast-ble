@@ -9,6 +9,8 @@
 //! - 500ns per phase = 2Mbps
 //! - Idle state: SDCKA HIGH, SDCKB LOW
 
+#![allow(dead_code)] // Some methods for real-time edge detection (alternative to bulk sampling)
+
 use crate::maple::MaplePacket;
 use core::sync::atomic::{Ordering, compiler_fence};
 use heapless::Vec;
@@ -23,26 +25,10 @@ static mut SAMPLE_BUFFER: [u32; 24576] = [0; 24576];
 const PIN_A_MASK: u32 = 1 << 5; // SDCKA on P0.05
 const PIN_B_MASK: u32 = 1 << 6; // SDCKB on P0.06
 
-#[inline(always)]
-fn read_pins_fast() -> (bool, bool) {
-    let p0 = unsafe { &*P0::ptr() };
-    let val = p0.in_.read().bits();
-    ((val & PIN_A_MASK) != 0, (val & PIN_B_MASK) != 0)
-}
-
 /// ~500ns delay at 64MHz
 #[inline(always)]
 fn delay_half_bit() {
     for _ in 0..32 {
-        cortex_m::asm::nop();
-    }
-    compiler_fence(Ordering::SeqCst);
-}
-
-/// ~1µs delay at 64MHz
-#[inline(always)]
-fn delay_full_bit() {
-    for _ in 0..64 {
         cortex_m::asm::nop();
     }
     compiler_fence(Ordering::SeqCst);
@@ -63,14 +49,6 @@ impl MapleBusGpioOut {
         Self { sdcka, sdckb }
     }
 
-    /// Set bus to neutral state (both lines HIGH) before transmission.
-    /// This is the required state before the start pattern.
-    #[inline(always)]
-    pub fn set_neutral(&mut self) {
-        let _ = self.sdcka.set_high();
-        let _ = self.sdckb.set_high();
-    }
-
     /// Set bus to idle state (SDCKA high, SDCKB low).
     /// This is the state after transmission completes.
     #[inline(always)]
@@ -81,11 +59,8 @@ impl MapleBusGpioOut {
 
     /// Send the start/sync pattern.
     ///
-    /// Pattern per gmanmodz maple_protocol.cpp:
-    /// 1. SDCKA immediately LOW
-    /// 2. SDCKB pulsed 4 times (HIGH-LOW cycle) while SDCKA stays LOW
-    /// 3. SDCKB HIGH, then SDCKA HIGH, then SDCKB LOW
-    /// Final state: SDCKA=HIGH, SDCKB=LOW (ready for first bit)
+    /// Pattern: SDCKA LOW, SDCKB pulsed 4 times, then SDCKB HIGH, SDCKA HIGH, SDCKB LOW.
+    /// Final state: SDCKA=HIGH, SDCKB=LOW (ready for first bit).
     pub fn send_start_pattern(&mut self) {
         // 1. SDCKA immediately LOW (no initial HIGH state)
         let _ = self.sdcka.set_low();
@@ -681,8 +656,8 @@ impl MapleBusGpio<Pin<Input<PullUp>>, Pin<Input<PullUp>>> {
             if a && b_transitions >= 3 {
                 // Valid start pattern - sample IMMEDIATELY (no return delay!)
                 compiler_fence(Ordering::SeqCst);
-                for i in 0..24576 {
-                    samples[i] = p0_in.read().bits();
+                for sample in samples.iter_mut() {
+                    *sample = p0_in.read().bits();
                 }
                 compiler_fence(Ordering::SeqCst);
                 return (true, wait_cycles, b_transitions, 24576, unsafe {
@@ -713,8 +688,8 @@ impl MapleBusGpio<Pin<Input<PullUp>>, Pin<Input<PullUp>>> {
         };
 
         compiler_fence(Ordering::SeqCst);
-        for i in 0..24576 {
-            samples[i] = p0_in.read().bits();
+        for sample in samples.iter_mut() {
+            *sample = p0_in.read().bits();
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -752,9 +727,9 @@ impl MapleBusGpio<Pin<Input<PullUp>>, Pin<Input<PullUp>>> {
         let mut idle_count: usize = 0;
         let mut seen_first_a_fall = false;
 
-        for i in start_idx..count {
-            let a = (samples[i] & PIN_A_MASK) != 0;
-            let b = (samples[i] & PIN_B_MASK) != 0;
+        for &sample in &samples[start_idx..count] {
+            let a = (sample & PIN_A_MASK) != 0;
+            let b = (sample & PIN_B_MASK) != 0;
 
             // Gap detection: idle = A HIGH, B LOW
             if a && !b {
@@ -770,13 +745,13 @@ impl MapleBusGpio<Pin<Input<PullUp>>, Pin<Input<PullUp>>> {
             // A falls -> sample B (Phase 1)
             if last_a && !a {
                 seen_first_a_fall = true;
-                let _ = bits.push((samples[i] & PIN_B_MASK != 0) as u8);
+                let _ = bits.push(b as u8);
                 a_falls += 1;
             }
             // B falls -> sample A (Phase 2), but only after first A fall
             else if last_b && !b {
                 if seen_first_a_fall {
-                    let _ = bits.push((samples[i] & PIN_A_MASK != 0) as u8);
+                    let _ = bits.push(a as u8);
                 }
                 b_falls += 1;
             }
@@ -799,20 +774,20 @@ impl MapleBusGpio<Pin<Input<PullUp>>, Pin<Input<PullUp>>> {
         let mut last_a = (samples[0] & PIN_A_MASK) != 0;
         let mut last_b = (samples[0] & PIN_B_MASK) != 0;
 
-        for i in 1..count {
+        for (i, &sample) in samples[1..count].iter().enumerate() {
             if edges.len() >= max_edges {
                 break;
             }
-            let a = (samples[i] & PIN_A_MASK) != 0;
-            let b = (samples[i] & PIN_B_MASK) != 0;
+            let a = (sample & PIN_A_MASK) != 0;
+            let b = (sample & PIN_B_MASK) != 0;
 
-            // Falling edge on A
+            // Falling edge on A (i+1 because we started at index 1)
             if last_a && !a {
-                let _ = edges.push((i, 'A', b)); // index, which line fell, data sampled
+                let _ = edges.push((i + 1, 'A', b));
             }
             // Falling edge on B
             if last_b && !b {
-                let _ = edges.push((i, 'B', a));
+                let _ = edges.push((i + 1, 'B', a));
             }
 
             last_a = a;

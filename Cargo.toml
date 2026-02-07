@@ -13,29 +13,16 @@ nrf52840-pac = "0.12.2"
 panic-halt = "1.0.0"
 nb = "1.1.0"
 rtt-target = { version = "0.3.1", features = ["cortex-m"] }
-heapless = "0.8.0"  # ✅ Removed `features = ["defmt-03"]`
-
-# Nothing required here unless you want separate test-time features
-# cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
-# cortex-m-rt = ">=0.6, <0.9"
-# embedded-hal = "1.0.0"
-# nrf52840-dk-bsp = "0.2.0"
-# nrf52840-hal = "0.18.0"
-# nrf52840-pac = "0.12.2"
-# panic-halt = "1.0.0"
-# nb = "1.1.0"
-# rtt-target = "0.6.1"
-# defmt = { version = "0.3.5", features = ["encoding-rzcobs"] }
-# defmt-rtt = "0.4.0"
-# panic-probe = { version = "1.0.0", features = ["print-defmt"] }
-# heapless = { version = "0.8.0", features = ["defmt-03"] }
-
-# [dev-dependencies]
-# cortex-m-rt = ">=0.6, <0.9"
-# nb = "1.1.0"
-# panic-halt = "1.0.0"
-
+heapless = "0.8.0"
 
 [features]
 rt = ["nrf52840-hal/rt"]
 default = ["rt"]
+
+[[example]]
+name = "blinky"
+path = "examples/blinky.rs"
+
+[[example]]
+name = "maple_device_info"
+path = "examples/maple_device_info.rs"

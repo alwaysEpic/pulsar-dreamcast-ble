@@ -58,15 +58,31 @@ The goal is to **retain original hardware feel** while enabling **modern wireles
 - [x] RTT debug logs using `rtt-target`
 - [x] Modular structure for easy hardware simulation and swapping
 - [x] Boot and timer setup on `nRF52840-DK`
+- [x] **Maple Bus TX** - Send packets via GPIO bit-banging
+- [x] **Maple Bus RX** - Bulk sampling decoder with phase alignment
+- [x] **Device Info Request/Response** - Full transaction with CRC verification
+- [x] Start pattern detection (handles false starts)
+- [x] Static 96KB sample buffer for reliable 2Mbps capture
 
 ---
 
 ## 🔜 Next Goals
 
-- [ ] Implement real MapleBus read/write via GPIO + interrupt/polling
-- [ ] Integrate BLE pairing when a button is held
-- [ ] Send controller state over BLE to host
-- [ ] (Optional) Support PC HID over BLE or USB
+### Maple Bus - Controller Input
+- [ ] Get Condition (0x09) - read buttons/sticks
+- [ ] 60Hz polling loop
+- [ ] Parse analog triggers and joystick values
+
+### BLE Integration
+- [ ] BLE softdevice initialization
+- [ ] GATT service for controller state
+- [ ] Expose buttons/sticks as BLE characteristics
+- [ ] BLE pairing on button hold
+
+### Optional / Future
+- [ ] PC HID over BLE or USB
+- [ ] VMU support (read/write memory card)
+- [ ] Rumble pack support
 
 ---
 
@@ -85,4 +101,6 @@ The goal is to **retain original hardware feel** while enabling **modern wireles
 - Stick to single-core critical-section features (valid for Cortex-M4)
 - Modular design enables mocking/testing and eventual HAL swap
 - `heapless` used to support no_std, deterministic stack-allocated buffers
-- Interrupt usage TBD — likely needed for real-time bus sampling
+- **Bulk sampling approach** for RX - capture all GPIO samples, decode later
+- **Static buffers** to avoid stack allocation delays in timing-critical code
+- No interrupts needed - polling loop with bulk sampling handles 2Mbps reliably

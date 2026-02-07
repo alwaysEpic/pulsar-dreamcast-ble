@@ -2,12 +2,12 @@
 #![no_main]
 
 use cortex_m_rt::entry;
-use panic_halt as _;
 use nrf52840_dk_bsp::hal::{
-    prelude::*,
-    gpio::{p0::Parts as P0Parts, Level},
+    gpio::{Level, p0::Parts as P0Parts},
     pac,
+    prelude::*,
 };
+use panic_halt as _;
 
 #[entry]
 fn main() -> ! {

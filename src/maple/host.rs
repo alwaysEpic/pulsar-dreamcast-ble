@@ -3,8 +3,10 @@
 //! This module implements the host side of Maple Bus communication,
 //! allowing the adapter to query Dreamcast controllers.
 
-use crate::maple::{MaplePacket, ControllerState};
+#![allow(dead_code)] // Contains get_condition (upcoming feature)
+
 use crate::maple::gpio_bus::MapleBusGpioOut;
+use crate::maple::{ControllerState, MaplePacket};
 use heapless::Vec;
 use rtt_target::rprintln;
 
@@ -120,7 +122,10 @@ impl MapleHost {
     ///
     /// Takes ownership of the bus and returns it along with the result.
     /// GPIO pins change type when switching modes, hence the ownership transfer.
-    pub fn request_device_info(&self, mut bus: MapleBusGpioOut) -> (MapleBusGpioOut, MapleResult<DeviceInfo>) {
+    pub fn request_device_info(
+        &self,
+        mut bus: MapleBusGpioOut,
+    ) -> (MapleBusGpioOut, MapleResult<DeviceInfo>) {
         let packet = MaplePacket {
             sender: addressing::HOST,
             recipient: addressing::PORT_A_MAIN,
@@ -144,18 +149,16 @@ impl MapleHost {
         let result = match response {
             None => MapleResult::Timeout,
             Some(pkt) => {
-                if pkt.command != commands::DEVICE_INFO_RESPONSE {
-                    MapleResult::UnexpectedResponse(pkt.command)
-                } else if pkt.payload.len() < 5 {
+                if pkt.command != commands::DEVICE_INFO_RESPONSE || pkt.payload.len() < 5 {
                     MapleResult::UnexpectedResponse(pkt.command)
                 } else {
-                    let mut info = DeviceInfo::default();
-                    info.functions = pkt.payload[0];
-                    info.sub_functions[0] = pkt.payload[1];
-                    info.sub_functions[1] = pkt.payload[2];
-                    info.sub_functions[2] = pkt.payload[3];
-                    info.region = (pkt.payload[4] >> 24) as u8;
-                    info.direction = (pkt.payload[4] >> 16) as u8;
+                    let info = DeviceInfo {
+                        functions: pkt.payload[0],
+                        sub_functions: [pkt.payload[1], pkt.payload[2], pkt.payload[3]],
+                        region: (pkt.payload[4] >> 24) as u8,
+                        direction: (pkt.payload[4] >> 16) as u8,
+                        ..Default::default()
+                    };
                     MapleResult::Ok(info)
                 }
             }
@@ -167,9 +170,10 @@ impl MapleHost {
     /// Send a Get Condition request to read controller state.
     ///
     /// Takes ownership of the bus and returns it along with the result.
-    pub fn get_condition(&self, mut bus: MapleBusGpioOut) -> (MapleBusGpioOut, MapleResult<ControllerState>) {
-        // Build Get Condition packet
-        // Payload contains the function type we're querying (controller = 0x00000001)
+    pub fn get_condition(
+        &self,
+        mut bus: MapleBusGpioOut,
+    ) -> (MapleBusGpioOut, MapleResult<ControllerState>) {
         let mut payload: Vec<u32, 255> = Vec::new();
         payload.push(functions::CONTROLLER).ok();
 
@@ -180,12 +184,12 @@ impl MapleHost {
             payload,
         };
 
-        // Send packet
+        rprintln!("TX: GetCondition");
         bus.write_packet(&packet);
 
-        // Switch to input mode and read response
+        // Switch to input mode and read response using bulk sampling
         let mut bus_in = bus.into_input();
-        let response = bus_in.read_packet(self.timeout_cycles);
+        let response = bus_in.read_packet_bulk(self.timeout_cycles);
 
         // Switch back to output mode
         let bus_out = bus_in.into_output();

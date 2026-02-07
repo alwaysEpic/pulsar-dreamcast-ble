@@ -2,6 +2,8 @@
 //!
 //! Holds the parsed state from a Get Condition (0x09) response.
 
+#![allow(dead_code)] // Used by get_condition (upcoming feature)
+
 /// Represents the state of a standard Dreamcast controller.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ControllerState {
@@ -37,8 +39,8 @@ pub struct ButtonState {
     pub z: bool,
     pub y: bool,
     pub x: bool,
-    pub d: bool,  // Second D button (rare)
-    // Bits 12-15 are typically unused on standard controllers
+    pub d: bool, // Second D button (rare)
+                 // Bits 12-15 are typically unused on standard controllers
 }
 
 impl ButtonState {
@@ -47,26 +49,35 @@ impl ButtonState {
     /// Buttons are active LOW in the protocol, so we invert.
     pub fn from_raw(raw: u16) -> Self {
         Self {
-            c:          (raw & (1 << 0)) == 0,
-            b:          (raw & (1 << 1)) == 0,
-            a:          (raw & (1 << 2)) == 0,
-            start:      (raw & (1 << 3)) == 0,
-            dpad_up:    (raw & (1 << 4)) == 0,
-            dpad_down:  (raw & (1 << 5)) == 0,
-            dpad_left:  (raw & (1 << 6)) == 0,
+            c: (raw & (1 << 0)) == 0,
+            b: (raw & (1 << 1)) == 0,
+            a: (raw & (1 << 2)) == 0,
+            start: (raw & (1 << 3)) == 0,
+            dpad_up: (raw & (1 << 4)) == 0,
+            dpad_down: (raw & (1 << 5)) == 0,
+            dpad_left: (raw & (1 << 6)) == 0,
             dpad_right: (raw & (1 << 7)) == 0,
-            z:          (raw & (1 << 8)) == 0,
-            y:          (raw & (1 << 9)) == 0,
-            x:          (raw & (1 << 10)) == 0,
-            d:          (raw & (1 << 11)) == 0,
+            z: (raw & (1 << 8)) == 0,
+            y: (raw & (1 << 9)) == 0,
+            x: (raw & (1 << 10)) == 0,
+            d: (raw & (1 << 11)) == 0,
         }
     }
 
     /// Returns true if any button is currently pressed.
     pub fn any_pressed(&self) -> bool {
-        self.c || self.b || self.a || self.start
-            || self.dpad_up || self.dpad_down || self.dpad_left || self.dpad_right
-            || self.z || self.y || self.x || self.d
+        self.c
+            || self.b
+            || self.a
+            || self.start
+            || self.dpad_up
+            || self.dpad_down
+            || self.dpad_left
+            || self.dpad_right
+            || self.z
+            || self.y
+            || self.x
+            || self.d
     }
 }
 
@@ -142,9 +153,9 @@ mod tests {
     #[test]
     fn test_controller_state_parse() {
         let payload = [
-            0x00000001,  // Function type: controller
-            0xFFFB0000,  // A button pressed (bit 2 = 0), lower 16 unused
-            0x80804080,  // R=128, L=64, X=64, Y=128
+            0x00000001, // Function type: controller
+            0xFFFB0000, // A button pressed (bit 2 = 0), lower 16 unused
+            0x80804080, // R=128, L=64, X=64, Y=128
         ];
 
         let state = ControllerState::from_payload(&payload).unwrap();
