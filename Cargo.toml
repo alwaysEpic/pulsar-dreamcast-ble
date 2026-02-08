@@ -26,6 +26,9 @@ embassy-futures = { git = "https://github.com/embassy-rs/embassy" }
 nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice", features = ["s140", "nrf52840", "ble-peripheral", "ble-gatt-server", "ble-sec", "critical-section-impl"] }
 nrf-softdevice-s140 = { git = "https://github.com/embassy-rs/nrf-softdevice" }
 
+# Flash storage
+embedded-storage-async = "0.4.1"
+
 # RTT debugging
 rtt-target = { version = "0.3.1", features = ["cortex-m"] }
 
