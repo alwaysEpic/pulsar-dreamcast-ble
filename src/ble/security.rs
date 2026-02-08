@@ -22,6 +22,7 @@ struct Peer {
 pub struct Bonder {
     peer: Cell<Option<Peer>>,
     sys_attrs: RefCell<Vec<u8, 64>>,
+    sys_attrs_len: Cell<usize>,  // Track actual saved length
 }
 
 impl Bonder {
@@ -29,6 +30,7 @@ impl Bonder {
         Self {
             peer: Cell::new(None),
             sys_attrs: RefCell::new(Vec::new()),
+            sys_attrs_len: Cell::new(0),
         }
     }
 }
@@ -62,6 +64,7 @@ impl SecurityHandler for Bonder {
     ) {
         rprintln!("BLE: Bonded with peer (EDIV=0x{:04X})", master_id.ediv);
         self.sys_attrs.borrow_mut().clear();
+        self.sys_attrs_len.set(0);
         self.peer.set(Some(Peer {
             master_id,
             key,
@@ -86,10 +89,13 @@ impl SecurityHandler for Bonder {
             if peer.peer_id.is_match(conn.peer_address()) {
                 let mut sys_attrs = self.sys_attrs.borrow_mut();
                 let capacity = sys_attrs.capacity();
+                sys_attrs.clear();
                 sys_attrs.resize(capacity, 0).ok();
                 if let Ok(len) = get_sys_attrs(conn, &mut sys_attrs) {
-                    sys_attrs.truncate(len);
+                    self.sys_attrs_len.set(len);
                     rprintln!("BLE: Saved {} bytes of sys_attrs", len);
+                } else {
+                    self.sys_attrs_len.set(0);
                 }
             } else {
                 rprintln!("BLE: Peer address mismatch, not saving sys_attrs");
@@ -102,26 +108,25 @@ impl SecurityHandler for Bonder {
     fn load_sys_attrs(&self, conn: &Connection) {
         let addr = conn.peer_address();
         let attrs = self.sys_attrs.borrow();
+        let saved_len = self.sys_attrs_len.get();
         let is_bonded_peer = self
             .peer
             .get()
             .map(|peer| peer.peer_id.is_match(addr))
             .unwrap_or(false);
 
-        let attrs = if is_bonded_peer {
-            if !attrs.is_empty() {
-                rprintln!("BLE: Loading {} bytes of sys_attrs for bonded peer", attrs.len());
-                Some(attrs.as_slice())
-            } else {
-                rprintln!("BLE: Bonded peer but no stored sys_attrs");
-                None
-            }
+        let attrs_slice = if is_bonded_peer && saved_len > 0 {
+            rprintln!("BLE: Loading {} bytes of sys_attrs for bonded peer", saved_len);
+            Some(&attrs.as_slice()[..saved_len])
+        } else if is_bonded_peer {
+            rprintln!("BLE: Bonded peer but no stored sys_attrs");
+            None
         } else {
             rprintln!("BLE: New peer, no sys_attrs to load");
             None
         };
 
-        if let Err(e) = set_sys_attrs(conn, attrs) {
+        if let Err(e) = set_sys_attrs(conn, attrs_slice) {
             rprintln!("BLE: Failed to set sys_attrs: {:?}", e);
         }
     }
