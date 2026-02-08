@@ -1,23 +1,39 @@
 [package]
 name = "embedded_rust_setup"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
-cortex-m-rt = ">=0.6, <0.9"
+# Core
+cortex-m = { version = "0.7.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
 embedded-hal = "1.0.0"
-nrf52840-dk-bsp = "0.2.0"
-nrf52840-hal = "0.18.0"
-nrf52840-pac = "0.12.2"
+embedded-hal-02 = { package = "embedded-hal", version = "0.2.7" }
 panic-halt = "1.0.0"
 nb = "1.1.0"
-rtt-target = { version = "0.3.1", features = ["cortex-m"] }
 heapless = "0.8.0"
+static_cell = "2.1"
+futures = { version = "0.3", default-features = false }
+
+# Embassy async runtime (git versions for nrf-softdevice compatibility)
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = ["arch-cortex-m", "executor-thread", "embassy-time-driver"] }
+embassy-time = { git = "https://github.com/embassy-rs/embassy" }
+embassy-nrf = { git = "https://github.com/embassy-rs/embassy", features = ["nrf52840", "time-driver-rtc1", "gpiote"] }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy" }
+
+# SoftDevice BLE stack (git for compatibility)
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice", features = ["s140", "nrf52840", "ble-peripheral", "ble-gatt-server", "ble-sec", "critical-section-impl"] }
+nrf-softdevice-s140 = { git = "https://github.com/embassy-rs/nrf-softdevice" }
+
+# RTT debugging
+rtt-target = { version = "0.3.1", features = ["cortex-m"] }
+
+# Note: We use embassy-nrf's peripheral access for everything
+# No legacy HAL to avoid duplicate interrupt vector table
 
 [features]
-rt = ["nrf52840-hal/rt"]
-default = ["rt"]
+default = []
 
 [[example]]
 name = "blinky"

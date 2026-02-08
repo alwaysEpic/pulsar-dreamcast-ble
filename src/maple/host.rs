@@ -3,9 +3,9 @@
 //! This module implements the host side of Maple Bus communication,
 //! allowing the adapter to query Dreamcast controllers.
 
-#![allow(dead_code)] // Contains get_condition (upcoming feature)
+#![allow(dead_code)]
 
-use crate::maple::gpio_bus::MapleBusGpioOut;
+use crate::maple::gpio_bus::MapleBus;
 use crate::maple::{ControllerState, MaplePacket};
 use heapless::Vec;
 use rtt_target::rprintln;
@@ -39,7 +39,6 @@ pub mod functions {
 }
 
 /// Maple Bus addressing.
-/// Port 0, Unit 0 = main controller in port A.
 pub mod addressing {
     /// Host address (the adapter).
     pub const HOST: u8 = 0x00;
@@ -97,8 +96,6 @@ impl Default for DeviceInfo {
 }
 
 /// Maple Bus host controller.
-///
-/// Manages communication with Dreamcast peripherals.
 pub struct MapleHost {
     /// Timeout for waiting for response (in busy-loop cycles).
     pub timeout_cycles: u32,
@@ -108,7 +105,6 @@ impl MapleHost {
     /// Create a new Maple Host with default timeout.
     pub fn new() -> Self {
         Self {
-            // ~1ms timeout at 64MHz
             timeout_cycles: 64_000,
         }
     }
@@ -119,13 +115,7 @@ impl MapleHost {
     }
 
     /// Send a Device Info Request to discover what's connected.
-    ///
-    /// Takes ownership of the bus and returns it along with the result.
-    /// GPIO pins change type when switching modes, hence the ownership transfer.
-    pub fn request_device_info(
-        &self,
-        mut bus: MapleBusGpioOut,
-    ) -> (MapleBusGpioOut, MapleResult<DeviceInfo>) {
+    pub fn request_device_info(&self, bus: &mut MapleBus) -> MapleResult<DeviceInfo> {
         let packet = MaplePacket {
             sender: addressing::HOST,
             recipient: addressing::PORT_A_MAIN,
@@ -136,17 +126,10 @@ impl MapleHost {
         rprintln!("TX: DeviceInfoRequest");
         bus.write_packet(&packet);
 
-        // Switch to input mode - controller will respond after ~60µs
-        let mut bus_in = bus.into_input();
+        // Read response using bulk sampling
+        let response = bus.read_packet_bulk(self.timeout_cycles);
 
-        // Use bulk sampling for more reliable reading
-        let response = bus_in.read_packet_bulk(self.timeout_cycles);
-
-        // Switch back to output mode
-        let bus_out = bus_in.into_output();
-
-        // Parse response
-        let result = match response {
+        match response {
             None => MapleResult::Timeout,
             Some(pkt) => {
                 if pkt.command != commands::DEVICE_INFO_RESPONSE || pkt.payload.len() < 5 {
@@ -162,18 +145,11 @@ impl MapleHost {
                     MapleResult::Ok(info)
                 }
             }
-        };
-
-        (bus_out, result)
+        }
     }
 
     /// Send a Get Condition request to read controller state.
-    ///
-    /// Takes ownership of the bus and returns it along with the result.
-    pub fn get_condition(
-        &self,
-        mut bus: MapleBusGpioOut,
-    ) -> (MapleBusGpioOut, MapleResult<ControllerState>) {
+    pub fn get_condition(&self, bus: &mut MapleBus) -> MapleResult<ControllerState> {
         let mut payload: Vec<u32, 255> = Vec::new();
         payload.push(functions::CONTROLLER).ok();
 
@@ -184,40 +160,23 @@ impl MapleHost {
             payload,
         };
 
-        // rprintln!("TX: GetCondition");
         bus.write_packet(&packet);
 
-        // Switch to input mode and read response using bulk sampling
-        let mut bus_in = bus.into_input();
-        let response = bus_in.read_packet_bulk(self.timeout_cycles);
+        let response = bus.read_packet_bulk(self.timeout_cycles);
 
-        // Switch back to output mode
-        let bus_out = bus_in.into_output();
-
-        // Parse response
-        let result = match response {
+        match response {
             None => MapleResult::Timeout,
             Some(pkt) => {
                 if pkt.command != commands::CONDITION_RESPONSE {
                     MapleResult::UnexpectedResponse(pkt.command)
                 } else {
-                    // Debug: print raw payload words
-                    // if pkt.payload.len() >= 3 {
-                    //     rprintln!(
-                    //         "w1={:08X} w2={:08X}",
-                    //         pkt.payload[1],
-                    //         pkt.payload[2]
-                    //     );
-                    // }
                     match ControllerState::from_payload(&pkt.payload) {
                         Some(state) => MapleResult::Ok(state),
                         None => MapleResult::UnexpectedResponse(pkt.command),
                     }
                 }
             }
-        };
-
-        (bus_out, result)
+        }
     }
 }
 

@@ -79,9 +79,130 @@ impl ButtonState {
             || self.x
             || self.d
     }
+
+    /// Convert button state back to raw u16 format for BLE transmission.
+    /// Bit is set (1) when button is pressed (opposite of Maple protocol).
+    pub fn to_raw(&self) -> u16 {
+        let mut raw: u16 = 0;
+        if self.c {
+            raw |= 1 << 0;
+        }
+        if self.b {
+            raw |= 1 << 1;
+        }
+        if self.a {
+            raw |= 1 << 2;
+        }
+        if self.start {
+            raw |= 1 << 3;
+        }
+        if self.dpad_up {
+            raw |= 1 << 4;
+        }
+        if self.dpad_down {
+            raw |= 1 << 5;
+        }
+        if self.dpad_left {
+            raw |= 1 << 6;
+        }
+        if self.dpad_right {
+            raw |= 1 << 7;
+        }
+        if self.z {
+            raw |= 1 << 8;
+        }
+        if self.y {
+            raw |= 1 << 9;
+        }
+        if self.x {
+            raw |= 1 << 10;
+        }
+        if self.d {
+            raw |= 1 << 11;
+        }
+        raw
+    }
 }
 
 impl ControllerState {
+    /// Serialize controller state to 12-byte BLE characteristic format (legacy).
+    #[allow(dead_code)]
+    pub fn to_ble_bytes(&self) -> [u8; 12] {
+        let buttons_raw = self.buttons.to_raw();
+        [
+            (buttons_raw & 0xFF) as u8,
+            (buttons_raw >> 8) as u8,
+            self.trigger_l,
+            self.trigger_r,
+            self.stick_x,
+            self.stick_y,
+            0, 0, 0, 0, 0, 0,
+        ]
+    }
+
+    /// Convert to HID Gamepad report.
+    ///
+    /// Mapping:
+    /// - Dreamcast A/B/X/Y → Buttons 0-3
+    /// - Dreamcast Start → Button 7
+    /// - Dreamcast D-pad → Buttons 12-15 (Up, Down, Left, Right)
+    /// - Dreamcast analog stick → Left stick (signed, -127 to 127)
+    /// - Dreamcast L/R triggers → Trigger axes (signed, -127 to 127)
+    /// - Right stick always centered (Dreamcast doesn't have one)
+    pub fn to_gamepad_report(&self) -> crate::ble::hid::GamepadReport {
+        use crate::ble::hid::{buttons, GamepadReport};
+
+        let mut btns: u16 = 0;
+        if self.buttons.a {
+            btns |= buttons::A;
+        }
+        if self.buttons.b {
+            btns |= buttons::B;
+        }
+        if self.buttons.x {
+            btns |= buttons::X;
+        }
+        if self.buttons.y {
+            btns |= buttons::Y;
+        }
+        if self.buttons.start {
+            btns |= buttons::START;
+        }
+        // D-pad as buttons 12-15
+        if self.buttons.dpad_up {
+            btns |= buttons::DPAD_UP;
+        }
+        if self.buttons.dpad_down {
+            btns |= buttons::DPAD_DOWN;
+        }
+        if self.buttons.dpad_left {
+            btns |= buttons::DPAD_LEFT;
+        }
+        if self.buttons.dpad_right {
+            btns |= buttons::DPAD_RIGHT;
+        }
+
+        // Convert unsigned 0-255 (center=128) to signed -127 to 127 (center=0)
+        let left_x = (self.stick_x as i16 - 128).clamp(-127, 127) as i8;
+        let left_y = (self.stick_y as i16 - 128).clamp(-127, 127) as i8;
+
+        // Convert triggers: 0-255 → -127 to 127
+        // Dreamcast: 0=pressed, 255=released (after inversion in from_payload)
+        // We need: -127=released, 127=pressed, so invert the mapping
+        let left_trigger = (128i16 - self.trigger_l as i16).clamp(-127, 127) as i8;
+        let right_trigger = (128i16 - self.trigger_r as i16).clamp(-127, 127) as i8;
+
+        GamepadReport {
+            buttons: btns,
+            left_x,
+            left_y,
+            right_x: 0,  // Centered - Dreamcast has no right stick
+            right_y: 0,
+            left_trigger,
+            right_trigger,
+        }
+    }
+
     /// Parse controller state from a Get Condition response payload.
     ///
     /// Expected payload format (from command 0x09 response):
@@ -117,10 +238,11 @@ impl ControllerState {
         let buttons = ButtonState::from_raw(buttons_raw);
 
         // Word 2: Analog sticks
-        // Wire sends: [stick_x, stick_y, stick2_x, stick2_y]
+        // Format: [unused, unused, stick_x, stick_y] (main stick in upper 16 bits)
+        // Bytes 0-1 are for secondary stick (stays 0x80 on standard controller)
         let analog_word = payload[2];
-        let stick_x = (analog_word & 0xFF) as u8;
-        let stick_y = ((analog_word >> 8) & 0xFF) as u8;
+        let stick_x = ((analog_word >> 16) & 0xFF) as u8;
+        let stick_y = ((analog_word >> 24) & 0xFF) as u8;
 
         Some(Self {
             buttons,

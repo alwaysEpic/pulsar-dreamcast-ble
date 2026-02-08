@@ -1,79 +1,125 @@
 #![no_std]
 #![no_main]
 
-use cortex_m_rt::entry;
-use nb::block;
+use embassy_executor::Spawner;
+use embassy_nrf::gpio::{Flex, Level, Output, OutputDrive};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer};
+use nrf_softdevice::ble::gatt_server;
+use nrf_softdevice::ble::security::SecurityHandler;
+use nrf_softdevice::Softdevice;
 use panic_halt as _;
-
-use nrf52840_dk_bsp::hal::{
-    gpio::{Level, p0::Parts as P0Parts},
-    pac,
-    prelude::*,
-    timer::{self, Timer},
-};
-
 use rtt_target::{rprintln, rtt_init_print};
+use static_cell::StaticCell;
 
+mod ble;
+mod board;
 mod maple;
 
+use crate::ble::{init_softdevice, Bonder, GamepadServer};
+use crate::ble::hid::{GamepadServerEvent, HidServiceEvent};
 use crate::maple::host::MapleResult;
-use crate::maple::{ControllerState, MapleBusGpio, MapleHost};
+use crate::maple::{ControllerState, MapleBus, MapleHost};
 
-#[entry]
-fn main() -> ! {
+/// Shared controller state between maple and BLE tasks.
+static CONTROLLER_STATE: Signal<CriticalSectionRawMutex, ControllerState> = Signal::new();
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
     rtt_init_print!();
     rprintln!("Dreamcast Controller Adapter Starting...");
 
-    let periph = pac::Peripherals::take().unwrap();
-    let p0 = P0Parts::new(periph.P0);
-    let mut timer = Timer::new(periph.TIMER0);
+    // Initialize Embassy with interrupt priorities that don't conflict with SoftDevice
+    // SoftDevice uses priority 0-1, so we use P2 for our peripherals
+    let mut config = embassy_nrf::config::Config::default();
+    config.gpiote_interrupt_priority = embassy_nrf::interrupt::Priority::P2;
+    config.time_interrupt_priority = embassy_nrf::interrupt::Priority::P2;
+    let p = embassy_nrf::init(config);
+    rprintln!("Embassy initialized");
+
+    // Initialize SoftDevice
+    rprintln!("Initializing SoftDevice...");
+    let sd = init_softdevice();
+    rprintln!("SoftDevice initialized");
+
+    // Create HID Gamepad GATT server
+    let server = match GamepadServer::new(sd) {
+        Ok(s) => s,
+        Err(e) => {
+            rprintln!("Failed to create GATT server: {:?}", e);
+            loop {
+                cortex_m::asm::wfi();
+            }
+        }
+    };
+    static SERVER: StaticCell<GamepadServer> = StaticCell::new();
+    let server = SERVER.init(server);
+
+    // Initialize HID service values
+    if let Err(e) = server.init() {
+        rprintln!("Failed to init HID service: {:?}", e);
+    }
+
+    // Spawn the SoftDevice runner task
+    match softdevice_task(sd) {
+        Ok(token) => {
+            spawner.spawn(token);
+            rprintln!("SoftDevice task spawned");
+        }
+        Err(_) => rprintln!("Failed to create softdevice_task"),
+    }
+
+    // Create bonder for security/pairing
+    static BONDER: StaticCell<Bonder> = StaticCell::new();
+    let bonder = BONDER.init(Bonder::new());
+
+    // Spawn BLE task
+    match ble_task(sd, server, bonder) {
+        Ok(token) => {
+            spawner.spawn(token);
+            rprintln!("BLE task spawned");
+        }
+        Err(_) => rprintln!("Failed to create ble_task"),
+    }
 
     // LEDs (active low on DK)
-    let mut led1 = p0.p0_13.into_push_pull_output(Level::High).degrade();
-    let mut led2 = p0.p0_14.into_push_pull_output(Level::High).degrade();
-    let mut led3 = p0.p0_15.into_push_pull_output(Level::High).degrade();
-    let mut led4 = p0.p0_16.into_push_pull_output(Level::High).degrade();
+    let mut led1 = Output::new(p.P0_13, Level::High, OutputDrive::Standard);
+    let mut led2 = Output::new(p.P0_14, Level::High, OutputDrive::Standard);
+    let mut led3 = Output::new(p.P0_15, Level::High, OutputDrive::Standard);
+    let mut led4 = Output::new(p.P0_16, Level::High, OutputDrive::Standard);
 
     // Startup blink
     for _ in 0..3 {
-        let _ = led1.set_low();
-        delay(&mut timer, 100_000);
-        let _ = led1.set_high();
-        delay(&mut timer, 100_000);
+        led1.set_low();
+        Timer::after(Duration::from_millis(100)).await;
+        led1.set_high();
+        Timer::after(Duration::from_millis(100)).await;
     }
 
-    // Check initial bus state
-    let test_a = p0.p0_05.into_pullup_input();
-    let test_b = p0.p0_06.into_pullup_input();
-    delay(&mut timer, 10_000);
-    let a = test_a.is_high().unwrap_or(false);
-    let b = test_b.is_high().unwrap_or(false);
-    rprintln!("Bus state: A={} B={}", a as u8, b as u8);
-
-    // Set up Maple Bus
-    let sdcka = test_a.into_push_pull_output(Level::High).degrade();
-    let sdckb = test_b.into_push_pull_output(Level::Low).degrade();
-    let mut bus = MapleBusGpio::new(sdcka, sdckb);
+    // Set up Maple Bus using Flex pins
+    let sdcka = Flex::new(p.P0_05);
+    let sdckb = Flex::new(p.P0_06);
+    let mut bus = MapleBus::new(sdcka, sdckb);
     let host = MapleHost::new();
 
     // Detect controller
     rprintln!("Detecting controller...");
-    let _ = led2.set_low();
+    led2.set_low();
 
-    let (new_bus, result) = host.request_device_info(bus);
-    bus = new_bus;
+    let result = host.request_device_info(&mut bus);
 
     let controller_detected = match &result {
         MapleResult::Ok(info) => {
             rprintln!("Controller found! Functions: 0x{:08X}", info.functions);
-            let _ = led2.set_high();
-            let _ = led3.set_low();
+            led2.set_high();
+            led3.set_low();
             true
         }
         _ => {
             rprintln!("No controller detected");
-            let _ = led2.set_high();
-            let _ = led4.set_low();
+            led2.set_high();
+            led4.set_low();
             false
         }
     };
@@ -95,19 +141,18 @@ fn main() -> ! {
     let mut poll_count: u32 = 0;
 
     loop {
-        let (new_bus, result) = host.get_condition(bus);
-        bus = new_bus;
+        let result = host.get_condition(&mut bus);
 
         match result {
             MapleResult::Ok(state) => {
                 // LED1 on when any button pressed
                 if state.buttons.any_pressed() {
-                    let _ = led1.set_low();
+                    led1.set_low();
                 } else {
-                    let _ = led1.set_high();
+                    led1.set_high();
                 }
 
-                // Only print when state changes
+                // Only print and signal when state changes
                 let changed = match &last_state {
                     None => true,
                     Some(prev) => state_changed(prev, &state),
@@ -115,6 +160,7 @@ fn main() -> ! {
 
                 if changed {
                     print_state(&state);
+                    CONTROLLER_STATE.signal(state);
                     last_state = Some(state);
                 }
             }
@@ -132,12 +178,140 @@ fn main() -> ! {
         }
 
         poll_count = poll_count.wrapping_add(1);
-        delay(&mut timer, 16_000); // ~60Hz polling
+        Timer::after(Duration::from_millis(16)).await;
+    }
+}
+
+/// SoftDevice runner task - must run continuously.
+#[embassy_executor::task]
+async fn softdevice_task(sd: &'static Softdevice) {
+    sd.run().await;
+}
+
+/// BLE advertising and connection handling task.
+#[embassy_executor::task]
+async fn ble_task(sd: &'static Softdevice, server: &'static GamepadServer, bonder: &'static Bonder) {
+    loop {
+        // Advertise and wait for connection (with pairing support)
+        let conn = match ble::softdevice::advertise(sd, server, bonder).await {
+            Ok(c) => c,
+            Err(e) => {
+                rprintln!("BLE: Advertise error: {:?}", e);
+                Timer::after(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        rprintln!("BLE: Client connected (HID Gamepad)");
+
+        // Load sys_attrs for returning bonded devices (required for GATT to work on reconnect)
+        bonder.load_sys_attrs(&conn);
+
+        // Small delay to let connection stabilize
+        Timer::after(Duration::from_millis(100)).await;
+
+        // Request security/pairing from the central (required for HID over GATT)
+        // This triggers "Just Works" pairing to establish an encrypted link
+        rprintln!("BLE: Requesting security...");
+        if let Err(e) = conn.request_security() {
+            rprintln!("BLE: Security request failed: {:?}", e);
+            // Continue anyway - the central might initiate on its own
+        }
+
+        // Run GATT server while connected, also sending notifications
+        let gatt_future = gatt_server::run(&conn, server, |event| {
+            match event {
+                GamepadServerEvent::Hid(e) => {
+                    match e {
+                        HidServiceEvent::ProtocolModeWrite(val) => {
+                            rprintln!("BLE: Protocol mode set to {}", val);
+                        }
+                        HidServiceEvent::ReportCccdWrite { notifications } => {
+                            rprintln!("BLE: Client {} notifications",
+                                if notifications { "enabled" } else { "disabled" });
+                        }
+                        HidServiceEvent::ControlPointWrite(val) => {
+                            rprintln!("BLE: Control point: {}",
+                                if val == 0 { "suspend" } else { "exit suspend" });
+                        }
+                    }
+                }
+                GamepadServerEvent::DeviceInfo(_) => {
+                    rprintln!("BLE: DevInfo read");
+                }
+                GamepadServerEvent::Battery(_) => {
+                    rprintln!("BLE: Battery read");
+                }
+            }
+        });
+
+        // Notification sender - polls CONTROLLER_STATE and sends HID reports
+        let notify_future = async {
+            // Wait for client to discover services and subscribe to notifications
+            // macOS needs time for: pairing, service discovery, CCCD write
+            rprintln!("BLE: Waiting for client to subscribe...");
+            Timer::after(Duration::from_millis(5000)).await;
+            rprintln!("BLE: Starting HID reports");
+
+            let mut last_report: Option<[u8; 8]> = None;
+            let mut success_count = 0u32;
+            let mut error_count = 0u32;
+
+            loop {
+                let state = CONTROLLER_STATE.wait().await;
+                let report = state.to_gamepad_report();
+                let report_bytes = report.to_bytes();
+
+                let should_notify = match &last_report {
+                    None => true,
+                    Some(prev) => prev != &report_bytes,
+                };
+
+                if should_notify {
+                    // First just set the value (client can read it)
+                    let _ = server.hid.report_set(&report_bytes);
+
+                    // Then try to notify
+                    match server.send_report(&conn, &report) {
+                        Ok(_) => {
+                            success_count += 1;
+                            error_count = 0;
+                            last_report = Some(report_bytes);
+                            if success_count == 1 {
+                                rprintln!("BLE: First HID report sent successfully!");
+                            }
+                        }
+                        Err(e) => {
+                            error_count += 1;
+                            // Log first few errors with details, then less frequently
+                            if error_count <= 3 {
+                                rprintln!("BLE: Notify error {:?} (count={})", e, error_count);
+                            } else if error_count % 100 == 0 {
+                                rprintln!("BLE: Notify still failing (count={})", error_count);
+                            }
+                            // Still update last_report so we don't spam
+                            last_report = Some(report_bytes);
+                        }
+                    }
+                }
+
+                // Small delay between reports to reduce radio contention
+                Timer::after(Duration::from_millis(8)).await;
+            }
+        };
+
+        // Run both until one completes (connection drops)
+        embassy_futures::select::select(gatt_future, notify_future).await;
+
+        // Save system attributes before disconnect (for reconnection)
+        bonder.save_sys_attrs(&conn);
+
+        rprintln!("BLE: Client disconnected");
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
 fn state_changed(prev: &ControllerState, curr: &ControllerState) -> bool {
-    // Check buttons
     if prev.buttons.a != curr.buttons.a
         || prev.buttons.b != curr.buttons.b
         || prev.buttons.x != curr.buttons.x
@@ -151,14 +325,12 @@ fn state_changed(prev: &ControllerState, curr: &ControllerState) -> bool {
         return true;
     }
 
-    // Check triggers (with deadzone)
     if (prev.trigger_l as i16 - curr.trigger_l as i16).abs() > 10
         || (prev.trigger_r as i16 - curr.trigger_r as i16).abs() > 10
     {
         return true;
     }
 
-    // Check stick (with deadzone)
     if (prev.stick_x as i16 - curr.stick_x as i16).abs() > 15
         || (prev.stick_y as i16 - curr.stick_y as i16).abs() > 15
     {
@@ -171,7 +343,6 @@ fn state_changed(prev: &ControllerState, curr: &ControllerState) -> bool {
 fn print_state(state: &ControllerState) {
     let b = &state.buttons;
 
-    // Build button string
     let mut btns: heapless::String<32> = heapless::String::new();
     if b.a {
         let _ = btns.push_str("A ");
@@ -219,12 +390,4 @@ fn print_state(state: &ControllerState) {
             state.trigger_r
         );
     }
-}
-
-fn delay<T>(timer: &mut Timer<T>, cycles: u32)
-where
-    T: timer::Instance,
-{
-    timer.start(cycles);
-    let _ = block!(timer.wait());
 }

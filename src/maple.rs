@@ -4,6 +4,6 @@ pub mod host;
 pub mod packet;
 
 pub use controller_state::ControllerState;
-pub use gpio_bus::MapleBusGpio;
+pub use gpio_bus::MapleBus;
 pub use host::MapleHost;
 pub use packet::MaplePacket;
