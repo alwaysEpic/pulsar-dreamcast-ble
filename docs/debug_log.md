@@ -886,3 +886,25 @@ probe-rs erase --chip nRF52840_xxAA --allow-erase-all
 1. Remove the 500-cycle delay
 2. Add debug showing first few bit reads (pin states, timing)
 3. Verify we catch the first clock edge (A going LOW for first data bit)
+
+---
+
+## Session: 2026-02-09 (Triple-Press Name Toggle)
+
+### Feature
+Added ability to toggle device name between "Xbox Wireless Controller" and "Dreamcast Wireless Controller" via triple-press of the sync button (Button 4).
+
+### Why
+The iBlueControlMod adapter identifies controllers by BLE name ("Xbox Wireless Controller"), so that must remain the default. However, for general BLE use (Mac, iPhone, PC), "Dreamcast Wireless Controller" is more descriptive. Users can triple-press to switch.
+
+### Implementation
+- **Flash storage** (`src/ble/flash_bond.rs`): New flash page at `0x000FD000` stores name preference with magic `0x4E414D45` ("NAME"). Default = Xbox (0x00).
+- **SoftDevice name** (`src/ble/softdevice.rs`): `init_softdevice(is_dreamcast: bool)` picks the name at boot. Two static scan data arrays for advertising.
+- **Triple-press** (`src/main.rs`): 3 presses within 2 seconds (without triggering the 3s hold-for-sync) toggles the preference. Signals `ble_task` to write flash, then `SCB::sys_reset()`.
+- LED gives 5 rapid blinks to confirm the toggle before reset.
+
+### Expected Behavior
+1. Boot → loads preference → advertises with chosen name
+2. Triple-press sync button → 5 rapid blinks → device resets → advertises with other name
+3. Preference persists across power cycles
+4. 3-second hold for sync mode still works unchanged

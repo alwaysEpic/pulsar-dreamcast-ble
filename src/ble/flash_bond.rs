@@ -9,11 +9,17 @@ use nrf_softdevice::Flash;
 /// Flash address for bonding storage (last page before 1MB boundary)
 const BOND_FLASH_ADDR: u32 = 0x000FE000;
 
+/// Flash address for name preference storage (one page before bond data)
+const NAME_FLASH_ADDR: u32 = 0x000FD000;
+
 /// Flash page size
 const PAGE_SIZE: u32 = 4096;
 
 /// Magic number to identify valid bonding data
 const BOND_MAGIC: u32 = 0xB00D_DA7A;
+
+/// Magic number to identify valid name preference data
+const NAME_MAGIC: u32 = 0x4E41_4D45; // "NAME"
 
 /// Stored bonding data structure (must be 4-byte aligned for flash writes)
 #[repr(C, align(4))]
@@ -149,6 +155,50 @@ pub async fn save_bond(
     };
 
     flash.write(BOND_FLASH_ADDR, data).await.map_err(|_| ())?;
+
+    Ok(())
+}
+
+/// Name preference stored in flash: magic (4 bytes) + preference byte (1 byte) + padding (3 bytes)
+#[repr(C, align(4))]
+struct StoredNamePref {
+    magic: u32,
+    /// 0x00 = Xbox, 0x01 = Dreamcast
+    preference: u8,
+    _pad: [u8; 3],
+}
+
+/// Load name preference from flash. Returns true if Dreamcast name is selected.
+/// Defaults to false (Xbox name) if no preference is stored.
+pub fn load_name_preference() -> bool {
+    let stored = unsafe { &*(NAME_FLASH_ADDR as *const StoredNamePref) };
+    if stored.magic != NAME_MAGIC {
+        return false; // Default to Xbox
+    }
+    stored.preference != 0
+}
+
+/// Save name preference to flash. `is_dreamcast`: true = Dreamcast, false = Xbox.
+pub async fn save_name_preference(flash: &mut Flash, is_dreamcast: bool) -> Result<(), ()> {
+    let stored = StoredNamePref {
+        magic: NAME_MAGIC,
+        preference: u8::from(is_dreamcast),
+        _pad: [0u8; 3],
+    };
+
+    flash
+        .erase(NAME_FLASH_ADDR, NAME_FLASH_ADDR + PAGE_SIZE)
+        .await
+        .map_err(|_| ())?;
+
+    let data = unsafe {
+        core::slice::from_raw_parts(
+            &stored as *const StoredNamePref as *const u8,
+            core::mem::size_of::<StoredNamePref>(),
+        )
+    };
+
+    flash.write(NAME_FLASH_ADDR, data).await.map_err(|_| ())?;
 
     Ok(())
 }

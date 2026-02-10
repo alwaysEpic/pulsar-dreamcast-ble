@@ -47,8 +47,19 @@ pub fn set_connection_state(state: ConnectionState) {
     CONNECTION_STATE.store(state as u8, Ordering::Relaxed);
 }
 
+/// Device name for Xbox compatibility (24 chars).
+static NAME_XBOX: &[u8] = b"Xbox Wireless Controller\0";
+/// Device name for Dreamcast branding (29 chars).
+static NAME_DREAMCAST: &[u8] = b"Dreamcast Wireless Controller\0";
+
 /// SoftDevice configuration for BLE peripheral mode.
-fn softdevice_config() -> nrf_softdevice::Config {
+fn softdevice_config(is_dreamcast: bool) -> nrf_softdevice::Config {
+    let (name, name_len) = if is_dreamcast {
+        (NAME_DREAMCAST.as_ptr(), 29u16)
+    } else {
+        (NAME_XBOX.as_ptr(), 24u16)
+    };
+
     nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
             source: raw::NRF_CLOCK_LF_SRC_RC as u8,
@@ -72,9 +83,9 @@ fn softdevice_config() -> nrf_softdevice::Config {
             _bitfield_1: raw::ble_gap_cfg_role_count_t::new_bitfield_1(0),
         }),
         gap_device_name: Some(raw::ble_gap_cfg_device_name_t {
-            p_value: b"Xbox Wireless Controller\0" as *const u8 as _,
-            current_len: 24,
-            max_len: 24,
+            p_value: name as _,
+            current_len: name_len,
+            max_len: name_len,
             write_perm: raw::ble_gap_conn_sec_mode_t {
                 _bitfield_1: raw::ble_gap_conn_sec_mode_t::new_bitfield_1(0, 0),
             },
@@ -88,10 +99,13 @@ fn softdevice_config() -> nrf_softdevice::Config {
 
 /// Initialize the SoftDevice and return a mutable reference to it.
 ///
+/// `is_dreamcast`: if true, advertises as "Dreamcast Wireless Controller";
+/// otherwise "Xbox Wireless Controller" (compatible with iBlueControlMod).
+///
 /// # Safety
 /// This must be called exactly once at program start, before any BLE operations.
-pub fn init_softdevice() -> &'static mut Softdevice {
-    let config = softdevice_config();
+pub fn init_softdevice(is_dreamcast: bool) -> &'static mut Softdevice {
+    let config = softdevice_config(is_dreamcast);
     Softdevice::enable(&config)
 }
 
@@ -140,7 +154,7 @@ static ADV_DATA_RECONNECT: [u8; 13] = [
 
 /// Scan response with device name (Xbox Wireless Controller).
 #[rustfmt::skip]
-static SCAN_DATA: [u8; 26] = [
+static SCAN_DATA_XBOX: [u8; 26] = [
     // Complete Local Name
     0x19,              // Length: 25 bytes follow (1 type + 24 name chars)
     0x09,              // AD Type: Complete Local Name
@@ -148,6 +162,26 @@ static SCAN_DATA: [u8; 26] = [
     b'W', b'i', b'r', b'e', b'l', b'e', b's', b's', b' ',
     b'C', b'o', b'n', b't', b'r', b'o', b'l', b'l', b'e', b'r',
 ];
+
+/// Scan response with device name (Dreamcast Wireless Controller).
+#[rustfmt::skip]
+static SCAN_DATA_DREAMCAST: [u8; 31] = [
+    // Complete Local Name
+    0x1E,              // Length: 30 bytes follow (1 type + 29 name chars)
+    0x09,              // AD Type: Complete Local Name
+    b'D', b'r', b'e', b'a', b'm', b'c', b'a', b's', b't', b' ',
+    b'W', b'i', b'r', b'e', b'l', b'e', b's', b's', b' ',
+    b'C', b'o', b'n', b't', b'r', b'o', b'l', b'l', b'e', b'r',
+];
+
+/// Whether we're advertising as Dreamcast (set at init, read during advertising).
+static IS_DREAMCAST_NAME: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Set the name mode (called once at init before advertising starts).
+pub fn set_name_mode(is_dreamcast: bool) {
+    IS_DREAMCAST_NAME.store(is_dreamcast, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// Advertising mode determines visibility and connection behavior.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,9 +232,15 @@ pub async fn advertise(
         }
     };
 
+    let scan_data: &[u8] = if IS_DREAMCAST_NAME.load(core::sync::atomic::Ordering::Relaxed) {
+        &SCAN_DATA_DREAMCAST
+    } else {
+        &SCAN_DATA_XBOX
+    };
+
     let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
         adv_data,
-        scan_data: &SCAN_DATA,
+        scan_data,
     };
 
     rprintln!("{}", log_msg);

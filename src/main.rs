@@ -18,8 +18,8 @@ mod board;
 mod maple;
 
 use crate::ble::{
-    advertise, get_connection_state, init_softdevice, set_connection_state, AdvertiseMode, Bonder,
-    ConnectionState, GamepadServer,
+    advertise, get_connection_state, init_softdevice, set_connection_state, set_name_mode,
+    AdvertiseMode, Bonder, ConnectionState, GamepadServer,
 };
 use crate::maple::host::MapleResult;
 use crate::maple::{ControllerState, MapleBus, MapleHost};
@@ -29,6 +29,9 @@ static CONTROLLER_STATE: Signal<CriticalSectionRawMutex, ControllerState> = Sign
 
 /// Signal to trigger sync/pairing mode (clears bonds).
 static SYNC_MODE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Signal to toggle device name and reset. Carries new is_dreamcast value.
+static NAME_TOGGLE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -41,8 +44,17 @@ async fn main(spawner: Spawner) {
     config.time_interrupt_priority = embassy_nrf::interrupt::Priority::P2;
     let p = embassy_nrf::init(config);
 
-    // Initialize SoftDevice
-    let sd = init_softdevice();
+    // Load name preference from flash (Xbox vs Dreamcast)
+    let is_dreamcast = crate::ble::flash_bond::load_name_preference();
+    if is_dreamcast {
+        rprintln!("Name: Dreamcast Wireless Controller");
+    } else {
+        rprintln!("Name: Xbox Wireless Controller");
+    }
+
+    // Initialize SoftDevice with chosen name
+    set_name_mode(is_dreamcast);
+    let sd = init_softdevice(is_dreamcast);
 
     // Create HID Gamepad GATT server
     let server = match GamepadServer::new(sd) {
@@ -179,6 +191,18 @@ async fn ble_task(
     const SYNC_TIMEOUT_MS: u64 = 60_000;
 
     loop {
+        // Check for name toggle request (non-blocking)
+        if NAME_TOGGLE.signaled() {
+            let new_pref = NAME_TOGGLE.wait().await;
+            rprintln!(
+                "NAME: Toggling to {}",
+                if new_pref { "Dreamcast" } else { "Xbox" }
+            );
+            let _ = crate::ble::flash_bond::save_name_preference(&mut flash, new_pref).await;
+            // Reset to apply new name (set at SoftDevice init)
+            cortex_m::peripheral::SCB::sys_reset();
+        }
+
         let state = get_connection_state();
 
         match state {
@@ -353,7 +377,10 @@ async fn handle_connection(
     Timer::after(Duration::from_millis(500)).await;
 }
 
-/// Sync button monitoring task - hold Button 4 for 3 seconds to enter pairing mode.
+/// Sync button monitoring task.
+///
+/// - Hold 3 seconds: enter pairing/sync mode
+/// - Triple-press within 2 seconds: toggle device name (Xbox <-> Dreamcast) and reset
 ///
 /// LED1 behavior based on ConnectionState:
 /// - Idle/Reconnecting: OFF
@@ -363,6 +390,10 @@ async fn handle_connection(
 async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) {
     const HOLD_DURATION_MS: u64 = 3000;
     const BLINK_INTERVAL_MS: u64 = 100;
+    const TRIPLE_PRESS_WINDOW_MS: u64 = 2000;
+
+    let mut press_count: u8 = 0;
+    let mut first_press_time = Instant::now();
 
     loop {
         let state = get_connection_state();
@@ -384,9 +415,6 @@ async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) {
                     Timer::after(Duration::from_millis(100)).await;
                     if button.is_low() {
                         rprintln!("SYNC: Cancelled by button press");
-                        // Return to appropriate state
-                        // Note: The ble_task will handle the state change on timeout
-                        // We just let the current sync cycle finish
                         while button.is_low() {
                             Timer::after(Duration::from_millis(50)).await;
                         }
@@ -401,6 +429,10 @@ async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) {
 
         // Check for button press (active low)
         if button.is_high() {
+            // Reset triple-press counter if window expired
+            if press_count > 0 && first_press_time.elapsed().as_millis() >= TRIPLE_PRESS_WINDOW_MS {
+                press_count = 0;
+            }
             Timer::after(Duration::from_millis(50)).await;
             continue;
         }
@@ -409,6 +441,7 @@ async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) {
         let press_start = Instant::now();
         let mut led_state = false;
         let mut last_blink = Instant::now();
+        let mut held_long = false;
 
         // Wait for either release or hold duration
         while button.is_low() {
@@ -425,12 +458,13 @@ async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) {
 
             if press_start.elapsed().as_millis() >= HOLD_DURATION_MS {
                 // Held long enough - trigger sync mode
+                held_long = true;
                 rprintln!("SYNC: Entering pairing mode (60s)");
                 SYNC_MODE.signal(());
+                press_count = 0; // Reset triple-press counter
 
                 // Wait for button release
                 while button.is_low() {
-                    // Keep blinking
                     led.set_low();
                     Timer::after(Duration::from_millis(100)).await;
                     led.set_high();
@@ -439,6 +473,36 @@ async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) {
                 break;
             }
             Timer::after(Duration::from_millis(20)).await;
+        }
+
+        if !held_long {
+            // Short press — count for triple-press detection
+            if press_count == 0 {
+                first_press_time = Instant::now();
+            }
+            press_count += 1;
+
+            if press_count >= 3 && first_press_time.elapsed().as_millis() < TRIPLE_PRESS_WINDOW_MS {
+                // Triple press detected! Toggle name preference.
+                let current = crate::ble::flash_bond::load_name_preference();
+                let new_pref = !current;
+                rprintln!(
+                    "NAME: Triple-press! Switching to {}",
+                    if new_pref { "Dreamcast" } else { "Xbox" }
+                );
+
+                // LED confirmation: 5 rapid blinks
+                for _ in 0..5 {
+                    led.set_low();
+                    Timer::after(Duration::from_millis(50)).await;
+                    led.set_high();
+                    Timer::after(Duration::from_millis(50)).await;
+                }
+
+                // Signal ble_task to save and reset
+                NAME_TOGGLE.signal(new_pref);
+                press_count = 0;
+            }
         }
 
         // Debounce
