@@ -403,6 +403,14 @@ async fn ble_task(
                         if bonder.has_bond() {
                             set_connection_state(ConnectionState::Reconnecting);
                         } else {
+                            // No bond and sync timed out — sleep to save power.
+                            // Wake via sync button → full reset → auto sync mode.
+                            #[cfg(feature = "board-xiao")]
+                            {
+                                rprintln!("BLE: No bond after sync timeout, entering sleep");
+                                SLEEP_REQUEST.signal(());
+                                Timer::after(Duration::from_secs(5)).await;
+                            }
                             set_connection_state(ConnectionState::Idle);
                         }
                         break None;
