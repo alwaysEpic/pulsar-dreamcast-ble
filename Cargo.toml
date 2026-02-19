@@ -1,9 +1,13 @@
+[workspace]
+members = [".", "dc-protocol"]
+
 [package]
 name = "embedded_rust_setup"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+dc-protocol = { path = "dc-protocol" }
 # Core
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"

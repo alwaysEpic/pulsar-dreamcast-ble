@@ -1136,3 +1136,39 @@ repeated reset loops during debugging. Key learnings:
 - `cargo clippy -- -W clippy::all -W clippy::pedantic` — 0 warnings
 - Hardware tested: controller detection retry loop works
 - Still needed: unplug controller mid-session, BLE disconnect/reconnect, sustained gameplay
+
+---
+
+## Session: 2026-02-19 (dc-protocol extraction, tests, docs)
+
+### What Changed
+Extracted pure protocol logic into a separate `dc-protocol/` library crate so it can be tested on the host without embedded toolchains.
+
+### dc-protocol Crate
+- New workspace member: `dc-protocol/` (no_std, depends only on `heapless`)
+- Moved from main crate:
+  - `controller_state.rs` — `ControllerState`, `ButtonState`, `from_payload`, `to_gamepad_report`
+  - `hid.rs` — `GamepadReport`, `to_bytes`, `hat` module, `buttons` module
+  - `packet.rs` — `MaplePacket`, `frame_word`
+- `state_changed()` moved from free function in `main.rs` to method on `ControllerState`
+- Main crate files now re-export from `dc_protocol::*`
+
+### Tests (24 total, all passing)
+- **controller_state** (17): button parsing, roundtrip, from_payload (valid/short/wrong func),
+  stick deadzone, gamepad report (buttons/dpad/triggers/sticks), state_changed (buttons/triggers/sticks)
+- **hid** (5): to_bytes default/buttons/triggers/hat/max values
+- **packet** (2): frame_word basic/with payload
+
+### Fixed
+- `controller_state_parse` test had wrong assertions (raw byte values vs inverted values).
+  The test was ported from the original crate where it had never actually run due to the
+  `cortex-m` dependency preventing `cargo test` on host.
+
+### Docs
+- `README.md` — full rewrite: features, hardware, build/flash, testing, project structure
+- `docs/users_guide.md` — non-technical guide: pairing, button mapping, sync button, battery, sleep, troubleshooting
+
+### Verification
+- `cd dc-protocol && cargo test` — 24 tests pass
+- `cargo build --release --no-default-features --features board-xiao` — success
+- `cargo build --release --no-default-features --features board-dk` — success

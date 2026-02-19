@@ -1,0 +1,3 @@
+# Override the workspace default ARM target so `cargo test` runs on host
+[build]
+target = "aarch64-apple-darwin"

@@ -209,6 +209,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-protocol"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -459,6 +466,7 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "dc-protocol",
  "embassy-executor",
  "embassy-futures 0.1.2 (git+https://github.com/embassy-rs/embassy)",
  "embassy-nrf",

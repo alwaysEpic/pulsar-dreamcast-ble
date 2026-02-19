@@ -546,3 +546,48 @@ MAPLE: Controller detected
 2. **`diagnose_bus()` is invaluable** — zero transitions immediately pointed to a hardware issue, not software.
 3. **Manual GND short test** differentiates between a pull-up path (safe to short, draws <1mA) and a direct power short (resets board).
 4. **Battery must feed Pololu directly** — XIAO 3.3V regulator browns out under boost converter load.
+
+---
+
+## Session: 2026-02-19 (Inactivity Sleep + Battery Level Reporting)
+
+### Changes
+
+#### 1. Inactivity Sleep Timeout (10 minutes)
+
+**Problem:** When the BLE host (Steam Deck) goes to sleep but keeps the connection alive, the adapter polls the controller and sends HID reports indefinitely, draining the battery overnight.
+
+**Fix:** Track `last_activity` timestamp in the main polling loop. Reset it whenever `state_changed()` returns true or the controller is (re)detected. After 10 minutes with no input change, signal `SLEEP_REQUEST` to enter System Off.
+
+- New constant: `INACTIVITY_TIMEOUT_MS = 600_000` (10 min), XIAO-only
+- `last_activity` reset on: state change, initial detection, re-detection
+- Check runs every poll cycle (16ms) in the main loop, before the poll sleep
+
+#### 2. Battery Level via SAADC
+
+**Problem:** Battery service hardcoded to 100% — never reflects actual charge state.
+
+**Fix:** Read battery voltage via SAADC on P0.31 (AIN7) every 60 seconds.
+
+**Hardware:** XIAO has a 1:2 voltage divider on P0.31, gated by P0.14 (HIGH = enable). This divides the LiPo voltage (3.0-4.2V) to the ADC-safe range (1.5-2.1V).
+
+**Implementation:**
+- `BatteryReader` struct in `src/board/xiao.rs` — holds SAADC peripheral + P0.14 enable pin
+- 12-bit SAADC with internal 0.6V reference, 1/6 gain → 0-3.6V ADC range
+- Battery voltage = ADC reading × 2 (divider)
+- Linear mapping: 3.0V = 0%, 4.2V = 100%
+- Enable pin driven HIGH for reading, LOW between reads to save power
+- `BATTERY_LEVEL` signal carries percentage from main task to BLE task
+- BLE task updates Battery Service characteristic + sends notification
+- DK board: no battery circuit, stays at init value (100%)
+
+**Files modified:**
+- `src/main.rs` — Inactivity timeout, SAADC interrupt binding, battery reader init, periodic read in main loop, battery update in BLE connection handler
+- `src/board/xiao.rs` — `BatteryReader` struct with `new()` and `read_percent()`
+
+### Verification Plan
+- Build: `cargo embed --release --no-default-features --features board-xiao`
+- Check RTT log for `BAT: raw=... v=...mV ...%` lines
+- Verify inactivity sleep triggers after 10 min idle (RTT: "Inactivity timeout")
+- Verify wake via sync button after sleep
+- Verify BLE battery level updates (non-100% value in host)

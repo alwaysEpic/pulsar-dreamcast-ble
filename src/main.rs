@@ -17,6 +17,11 @@ mod ble;
 mod board;
 mod maple;
 
+#[cfg(feature = "board-xiao")]
+embassy_nrf::bind_interrupts!(struct SaadcIrqs {
+    SAADC => embassy_nrf::saadc::InterruptHandler;
+});
+
 use crate::ble::{
     advertise, get_connection_state, init_softdevice, set_connection_state, set_name_mode,
     AdvertiseMode, Bonder, ConnectionState, GamepadServer,
@@ -45,14 +50,13 @@ const SERVICE_DISCOVERY_DELAY_MS: u64 = 5000;
 /// Max consecutive BLE notify failures before disconnecting.
 const MAX_NOTIFY_FAILURES: u8 = 10;
 
-/// Trigger change threshold for `state_changed` detection.
-const TRIGGER_CHANGE_THRESHOLD: i16 = 10;
-
-/// Stick change threshold for `state_changed` detection.
-const STICK_CHANGE_THRESHOLD: i16 = 15;
-
 /// Timeout before entering sleep when disconnected (ms).
 const SLEEP_TIMEOUT_MS: u64 = 60_000;
+
+/// Timeout before entering sleep when controller is idle (ms).
+/// 10 minutes with no input change triggers System Off.
+#[cfg(feature = "board-xiao")]
+const INACTIVITY_TIMEOUT_MS: u64 = 600_000;
 
 /// Shared controller state between maple and BLE tasks.
 static CONTROLLER_STATE: Signal<CriticalSectionRawMutex, ControllerState> = Signal::new();
@@ -66,6 +70,10 @@ static NAME_TOGGLE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 /// Signal to trigger System Off sleep (XIAO only).
 #[cfg(feature = "board-xiao")]
 static SLEEP_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Battery level percentage (0-100), updated periodically on XIAO.
+#[cfg(feature = "board-xiao")]
+static BATTERY_LEVEL: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
 #[allow(clippy::items_after_statements)] // StaticCell pattern requires inline statics
 #[embassy_executor::main]
@@ -130,6 +138,9 @@ async fn main(spawner: Spawner) {
         p.P0_05, p.P0_03, p.P0_26, p.P0_30, p.P0_06, p.P1_12, p.P0_28,
     );
 
+    #[cfg(feature = "board-xiao")]
+    let mut battery_reader = board::BatteryReader::new(p.P0_14, p.P0_31, p.SAADC, SaadcIrqs);
+
     if let Ok(token) = sync_button_task(sync_button, sync_led) {
         spawner.spawn(token);
     }
@@ -172,6 +183,12 @@ async fn main(spawner: Spawner) {
 
     let mut last_state: Option<ControllerState> = None;
     let mut fail_count: u16 = 0;
+    #[cfg(feature = "board-xiao")]
+    let mut last_activity = Instant::now();
+    #[cfg(feature = "board-xiao")]
+    const BATTERY_READ_INTERVAL_MS: u64 = 60_000;
+    #[cfg(feature = "board-xiao")]
+    let mut battery_read_countdown: u64 = 0; // Force immediate first read
 
     loop {
         // Check for sleep request (XIAO only)
@@ -195,12 +212,16 @@ async fn main(spawner: Spawner) {
             // Only signal when state changes
             let changed = match &last_state {
                 None => true,
-                Some(prev) => state_changed(prev, &state),
+                Some(prev) => prev.state_changed(&state),
             };
 
             if changed {
                 CONTROLLER_STATE.signal(state);
                 last_state = Some(state);
+                #[cfg(feature = "board-xiao")]
+                {
+                    last_activity = Instant::now();
+                }
             }
         } else {
             fail_count = fail_count.saturating_add(1);
@@ -227,12 +248,33 @@ async fn main(spawner: Spawner) {
                         rprintln!("MAPLE: Controller re-detected");
                         status.show_controller_found();
                         fail_count = 0;
+                        #[cfg(feature = "board-xiao")]
+                        {
+                            last_activity = Instant::now();
+                        }
                         break;
                     }
                     Timer::after(Duration::from_millis(retry_delay_ms)).await;
                     retry_delay_ms = (retry_delay_ms * 2).min(MAX_RETRY_DELAY_MS);
                 }
             }
+        }
+
+        #[cfg(feature = "board-xiao")]
+        {
+            battery_read_countdown = battery_read_countdown.saturating_sub(POLL_INTERVAL_MS);
+            if battery_read_countdown == 0 {
+                let percent = battery_reader.read_percent().await;
+                BATTERY_LEVEL.signal(percent);
+                battery_read_countdown = BATTERY_READ_INTERVAL_MS;
+            }
+        }
+
+        #[cfg(feature = "board-xiao")]
+        if last_activity.elapsed().as_millis() >= INACTIVITY_TIMEOUT_MS {
+            rprintln!("MAIN: Inactivity timeout (10 min), entering sleep");
+            SLEEP_REQUEST.signal(());
+            Timer::after(Duration::from_secs(5)).await;
         }
 
         Timer::after(Duration::from_millis(POLL_INTERVAL_MS)).await;
@@ -465,9 +507,35 @@ async fn handle_connection(
         }
     };
 
-    // Run both until one completes (connection drops)
+    // Update battery level in BLE service when signaled (XIAO only)
+    #[cfg(feature = "board-xiao")]
+    let battery_future = async {
+        loop {
+            let level = BATTERY_LEVEL.wait().await;
+            let _ = server.battery.battery_level_set(&level);
+            let _ = server.battery.battery_level_notify(&conn, &level);
+        }
+    };
+
+    // Run all until one completes (connection drops)
+    #[cfg(feature = "board-xiao")]
+    let result = embassy_futures::select::select3(gatt_future, notify_future, battery_future).await;
+    #[cfg(not(feature = "board-xiao"))]
     let result = embassy_futures::select::select(gatt_future, notify_future).await;
 
+    #[cfg(feature = "board-xiao")]
+    match result {
+        embassy_futures::select::Either3::First(gatt_result) => {
+            rprintln!("BLE: Disconnected (GATT: {:?})", gatt_result);
+        }
+        embassy_futures::select::Either3::Second(()) => {
+            rprintln!("BLE: Disconnected (notify failure)");
+        }
+        embassy_futures::select::Either3::Third(()) => {
+            rprintln!("BLE: Disconnected (battery task ended)");
+        }
+    }
+    #[cfg(not(feature = "board-xiao"))]
     match result {
         embassy_futures::select::Either::First(gatt_result) => {
             rprintln!("BLE: Disconnected (GATT: {:?})", gatt_result);
@@ -623,31 +691,3 @@ async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) {
     }
 }
 
-fn state_changed(prev: &ControllerState, curr: &ControllerState) -> bool {
-    if prev.buttons.a != curr.buttons.a
-        || prev.buttons.b != curr.buttons.b
-        || prev.buttons.x != curr.buttons.x
-        || prev.buttons.y != curr.buttons.y
-        || prev.buttons.start != curr.buttons.start
-        || prev.buttons.dpad_up != curr.buttons.dpad_up
-        || prev.buttons.dpad_down != curr.buttons.dpad_down
-        || prev.buttons.dpad_left != curr.buttons.dpad_left
-        || prev.buttons.dpad_right != curr.buttons.dpad_right
-    {
-        return true;
-    }
-
-    if (i16::from(prev.trigger_l) - i16::from(curr.trigger_l)).abs() > TRIGGER_CHANGE_THRESHOLD
-        || (i16::from(prev.trigger_r) - i16::from(curr.trigger_r)).abs() > TRIGGER_CHANGE_THRESHOLD
-    {
-        return true;
-    }
-
-    if (i16::from(prev.stick_x) - i16::from(curr.stick_x)).abs() > STICK_CHANGE_THRESHOLD
-        || (i16::from(prev.stick_y) - i16::from(curr.stick_y)).abs() > STICK_CHANGE_THRESHOLD
-    {
-        return true;
-    }
-
-    false
-}

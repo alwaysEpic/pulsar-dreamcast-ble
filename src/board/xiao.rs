@@ -9,6 +9,7 @@
 //! - Battery ADC: P0.31 (internal, via P0.14 enable — future)
 
 use embassy_nrf::gpio::{Flex, Input, Level, Output, OutputDrive, Pin, Pull};
+use embassy_nrf::saadc::{self, Saadc};
 use embassy_nrf::Peri;
 use embassy_time::{Duration, Timer};
 
@@ -134,6 +135,76 @@ pub unsafe fn disable_boost() {
     // SAFETY: See BOOST_CONTROL declaration — single writer, single reader, no concurrency.
     if let Some(ref mut boost) = BOOST_CONTROL {
         boost.set_low();
+    }
+}
+
+/// Battery voltage reader using SAADC on P0.31 (AIN7).
+///
+/// The XIAO has a 1:2 voltage divider on P0.31, gated by P0.14 (HIGH=enable).
+/// With the internal 0.6V reference and 1/6 gain, the SAADC input range is 0-3.6V,
+/// which maps to 0-7.2V battery voltage after the 2:1 divider.
+pub struct BatteryReader<'d> {
+    saadc: Saadc<'d, 1>,
+    enable: Output<'d>,
+}
+
+impl<'d> BatteryReader<'d> {
+    /// Create a new battery reader.
+    ///
+    /// `enable_pin` is P0.14 (drives the voltage divider gate).
+    /// `adc_pin` is P0.31 (AIN7, battery voltage through divider).
+    /// `saadc_peri` is the SAADC peripheral.
+    pub fn new(
+        enable_pin: Peri<'d, impl Pin>,
+        adc_pin: impl saadc::Input + 'd,
+        saadc_peri: Peri<'d, embassy_nrf::peripherals::SAADC>,
+        irq: impl embassy_nrf::interrupt::typelevel::Binding<
+            embassy_nrf::interrupt::typelevel::SAADC,
+            saadc::InterruptHandler,
+        > + 'd,
+    ) -> Self {
+        let enable = Output::new(enable_pin, Level::Low, OutputDrive::Standard);
+        let channel = saadc::ChannelConfig::single_ended(adc_pin);
+        let saadc = Saadc::new(saadc_peri, irq, saadc::Config::default(), [channel]);
+        Self { saadc, enable }
+    }
+
+    /// Read battery voltage and return percentage (0-100).
+    ///
+    /// Enables the voltage divider, takes a sample, disables divider.
+    ///
+    /// 12-bit SAADC with 0.6V internal ref, 1/6 gain gives 0-3.6V range.
+    /// Battery voltage = ADC voltage * 2 (1:2 divider).
+    /// Battery range: 3.0V (empty) to 4.2V (full).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub async fn read_percent(&mut self) -> u8 {
+        self.enable.set_high();
+        // Brief settling time for the voltage divider
+        Timer::after(Duration::from_micros(100)).await;
+
+        let mut buf = [0i16; 1];
+        self.saadc.sample(&mut buf).await;
+
+        self.enable.set_low();
+
+        let raw = buf[0].max(0) as u32;
+        // 12-bit resolution (0-4095), internal ref 0.6V, gain 1/6 → full scale 3.6V
+        // Voltage at ADC pin = raw * 3.6 / 4095
+        // Battery voltage = ADC voltage * 2 (voltage divider)
+        // Fixed-point: v_bat_mv = raw * 7200 / 4095
+        let v_bat_mv = raw * 7200 / 4095;
+
+        // LiPo: 3000mV = 0%, 4200mV = 100%
+        let percent = if v_bat_mv <= 3000 {
+            0
+        } else if v_bat_mv >= 4200 {
+            100
+        } else {
+            ((v_bat_mv - 3000) * 100 / 1200) as u8
+        };
+
+        rtt_target::rprintln!("BAT: raw={} v={}mV {}%", raw, v_bat_mv, percent);
+        percent
     }
 }
 

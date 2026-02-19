@@ -22,7 +22,7 @@ pub mod commands {
 /// Maple Bus function codes (device types).
 pub mod functions {
     /// Standard controller.
-    pub const CONTROLLER: u32 = 0x0000_0001;
+    pub const CONTROLLER: u32 = dc_protocol::controller_state::CONTROLLER_FUNCTION;
 }
 
 /// Maple Bus addressing.
