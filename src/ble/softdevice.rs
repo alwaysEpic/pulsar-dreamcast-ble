@@ -197,6 +197,9 @@ pub enum AdvertiseMode {
     Reconnect,
 }
 
+/// Tracks last advertise mode to log only on change.
+static LAST_ADV_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+
 /// Start BLE advertising based on mode.
 ///
 /// - `SyncMode`: General Discoverable, visible in Bluetooth menus, accepts any pairing
@@ -264,6 +267,15 @@ pub async fn advertise(
         scan_data,
     };
 
-    rprintln!("{}", log_msg);
+    // Log only on mode change to reduce spam
+    let mode_id = match mode {
+        AdvertiseMode::SyncMode => 0,
+        AdvertiseMode::ReconnectFast => 1,
+        AdvertiseMode::Reconnect => 2,
+    };
+    if LAST_ADV_MODE.swap(mode_id, core::sync::atomic::Ordering::Relaxed) != mode_id {
+        rprintln!("{}", log_msg);
+    }
+
     peripheral::advertise_pairable(sd, adv, &config, bonder).await
 }

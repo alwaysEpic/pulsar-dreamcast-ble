@@ -158,6 +158,7 @@ async fn main(spawner: Spawner) {
     // Detect controller (retry with backoff until found)
     status.show_searching();
     let mut retry_delay_ms: u64 = INITIAL_RETRY_DELAY_MS;
+    let mut timeout_logged = false;
     loop {
         status.tx_activity_on();
         let result = host.request_device_info(&mut bus);
@@ -169,14 +170,17 @@ async fn main(spawner: Spawner) {
                 rprintln!("MAPLE: Controller detected");
                 break;
             }
-            MapleResult::Timeout => rprintln!("MAPLE: Timeout"),
+            MapleResult::Timeout => {
+                if !timeout_logged {
+                    rprintln!("MAPLE: Timeout (retrying...)");
+                    bus.diagnose_bus();
+                    timeout_logged = true;
+                }
+            }
             MapleResult::UnexpectedResponse(cmd) => {
                 rprintln!("MAPLE: Unexpected cmd=0x{:02X}", cmd);
             }
         }
-
-        // Diagnostic: check bus state after failed attempt (not in hot path)
-        bus.diagnose_bus();
 
         Timer::after(Duration::from_millis(retry_delay_ms)).await;
         // Back off up to max delay between retries
