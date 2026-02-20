@@ -203,7 +203,7 @@ impl ControllerState {
         // Convert Dreamcast stick (u8, 0-255, center=128) to Xbox (u16, 0-65535, center=32768)
         // Scale: multiply by 257 (maps 0->0, 128->32896~=32768, 255->65535)
         // Apply deadzone around center
-        const DEADZONE: u16 = 10;
+        const DEADZONE: u16 = 5;
         let raw_x = self.stick_y; // Dreamcast Y -> HID X
         let raw_y = self.stick_x; // Dreamcast X -> HID Y
         let left_x: u16 =

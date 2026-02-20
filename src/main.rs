@@ -307,8 +307,10 @@ async fn main(spawner: Spawner) {
                     Some(prev) => prev.state_changed(&state),
                 };
 
+                // Always send reports for continuous ~60Hz updates
+                CONTROLLER_STATE.signal(state);
+
                 if changed {
-                    CONTROLLER_STATE.signal(state);
                     last_state = Some(state);
                     #[cfg(feature = "board-xiao")]
                     {
