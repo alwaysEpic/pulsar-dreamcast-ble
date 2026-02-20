@@ -50,7 +50,12 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
         }
 
         if elapsed >= HOLD_SLEEP_MS {
-            rprintln!("SYNC: 10s hold — entering System Off");
+            rprintln!("SYNC: 10s hold — waiting for release, then System Off");
+            // Solid LED to confirm sleep is committed
+            led.set_low();
+            while button.is_low() {
+                Timer::after(Duration::from_millis(50)).await;
+            }
             #[cfg(feature = "board-xiao")]
             unsafe {
                 crate::board::enter_system_off();
