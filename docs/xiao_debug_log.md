@@ -808,3 +808,54 @@ System draws ~120mA while active but BQ25101 charges at only 100mA — battery d
 - `src/maple/gpio_bus.rs` — HighDrive mode, set_low_power() method
 - `src/main.rs` — QSPI DPD call at startup, bus.set_low_power() in BLE wait phase
 - `src/ble/softdevice.rs` — reconnect advertising interval 160 → 800
+
+---
+
+## 2026-02-20: QSPI DPD Fix + Startup Battery Read
+
+### Problem
+QSPI peripheral approach for flash DPD was unreliable on hardware:
+1. First attempt: hung on `TASKS_ACTIVATE` — missing `IFCONFIG0`/`IFCONFIG1` register config
+2. After adding config: `CINSTRCONF` register offset was wrong (`0x604` = read-only STATUS, should be `0x634`)
+3. After fixing offset: `TASKS_DEACTIVATE` doesn't trigger `EVENTS_READY` (timeout)
+4. After removing deactivate wait: `TASKS_ACTIVATE` failed again (peripheral wedged from previous partial deactivate)
+
+### Solution
+Replaced entire QSPI peripheral approach with GPIO bit-bang SPI:
+- Configure CS (P0.25), SCK (P0.21), IO0/MOSI (P0.20) as GPIO outputs
+- Bit-bang 0xB9 (DPD command) in SPI mode 0, MSB first
+- Deassert CS → flash enters DPD
+- Keep CS driven HIGH, disconnect SCK/IO0-IO3
+
+This is simpler, more reliable, and avoids all QSPI peripheral state machine issues.
+
+### Battery Read at Startup
+Battery percentage wasn't appearing in logs because BLE connects so fast (~500ms with bonded device) that the wait phase battery read never fires. Added an immediate battery read right after startup blink, before entering main loop.
+
+### Battery Voltage History
+| Date | Reading | State | Notes |
+|------|---------|-------|-------|
+| 2026-02-19 | 4455mV | USB 5V bleed-through | Not a real battery reading |
+| 2026-02-19 | 160mV | Trickle pre-charge | Deeply discharged LiPo |
+| 2026-02-19 | 3874mV / ~73% | Charging | First real working reading |
+| 2026-02-19 | 3869mV / ~72% | Charging | ~1hr later, draining (system > charger) |
+| 2026-02-19 | 3601mV / ~50% | Unplugged | Battery-only operation |
+| 2026-02-20 | 3832mV / 69% | Charging | After ~15min on charger |
+
+### Hardware Observation
+RTT log output (clean, no timeouts):
+```
+DC Adapter Starting
+QSPI: Flash in Deep Power Down
+Name: Xbox Wireless Controller
+BLE: Advertising (fast reconnect)
+BLE: Connected!
+PWR: Charging
+BAT: 3832mV 69%
+MAIN: Waiting for BLE connection...
+MAIN: BLE connected, enabling controller
+```
+
+### Files Changed
+- `src/board/xiao.rs` — rewrote `qspi_flash_deep_power_down()` as GPIO bit-bang
+- `src/main.rs` — added initial battery read at startup

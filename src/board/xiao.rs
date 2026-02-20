@@ -231,8 +231,6 @@ impl<'d> BatteryReader<'d> {
         // Combined: v_bat_mv = raw * 3600 * 1510 / (4095 * 510) ≈ raw * 10663 / 4095
         let v_bat_mv = (u64::from(raw) * 10_663 / 4095) as u32;
 
-        rtt_target::rprintln!("BAT: raw={} mv={}", raw, v_bat_mv);
-
         // LiPo: 3000mV = 0%, 4200mV = 100%
         let percent = if v_bat_mv <= 3000 {
             0
@@ -242,80 +240,81 @@ impl<'d> BatteryReader<'d> {
             ((v_bat_mv - 3000) * 100 / 1200) as u8
         };
 
+        rtt_target::rprintln!("BAT: {}mV {}%", v_bat_mv, percent);
+
         (v_bat_mv, percent)
     }
 }
 
 /// Put the onboard P25Q16H QSPI flash into Deep Power Down mode.
 ///
-/// The flash draws 2-5 mA in standby but we never use it (bonds/prefs use
-/// internal flash). DPD drops it to ~3 µA. Call once at startup before
-/// SoftDevice init.
+/// Bit-bangs SPI to send the DPD command (0xB9) — avoids QSPI peripheral
+/// configuration complexity. The flash draws 2-5 mA in standby; DPD drops
+/// it to ~3 µA. Call once at startup.
 ///
-/// After DPD, CS (P0.25) is kept driven HIGH to prevent accidental wake-up
-/// (floating CS can glitch LOW and the flash interprets noise as a Release
-/// command). The other 5 QSPI pins are disconnected.
+/// After DPD, CS (P0.25) is kept driven HIGH to prevent accidental wake-up.
+/// All other QSPI pins (SCK, IO0-IO3) are disconnected.
 ///
 /// # Safety
-/// Writes directly to QSPI and GPIO peripheral registers.
+/// Writes directly to GPIO peripheral registers.
 pub unsafe fn qspi_flash_deep_power_down() {
-    const QSPI_BASE: u32 = 0x4002_9000;
+    use rtt_target::rprintln;
 
-    // Enable QSPI peripheral
-    let enable = (QSPI_BASE + 0x500) as *mut u32;
-    core::ptr::write_volatile(enable, 1);
-
-    // Configure QSPI pin select registers
-    let psel_sck = (QSPI_BASE + 0x524) as *mut u32;
-    let psel_csn = (QSPI_BASE + 0x528) as *mut u32;
-    let psel_io0 = (QSPI_BASE + 0x530) as *mut u32;
-    let psel_io1 = (QSPI_BASE + 0x534) as *mut u32;
-    let psel_io2 = (QSPI_BASE + 0x538) as *mut u32;
-    let psel_io3 = (QSPI_BASE + 0x53C) as *mut u32;
-
-    core::ptr::write_volatile(psel_sck, 21); // P0.21
-    core::ptr::write_volatile(psel_csn, 25); // P0.25
-    core::ptr::write_volatile(psel_io0, 20); // P0.20
-    core::ptr::write_volatile(psel_io1, 24); // P0.24
-    core::ptr::write_volatile(psel_io2, 22); // P0.22
-    core::ptr::write_volatile(psel_io3, 23); // P0.23
-
-    // Activate QSPI
-    let tasks_activate = QSPI_BASE as *mut u32;
-    let events_ready = (QSPI_BASE + 0x100) as *mut u32;
-    core::ptr::write_volatile(events_ready, 0);
-    core::ptr::write_volatile(tasks_activate, 1);
-    while core::ptr::read_volatile(events_ready) == 0 {}
-
-    // Send Deep Power Down command (0xB9): opcode only, no address/data
-    // CINSTRCONF bits: [7:0]=opcode, [10:8]=length(1=opcode only),
-    //                  [12]=LIO2 high, [13]=LIO3 high
-    let cinstrconf = (QSPI_BASE + 0x604) as *mut u32;
-    core::ptr::write_volatile(events_ready, 0);
-    core::ptr::write_volatile(cinstrconf, 0xB9 | (1 << 8) | (1 << 12) | (1 << 13));
-    while core::ptr::read_volatile(events_ready) == 0 {}
-
-    // Deactivate QSPI
-    let tasks_deactivate = (QSPI_BASE + 0x010) as *mut u32;
-    core::ptr::write_volatile(events_ready, 0);
-    core::ptr::write_volatile(tasks_deactivate, 1);
-    while core::ptr::read_volatile(events_ready) == 0 {}
-
-    // Disable QSPI peripheral
-    core::ptr::write_volatile(enable, 0);
-
-    // Keep CS (P0.25) driven HIGH to prevent flash waking up
     const P0_OUTSET: *mut u32 = 0x5000_0508 as *mut u32;
-    core::ptr::write_volatile(P0_OUTSET, 1 << 25);
-    // P0.25 as output (bit 0 = DIR output, bit 1 = INPUT disconnect)
+    const P0_OUTCLR: *mut u32 = 0x5000_050C as *mut u32;
     const P0_PIN_CNF_BASE: *mut u32 = (0x5000_0000 + 0x700) as *mut u32;
-    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(25), 0x0000_0003);
 
-    // Disconnect other QSPI pins (SCK, IO0-IO3)
-    // Reset value 0x00000002 = input disconnected, no pull
-    for pin in [20, 21, 22, 23, 24] {
-        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), 0x0000_0002);
+    // Pin assignments (XIAO nRF52840 QSPI flash)
+    const CS: u32 = 25; // P0.25
+    const SCK: u32 = 21; // P0.21
+    const IO0: u32 = 20; // P0.20 (MOSI)
+
+    // PIN_CNF: output, input disconnected, no pull, standard drive
+    const CNF_OUTPUT: u32 = 0x0000_0003; // DIR=output, INPUT=disconnected
+
+    // Configure CS, SCK, IO0 as outputs
+    // CS starts HIGH (deasserted), SCK starts LOW (SPI mode 0)
+    core::ptr::write_volatile(P0_OUTSET, 1 << CS);
+    core::ptr::write_volatile(P0_OUTCLR, 1 << SCK);
+    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(CS as usize), CNF_OUTPUT);
+    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(SCK as usize), CNF_OUTPUT);
+    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(IO0 as usize), CNF_OUTPUT);
+
+    // Assert CS (LOW)
+    core::ptr::write_volatile(P0_OUTCLR, 1 << CS);
+
+    // Clock out 0xB9 (DPD command), MSB first, SPI mode 0
+    // Mode 0: data set on falling edge, sampled on rising edge
+    const DPD_CMD: u8 = 0xB9;
+    for i in (0..8).rev() {
+        // Set MOSI
+        if (DPD_CMD >> i) & 1 == 1 {
+            core::ptr::write_volatile(P0_OUTSET, 1 << IO0);
+        } else {
+            core::ptr::write_volatile(P0_OUTCLR, 1 << IO0);
+        }
+        // Brief setup time
+        cortex_m::asm::nop();
+        cortex_m::asm::nop();
+        // SCK HIGH (flash samples data)
+        core::ptr::write_volatile(P0_OUTSET, 1 << SCK);
+        cortex_m::asm::nop();
+        cortex_m::asm::nop();
+        // SCK LOW
+        core::ptr::write_volatile(P0_OUTCLR, 1 << SCK);
     }
+
+    // Deassert CS (HIGH) — flash enters DPD on CS rising edge
+    core::ptr::write_volatile(P0_OUTSET, 1 << CS);
+
+    // Keep CS driven HIGH to prevent accidental wake-up
+    // Disconnect SCK, IO0, and the unused IO1-IO3 pins
+    const DISCONNECT: u32 = 0x0000_0002; // input disconnected, no pull
+    for pin in [SCK, IO0, 22, 23, 24] {
+        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin as usize), DISCONNECT);
+    }
+
+    rprintln!("QSPI: Flash in Deep Power Down");
 }
 
 /// Enter System Off mode (deep sleep, ~5µA draw).

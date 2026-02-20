@@ -163,7 +163,21 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "board-xiao")]
     const BATTERY_READ_INTERVAL_MS: u64 = 60_000;
     #[cfg(feature = "board-xiao")]
-    let mut battery_read_countdown: u64 = 0; // Force immediate first read
+    let mut battery_read_countdown: u64 = BATTERY_READ_INTERVAL_MS;
+
+    // Initial battery read at startup
+    #[cfg(feature = "board-xiao")]
+    {
+        let (mv, percent) = battery_reader.read().await;
+        let charging = charge_stat.is_low();
+        BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
+        if !charging && mv < LOW_BATTERY_CUTOFF_MV {
+            rprintln!("PWR: Low battery ({}mV), entering System Off", mv);
+            unsafe {
+                board::enter_system_off();
+            }
+        }
+    }
 
     // Outer loop: wait for BLE connection, then poll controller
     loop {
