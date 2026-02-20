@@ -760,3 +760,51 @@ System draws ~120mA while active but BQ25101 charges at only 100mA — battery d
 - `src/main.rs` — restructured main loop, DCDC enable, BLE connection gating
 - `src/board/xiao.rs` — boost init LOW, added `enable_boost()`, added `StatusLeds::off()`
 - `src/board/dk.rs` — added `StatusLeds::off()` (API parity)
+
+---
+
+## 2026-02-20: Power Optimization Round 2 — QSPI Flash, Pin Disconnect, HighDrive
+
+### Changes
+
+**1. QSPI flash Deep Power Down (biggest find):**
+- P25Q16H flash on XIAO draws 2-5 mA in standby — we never use it
+- This was likely the hidden reason System Off current was milliamps, not ~5 µA
+- Added `qspi_flash_deep_power_down()` in `xiao.rs` using raw QSPI register writes
+- Sends DPD command (0xB9) at startup, before SoftDevice init
+- CS (P0.25) kept driven HIGH after DPD to prevent accidental wake (known Zephyr issue)
+- Other 5 QSPI pins disconnected
+
+**2. Maple Bus pin disconnect when not polling:**
+- Added `MapleBus::set_low_power()` — calls `set_as_disconnected()` on both data pins
+- Called when entering BLE wait phase (Phase 1 of main loop)
+- With pins disconnected, external pull-ups hold both lines at 3.3V, zero current
+- Pins auto-restore when `write_packet()` calls `set_output_mode()` on next poll
+- Saves 0.7 mA (SDCKB pull-up was fighting pin driver continuously)
+
+**3. Pin disconnect before System Off:**
+- Added raw PIN_CNF writes in `enter_system_off()` for SDCKA, SDCKB, charge STAT
+- GPIO state survives System Off on nRF52840 — must explicitly disconnect
+- Without this fix, SDCKB was wasting 0.7 mA throughout entire sleep period
+
+**4. HighDrive mode for Maple Bus TX:**
+- Changed `OutputDrive::Standard` → `OutputDrive::HighDrive` in all gpio_bus.rs calls
+- Output impedance drops from ~1.65kΩ to ~550Ω, rise time 363ns → 121ns
+- Free signal quality improvement, no power cost
+- Better foundation for potential future move to higher-resistance pull-ups
+
+**5. Slower reconnect advertising:**
+- Changed slow reconnect interval from 100ms (160 units) to 500ms (800 units)
+- Bonded hosts still reconnect within 2-4 seconds
+- Saves ~22 µA during slow reconnect phase
+
+### Expected Effect
+- System Off: should drop from ~2-5 mA to ~5-8 µA (QSPI flash was the hidden drain)
+- Advertising/idle: ~12 mA instead of ~17 mA (QSPI + pin disconnect)
+- Active gaming: ~118 mA instead of ~122 mA (QSPI DPD savings)
+
+### Files Changed
+- `src/board/xiao.rs` — QSPI DPD function, pin disconnect in enter_system_off()
+- `src/maple/gpio_bus.rs` — HighDrive mode, set_low_power() method
+- `src/main.rs` — QSPI DPD call at startup, bus.set_low_power() in BLE wait phase
+- `src/ble/softdevice.rs` — reconnect advertising interval 160 → 800

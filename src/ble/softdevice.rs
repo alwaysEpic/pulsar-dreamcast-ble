@@ -248,7 +248,7 @@ pub async fn advertise(
             // Reconnect mode: Slower advertising, NOT discoverable
             // Device won't appear in Bluetooth scans, but bonded devices can still connect
             let config = peripheral::Config {
-                interval: 160, // 160 * 0.625ms = 100ms (slower to save power)
+                interval: 800, // 800 * 0.625ms = 500ms (saves ~22uA vs 100ms)
                 timeout: None,
                 ..Default::default()
             };

@@ -93,8 +93,8 @@ impl MapleBus {
     #[allow(clippy::similar_names)] // sdcka/sdckb are protocol names
     pub fn new(mut sdcka: Flex<'static>, mut sdckb: Flex<'static>) -> Self {
         // Start in output mode with idle state
-        sdcka.set_as_output(embassy_nrf::gpio::OutputDrive::Standard);
-        sdckb.set_as_output(embassy_nrf::gpio::OutputDrive::Standard);
+        sdcka.set_as_output(embassy_nrf::gpio::OutputDrive::HighDrive);
+        sdckb.set_as_output(embassy_nrf::gpio::OutputDrive::HighDrive);
         sdcka.set_high();
         sdckb.set_low();
 
@@ -106,12 +106,22 @@ impl MapleBus {
         Self { sdcka, sdckb }
     }
 
+    /// Set pins to lowest-power disconnected state.
+    ///
+    /// Call when not polling (BLE disconnected). External pull-ups hold both
+    /// lines at 3.3V with zero current flow. Saves ~0.7 mA vs idle state
+    /// where SDCKB is driven LOW against its pull-up.
+    pub fn set_low_power(&mut self) {
+        self.sdcka.set_as_disconnected();
+        self.sdckb.set_as_disconnected();
+    }
+
     /// Configure pins as outputs (push-pull).
     pub fn set_output_mode(&mut self) {
         self.sdcka
-            .set_as_output(embassy_nrf::gpio::OutputDrive::Standard);
+            .set_as_output(embassy_nrf::gpio::OutputDrive::HighDrive);
         self.sdckb
-            .set_as_output(embassy_nrf::gpio::OutputDrive::Standard);
+            .set_as_output(embassy_nrf::gpio::OutputDrive::HighDrive);
     }
 
     /// Read current pin states (for diagnostics).
@@ -125,9 +135,9 @@ impl MapleBus {
         let b = self.sdckb.is_high();
         // Restore output mode
         self.sdcka
-            .set_as_output(embassy_nrf::gpio::OutputDrive::Standard);
+            .set_as_output(embassy_nrf::gpio::OutputDrive::HighDrive);
         self.sdckb
-            .set_as_output(embassy_nrf::gpio::OutputDrive::Standard);
+            .set_as_output(embassy_nrf::gpio::OutputDrive::HighDrive);
         self.sdcka.set_high();
         self.sdckb.set_low();
         (a, b)

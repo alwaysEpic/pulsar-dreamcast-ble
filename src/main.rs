@@ -66,6 +66,12 @@ async fn main(spawner: Spawner) {
     }
     let p = embassy_nrf::init(config);
 
+    // Put onboard QSPI flash into Deep Power Down (saves 2-5 mA)
+    #[cfg(feature = "board-xiao")]
+    unsafe {
+        board::qspi_flash_deep_power_down();
+    }
+
     // Load name preference from flash (Xbox vs Dreamcast)
     let is_dreamcast = ble::flash_bond::load_name_preference();
     if is_dreamcast {
@@ -163,6 +169,7 @@ async fn main(spawner: Spawner) {
     loop {
         // --- Phase 1: Wait for BLE connection ---
         rprintln!("MAIN: Waiting for BLE connection...");
+        bus.set_low_power();
         status.off();
         loop {
             if get_connection_state() == ConnectionState::Connected {
