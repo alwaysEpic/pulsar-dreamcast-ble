@@ -47,10 +47,13 @@ The Dreamcast controller has one analog stick, which maps to the left stick. The
 
 ## Sync Button
 
-The sync button on the adapter has two functions:
+The sync button on the adapter has three functions:
 
 ### Pair with a New Device (Hold 3 seconds)
-Hold the sync button for 3 seconds. The LED will blink rapidly while you hold it. When released, the adapter enters **pairing mode** for 60 seconds. This clears any existing pairing, so you'll need to pair again from your host device.
+Hold the sync button for 3 seconds. The LED will blink while you hold it. When released, the adapter enters **pairing mode** for 60 seconds. This clears any existing pairing, so you'll need to pair again from your host device.
+
+### Manual Sleep (Hold 10 seconds)
+Keep holding past the 3-second sync point. The LED blink rate will double to indicate sleep is approaching. At 10 seconds, the adapter enters deep sleep immediately. This is useful for conserving battery or allowing the battery to charge on USB without the controller drawing power.
 
 ### Toggle Device Name (Triple-press)
 Press the sync button three times quickly (within 2 seconds). The LED will flash 5 times to confirm. The adapter toggles between two names:
@@ -71,12 +74,13 @@ Charge the battery by connecting USB to the XIAO board.
 
 ## Sleep & Wake
 
-The adapter enters deep sleep to save battery in two situations:
+The adapter enters deep sleep to save battery in three situations:
 
-1. **No Bluetooth connection** for 60 seconds after power-on or disconnect.
-2. **No controller input** for 10 minutes while connected (inactivity timeout).
+1. **Manual sleep** -- hold the sync button for 10 seconds.
+2. **Controller disconnected** for 60 seconds while BLE is connected (re-detect timeout).
+3. **No controller input** for 10 minutes while connected (inactivity timeout).
 
-When asleep, the adapter draws minimal power (~5 microamps).
+When asleep, the adapter draws minimal power (~5 microamps). The battery charges normally from USB while asleep.
 
 **To wake up:** Press the sync button. The adapter performs a full restart and will reconnect to your paired device.
 
@@ -87,8 +91,9 @@ When asleep, the adapter draws minimal power (~5 microamps).
 | Green blink (3x) | Starting up |
 | Solid red | Searching for controller |
 | Solid green | Controller found / connected |
-| Fast blink | Pairing mode active (60s) |
-| Rapid blink while holding | Sync button held, pending action |
+| Fast blink (blue) | Pairing mode active (60s) |
+| Blink while holding | Sync button held, pending action |
+| Fast blink while holding | Past sync point, approaching sleep |
 | 5 quick flashes | Name toggle confirmed |
 | Off | Sleeping or idle (no BLE connection) |
 
