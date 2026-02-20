@@ -716,3 +716,47 @@ Added `const _: () = assert!(size_of::<IdentityResolutionKey>() == 16);` to catc
 - `src/button.rs` — removed debug logging (pin state, state transitions, press detection)
 - `dc-protocol/src/controller_state.rs` — thresholds 15/10 → 2/2
 - `src/maple/gpio_bus.rs` — fixed clippy cast_lossless warnings
+
+---
+
+## 2026-02-20: Battery Life Optimization — Gate Boost on BLE Connection
+
+### Problem
+System draws ~120mA while active but BQ25101 charges at only 100mA — battery drains even when plugged into USB. The boost converter + Dreamcast controller (~60-80mA) is the dominant consumer and serves no purpose when BLE is disconnected.
+
+### Changes
+
+**Restructured main loop to gate controller polling on BLE connection state:**
+1. Boot → init pins (boost OFF) → start BLE advertising
+2. Wait for BLE connection (check `get_connection_state() == Connected`)
+3. Enable boost → detect controller → enter poll loop
+4. On BLE disconnect → disable boost → LEDs off → loop back to waiting
+5. Inactivity/timeout → System Off (unchanged)
+
+**Enabled REG1 DCDC converter** (XIAO only):
+- `config.dcdc.reg1 = true` — confirmed safe, XIAO has inductor (verified via Zephyr DTS)
+- Free efficiency gain during radio activity (~2-3mA savings)
+- Do NOT enable REG0 (no inductor on XIAO, VDDH tied to VDD)
+
+**Boost init changed to OFF:**
+- `init_pins` now starts boost LOW instead of HIGH
+- Added `enable_boost()` alongside existing `disable_boost()`
+- Boost only turns on after BLE connection established
+
+**Added `StatusLeds::off()` to both board files:**
+- LEDs turn off when BLE disconnects (no point showing status with no host)
+
+**Battery/charge monitoring continues during BLE wait phase:**
+- Low battery cutoff still works while advertising
+- Charge status changes still logged
+
+### Expected Effect
+- Advertising/idle: ~15mA instead of ~120mA (boost off, no Maple Bus polling)
+- Battery can actually charge on USB (100mA charge > 15mA draw)
+- Active gaming: unchanged ~120mA
+- With typical 50/50 usage: ~7-8 hours on 500mAh vs ~4 hours before
+
+### Files Changed
+- `src/main.rs` — restructured main loop, DCDC enable, BLE connection gating
+- `src/board/xiao.rs` — boost init LOW, added `enable_boost()`, added `StatusLeds::off()`
+- `src/board/dk.rs` — added `StatusLeds::off()` (API parity)

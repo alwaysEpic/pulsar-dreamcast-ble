@@ -3,6 +3,7 @@
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
+use embedded_rust_setup::ble::{get_connection_state, ConnectionState};
 use embedded_rust_setup::maple::host::MapleResult;
 use embedded_rust_setup::maple::{ControllerState, MapleBus, MapleHost};
 use embedded_rust_setup::{ble, board, CONTROLLER_STATE};
@@ -36,6 +37,9 @@ const INITIAL_RETRY_DELAY_MS: u64 = 100;
 /// Maximum retry delay for controller detection (ms).
 const MAX_RETRY_DELAY_MS: u64 = 1000;
 
+/// How often to check BLE connection state while waiting (ms).
+const BLE_WAIT_CHECK_MS: u64 = 100;
+
 /// Timeout before entering sleep when controller is idle (ms).
 /// 10 minutes with no input change triggers System Off.
 #[cfg(feature = "board-xiao")]
@@ -56,6 +60,10 @@ async fn main(spawner: Spawner) {
     let mut config = embassy_nrf::config::Config::default();
     config.gpiote_interrupt_priority = embassy_nrf::interrupt::Priority::P2;
     config.time_interrupt_priority = embassy_nrf::interrupt::Priority::P2;
+    #[cfg(feature = "board-xiao")]
+    {
+        config.dcdc.reg1 = true;
+    }
     let p = embassy_nrf::init(config);
 
     // Load name preference from flash (Xbox vs Dreamcast)
@@ -133,7 +141,7 @@ async fn main(spawner: Spawner) {
 
     // Log initial charge status
     #[cfg(feature = "board-xiao")]
-    let initial_charging = {
+    let mut was_charging = {
         let charging = charge_stat.is_low();
         rprintln!(
             "PWR: {}",
@@ -146,149 +154,240 @@ async fn main(spawner: Spawner) {
     let mut bus = MapleBus::new(sdcka, sdckb);
     let host = MapleHost::new();
 
-    // Detect controller (retry with backoff until found)
-    status.show_searching();
-    let mut retry_delay_ms: u64 = INITIAL_RETRY_DELAY_MS;
-    let mut timeout_logged = false;
-    loop {
-        status.tx_activity_on();
-        let result = host.request_device_info(&mut bus);
-        status.tx_activity_off();
-
-        match &result {
-            MapleResult::Ok(_) => {
-                status.show_controller_found();
-                rprintln!("MAPLE: Controller detected");
-                break;
-            }
-            MapleResult::Timeout => {
-                if !timeout_logged {
-                    rprintln!("MAPLE: Timeout (retrying...)");
-                    bus.diagnose_bus();
-                    timeout_logged = true;
-                }
-            }
-            MapleResult::UnexpectedResponse(cmd) => {
-                rprintln!("MAPLE: Unexpected cmd=0x{:02X}", cmd);
-            }
-        }
-
-        Timer::after(Duration::from_millis(retry_delay_ms)).await;
-        // Back off up to max delay between retries
-        retry_delay_ms = (retry_delay_ms * 2).min(MAX_RETRY_DELAY_MS);
-    }
-
-    let mut last_state: Option<ControllerState> = None;
-    let mut fail_count: u16 = 0;
-    #[cfg(feature = "board-xiao")]
-    let mut last_activity = Instant::now();
-    #[cfg(feature = "board-xiao")]
-    let mut was_charging = initial_charging;
     #[cfg(feature = "board-xiao")]
     const BATTERY_READ_INTERVAL_MS: u64 = 60_000;
     #[cfg(feature = "board-xiao")]
     let mut battery_read_countdown: u64 = 0; // Force immediate first read
 
+    // Outer loop: wait for BLE connection, then poll controller
     loop {
-        if let MapleResult::Ok(state) = host.get_condition(&mut bus) {
-            if fail_count >= CONTROLLER_LOST_THRESHOLD {
-                rprintln!("MAPLE: Controller reconnected");
+        // --- Phase 1: Wait for BLE connection ---
+        rprintln!("MAIN: Waiting for BLE connection...");
+        status.off();
+        loop {
+            if get_connection_state() == ConnectionState::Connected {
+                break;
             }
-            fail_count = 0;
 
-            // Only signal when state changes
-            let changed = match &last_state {
-                None => true,
-                Some(prev) => prev.state_changed(&state),
-            };
-
-            if changed {
-                CONTROLLER_STATE.signal(state);
-                last_state = Some(state);
-                #[cfg(feature = "board-xiao")]
-                {
-                    last_activity = Instant::now();
+            #[cfg(feature = "board-xiao")]
+            {
+                // Battery/charge monitoring while waiting for BLE
+                let charging = charge_stat.is_low();
+                if charging != was_charging {
+                    rprintln!(
+                        "CHG: {}",
+                        if charging {
+                            "Charging started"
+                        } else {
+                            "Charging stopped"
+                        }
+                    );
+                    was_charging = charging;
                 }
-            }
-        } else {
-            fail_count = fail_count.saturating_add(1);
-            if fail_count == CONTROLLER_LOST_THRESHOLD {
-                rprintln!("MAPLE: Controller lost, re-detecting...");
-                CONTROLLER_STATE.signal(ControllerState::default());
-                last_state = None;
-                status.show_searching();
 
-                // Re-detect controller before resuming polling
-                let mut retry_delay_ms: u64 = INITIAL_RETRY_DELAY_MS;
-                #[cfg(feature = "board-xiao")]
-                let redetect_start = Instant::now();
-                loop {
-                    // Sleep after 60s of failed re-detection (XIAO only)
-                    #[cfg(feature = "board-xiao")]
-                    if redetect_start.elapsed().as_millis() >= SLEEP_TIMEOUT_MS {
-                        rprintln!("MAPLE: Re-detect timeout, entering System Off");
+                battery_read_countdown = battery_read_countdown.saturating_sub(BLE_WAIT_CHECK_MS);
+                if battery_read_countdown == 0 {
+                    let (mv, percent) = battery_reader.read().await;
+                    BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
+                    battery_read_countdown = BATTERY_READ_INTERVAL_MS;
+
+                    if !charging && mv < LOW_BATTERY_CUTOFF_MV {
+                        rprintln!("PWR: Low battery ({}mV), entering System Off", mv);
                         unsafe {
                             board::enter_system_off();
                         }
                     }
+                }
+            }
 
-                    let result = host.request_device_info(&mut bus);
-                    if let MapleResult::Ok(_) = &result {
-                        rprintln!("MAPLE: Controller re-detected");
-                        status.show_controller_found();
-                        fail_count = 0;
-                        #[cfg(feature = "board-xiao")]
-                        {
-                            last_activity = Instant::now();
+            Timer::after(Duration::from_millis(BLE_WAIT_CHECK_MS)).await;
+        }
+        rprintln!("MAIN: BLE connected, enabling controller");
+
+        // --- Phase 2: Enable boost and detect controller ---
+        #[cfg(feature = "board-xiao")]
+        unsafe {
+            board::enable_boost();
+        }
+        // Brief delay for boost converter startup
+        Timer::after(Duration::from_millis(50)).await;
+
+        status.show_searching();
+        let mut retry_delay_ms: u64 = INITIAL_RETRY_DELAY_MS;
+        let mut timeout_logged = false;
+        let controller_found = loop {
+            // Abort detection if BLE disconnects
+            if get_connection_state() != ConnectionState::Connected {
+                break false;
+            }
+
+            status.tx_activity_on();
+            let result = host.request_device_info(&mut bus);
+            status.tx_activity_off();
+
+            match &result {
+                MapleResult::Ok(_) => {
+                    status.show_controller_found();
+                    rprintln!("MAPLE: Controller detected");
+                    break true;
+                }
+                MapleResult::Timeout => {
+                    if !timeout_logged {
+                        rprintln!("MAPLE: Timeout (retrying...)");
+                        bus.diagnose_bus();
+                        timeout_logged = true;
+                    }
+                }
+                MapleResult::UnexpectedResponse(cmd) => {
+                    rprintln!("MAPLE: Unexpected cmd=0x{:02X}", cmd);
+                }
+            }
+
+            Timer::after(Duration::from_millis(retry_delay_ms)).await;
+            retry_delay_ms = (retry_delay_ms * 2).min(MAX_RETRY_DELAY_MS);
+        };
+
+        if !controller_found {
+            rprintln!("MAIN: BLE disconnected during detection, disabling boost");
+            #[cfg(feature = "board-xiao")]
+            unsafe {
+                board::disable_boost();
+            }
+            continue;
+        }
+
+        // --- Phase 3: Poll loop (active gaming) ---
+        let mut last_state: Option<ControllerState> = None;
+        let mut fail_count: u16 = 0;
+        #[cfg(feature = "board-xiao")]
+        let mut last_activity = Instant::now();
+
+        loop {
+            // Check for BLE disconnect
+            if get_connection_state() != ConnectionState::Connected {
+                rprintln!("MAIN: BLE disconnected, disabling boost");
+                #[cfg(feature = "board-xiao")]
+                unsafe {
+                    board::disable_boost();
+                }
+                status.off();
+                CONTROLLER_STATE.signal(ControllerState::default());
+                break;
+            }
+
+            if let MapleResult::Ok(state) = host.get_condition(&mut bus) {
+                if fail_count >= CONTROLLER_LOST_THRESHOLD {
+                    rprintln!("MAPLE: Controller reconnected");
+                }
+                fail_count = 0;
+
+                let changed = match &last_state {
+                    None => true,
+                    Some(prev) => prev.state_changed(&state),
+                };
+
+                if changed {
+                    CONTROLLER_STATE.signal(state);
+                    last_state = Some(state);
+                    #[cfg(feature = "board-xiao")]
+                    {
+                        last_activity = Instant::now();
+                    }
+                }
+            } else {
+                fail_count = fail_count.saturating_add(1);
+                if fail_count == CONTROLLER_LOST_THRESHOLD {
+                    rprintln!("MAPLE: Controller lost, re-detecting...");
+                    CONTROLLER_STATE.signal(ControllerState::default());
+                    last_state = None;
+                    status.show_searching();
+
+                    let mut retry_delay_ms: u64 = INITIAL_RETRY_DELAY_MS;
+                    #[cfg(feature = "board-xiao")]
+                    let redetect_start = Instant::now();
+                    loop {
+                        // Abort re-detection if BLE disconnects
+                        if get_connection_state() != ConnectionState::Connected {
+                            break;
                         }
+
+                        #[cfg(feature = "board-xiao")]
+                        if redetect_start.elapsed().as_millis() >= SLEEP_TIMEOUT_MS {
+                            rprintln!("MAPLE: Re-detect timeout, entering System Off");
+                            unsafe {
+                                board::enter_system_off();
+                            }
+                        }
+
+                        let result = host.request_device_info(&mut bus);
+                        if let MapleResult::Ok(_) = &result {
+                            rprintln!("MAPLE: Controller re-detected");
+                            status.show_controller_found();
+                            fail_count = 0;
+                            #[cfg(feature = "board-xiao")]
+                            {
+                                last_activity = Instant::now();
+                            }
+                            break;
+                        }
+                        Timer::after(Duration::from_millis(retry_delay_ms)).await;
+                        retry_delay_ms = (retry_delay_ms * 2).min(MAX_RETRY_DELAY_MS);
+                    }
+
+                    // If BLE disconnected during re-detection, break to outer loop
+                    if get_connection_state() != ConnectionState::Connected {
+                        rprintln!("MAIN: BLE disconnected during re-detect, disabling boost");
+                        #[cfg(feature = "board-xiao")]
+                        unsafe {
+                            board::disable_boost();
+                        }
+                        status.off();
+                        CONTROLLER_STATE.signal(ControllerState::default());
                         break;
                     }
-                    Timer::after(Duration::from_millis(retry_delay_ms)).await;
-                    retry_delay_ms = (retry_delay_ms * 2).min(MAX_RETRY_DELAY_MS);
                 }
             }
-        }
 
-        #[cfg(feature = "board-xiao")]
-        {
-            // BQ25101 STAT: LOW = charging, HIGH = not charging / full
-            let charging = charge_stat.is_low();
-            if charging != was_charging {
-                if charging {
-                    rprintln!("CHG: Charging started");
-                } else {
-                    rprintln!("CHG: Charging stopped");
+            #[cfg(feature = "board-xiao")]
+            {
+                let charging = charge_stat.is_low();
+                if charging != was_charging {
+                    rprintln!(
+                        "CHG: {}",
+                        if charging {
+                            "Charging started"
+                        } else {
+                            "Charging stopped"
+                        }
+                    );
+                    was_charging = charging;
                 }
-                was_charging = charging;
-            }
 
-            // Periodic battery read for BLE reporting and low-voltage cutoff
-            battery_read_countdown = battery_read_countdown.saturating_sub(POLL_INTERVAL_MS);
-            if battery_read_countdown == 0 {
-                let (mv, percent) = battery_reader.read().await;
-                // Send 0xFF when charging so BLE task knows not to report %
-                BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
-                battery_read_countdown = BATTERY_READ_INTERVAL_MS;
+                battery_read_countdown = battery_read_countdown.saturating_sub(POLL_INTERVAL_MS);
+                if battery_read_countdown == 0 {
+                    let (mv, percent) = battery_reader.read().await;
+                    BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
+                    battery_read_countdown = BATTERY_READ_INTERVAL_MS;
 
-                // Low battery cutoff (only when not charging — ADC reads VBUS on USB)
-                if !charging && mv < LOW_BATTERY_CUTOFF_MV {
-                    rprintln!("PWR: Low battery ({}mV), entering System Off", mv);
-                    unsafe {
-                        board::enter_system_off();
+                    if !charging && mv < LOW_BATTERY_CUTOFF_MV {
+                        rprintln!("PWR: Low battery ({}mV), entering System Off", mv);
+                        unsafe {
+                            board::enter_system_off();
+                        }
                     }
                 }
             }
-        }
 
-        #[cfg(feature = "board-xiao")]
-        if last_activity.elapsed().as_millis() >= INACTIVITY_TIMEOUT_MS {
-            rprintln!("MAIN: Inactivity timeout (10 min), entering System Off");
-            unsafe {
-                board::enter_system_off();
+            #[cfg(feature = "board-xiao")]
+            if last_activity.elapsed().as_millis() >= INACTIVITY_TIMEOUT_MS {
+                rprintln!("MAIN: Inactivity timeout (10 min), entering System Off");
+                unsafe {
+                    board::enter_system_off();
+                }
             }
-        }
 
-        Timer::after(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            Timer::after(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
     }
 }
 

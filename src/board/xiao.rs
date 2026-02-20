@@ -58,6 +58,12 @@ impl StatusLeds {
         self.led_g.set_low();
     }
 
+    /// Turn off all status LEDs.
+    pub fn off(&mut self) {
+        self.led_r.set_high();
+        self.led_g.set_high();
+    }
+
     /// Turn on TX activity indicator (no-op on XIAO to avoid flicker).
     #[allow(clippy::unused_self)] // Must match DK API
     pub fn tx_activity_on(&mut self) {}
@@ -103,8 +109,8 @@ pub fn init_pins(
     let led_g = Output::new(led_g_pin, Level::High, OutputDrive::Standard);
     let sync_led = Output::new(led_b_pin, Level::High, OutputDrive::Standard);
 
-    // Enable 5V boost converter on startup
-    let boost = Output::new(boost_pin, Level::High, OutputDrive::Standard);
+    // Start with boost converter OFF — enabled later when BLE connects
+    let boost = Output::new(boost_pin, Level::Low, OutputDrive::Standard);
     // Store in static for sleep/shutdown access
     // SAFETY: Written once here, read only from main task during sleep entry
     unsafe {
@@ -146,7 +152,18 @@ const WAKE_PIN_NUM: u32 = 15;
 /// no concurrent access possible.
 static mut BOOST_CONTROL: Option<Output<'static>> = None;
 
-/// Disable the 5V boost converter before entering System Off.
+/// Enable the 5V boost converter (when BLE connects).
+///
+/// # Safety
+/// Must only be called from the main task context, after `init_pins`.
+pub unsafe fn enable_boost() {
+    // SAFETY: See BOOST_CONTROL declaration — single writer, single reader, no concurrency.
+    if let Some(ref mut boost) = BOOST_CONTROL {
+        boost.set_high();
+    }
+}
+
+/// Disable the 5V boost converter (on BLE disconnect or before System Off).
 ///
 /// # Safety
 /// Must only be called from the main task context, after `init_pins`.
@@ -159,9 +176,10 @@ pub unsafe fn disable_boost() {
 
 /// Battery voltage reader using SAADC on P0.31 (AIN7).
 ///
-/// The XIAO has a 1:2 voltage divider on P0.31, gated by P0.14 (HIGH=enable).
-/// With the internal 0.6V reference and 1/6 gain, the SAADC input range is 0-3.6V,
-/// which maps to 0-7.2V battery voltage after the 2:1 divider.
+/// The XIAO has a 1M + 510K voltage divider on P0.31, with P0.14 as the low side.
+/// P0.14 LOW = divider enabled (measuring), P0.14 HIGH = divider disabled (idle).
+/// With the internal 0.6V reference and 1/6 gain, the SAADC input range is 0-3.6V.
+/// Battery voltage = ADC voltage * (1M + 510K) / 510K ≈ ADC * 2.96.
 pub struct BatteryReader<'d> {
     saadc: Saadc<'d, 1>,
     enable: Output<'d>,
@@ -170,7 +188,7 @@ pub struct BatteryReader<'d> {
 impl<'d> BatteryReader<'d> {
     /// Create a new battery reader.
     ///
-    /// `enable_pin` is P0.14 (drives the voltage divider gate).
+    /// `enable_pin` is P0.14 (LOW = enable divider, HIGH = disable).
     /// `adc_pin` is P0.31 (AIN7, battery voltage through divider).
     /// `saadc_peri` is the SAADC peripheral.
     pub fn new(
@@ -182,7 +200,8 @@ impl<'d> BatteryReader<'d> {
                 saadc::InterruptHandler,
             > + 'd,
     ) -> Self {
-        let enable = Output::new(enable_pin, Level::Low, OutputDrive::Standard);
+        // Start with divider disabled (HIGH) to avoid current leak
+        let enable = Output::new(enable_pin, Level::High, OutputDrive::Standard);
         let channel = saadc::ChannelConfig::single_ended(adc_pin);
         let saadc = Saadc::new(saadc_peri, irq, saadc::Config::default(), [channel]);
         Self { saadc, enable }
@@ -190,28 +209,29 @@ impl<'d> BatteryReader<'d> {
 
     /// Read battery voltage and return `(millivolts, percentage)`.
     ///
-    /// Enables the voltage divider, takes a sample, disables divider.
+    /// Enables the voltage divider (P0.14 LOW), takes a sample, disables (P0.14 HIGH).
     ///
     /// 12-bit SAADC with 0.6V internal ref, 1/6 gain gives 0-3.6V range.
-    /// Battery voltage = ADC voltage * 2 (1:2 divider).
+    /// Divider: 1M + 510K → V_adc = V_bat * 510 / 1510.
     /// Battery range: 3.0V (empty) to 4.2V (full).
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub async fn read(&mut self) -> (u32, u8) {
-        self.enable.set_high();
-        // Brief settling time for the voltage divider
+        self.enable.set_low(); // Enable divider
         Timer::after(Duration::from_micros(100)).await;
 
         let mut buf = [0i16; 1];
         self.saadc.sample(&mut buf).await;
 
-        self.enable.set_low();
+        self.enable.set_high(); // Disable divider
 
         let raw = buf[0].max(0) as u32;
         // 12-bit resolution (0-4095), internal ref 0.6V, gain 1/6 → full scale 3.6V
-        // Voltage at ADC pin = raw * 3.6 / 4095
-        // Battery voltage = ADC voltage * 2 (voltage divider)
-        // Fixed-point: v_bat_mv = raw * 7200 / 4095
-        let v_bat_mv = raw * 7200 / 4095;
+        // ADC voltage (mV) = raw * 3600 / 4095
+        // Battery voltage = ADC voltage * (1M + 510K) / 510K = ADC * 1510 / 510
+        // Combined: v_bat_mv = raw * 3600 * 1510 / (4095 * 510) ≈ raw * 10663 / 4095
+        let v_bat_mv = (u64::from(raw) * 10_663 / 4095) as u32;
+
+        rtt_target::rprintln!("BAT: raw={} mv={}", raw, v_bat_mv);
 
         // LiPo: 3000mV = 0%, 4200mV = 100%
         let percent = if v_bat_mv <= 3000 {

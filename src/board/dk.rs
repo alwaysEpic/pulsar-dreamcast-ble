@@ -48,6 +48,13 @@ impl StatusLeds {
         self.led3.set_low();
     }
 
+    /// Turn off all status LEDs.
+    pub fn off(&mut self) {
+        self.led2.set_high();
+        self.led3.set_high();
+        self.led4.set_high();
+    }
+
     /// Turn on TX activity indicator (LED2).
     pub fn tx_activity_on(&mut self) {
         self.led2.set_low();
