@@ -70,7 +70,7 @@ The adapter monitors the LiPo battery and reports the level over Bluetooth (visi
 - **Full charge:** 4.2V
 - **Empty:** 3.0V
 
-Charge the battery by connecting USB to the XIAO board.
+Charge the battery by connecting USB to the XIAO board. A USB power brick or phone charger is recommended for charging. **Note:** Some laptops (especially MacBooks) have smart USB ports that may reduce or cut power when the adapter is in deep sleep, since the USB peripheral is off and the laptop doesn't detect a device. If you notice the battery not charging from a laptop, either use a standard USB charger or keep the adapter awake while plugged in.
 
 ## Sleep & Wake
 
