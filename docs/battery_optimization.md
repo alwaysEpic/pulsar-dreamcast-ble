@@ -323,3 +323,267 @@ Already done:
 | Active gaming | ~122 mA | ~118 mA | ~4 mA (QSPI) |
 | BLE advertising | ~17 mA | ~12 mA | ~5 mA (QSPI + pin disconnect) |
 | System Off | ~2-5 mA (!) | ~5-8 uA | ~2-5 mA (QSPI was the hidden drain) |
+
+---
+
+## Overnight Drain Investigation — 2026-02-21
+
+### Symptom
+Fully charged battery (4.2V) drained to 166mV overnight while supposedly in System Off.
+500mAh / ~8 hours = ~60mA average draw. Way above the ~5-10µA System Off target.
+
+### Most Likely Cause: No Advertising Timeout
+
+The main loop Phase 1 (BLE wait) has **no timeout**. If the device wakes from System Off (button
+press, noise on SENSE pin, or power glitch) and nobody connects via BLE, it advertises at ~1-2mA
+**forever**. At 1.5mA, a 500mAh battery lasts ~14 days — but combined with any other wake/boot
+cycles, this fits the overnight drain pattern.
+
+**Fix:** Add an advertising timeout — if no BLE connection within 5 minutes, enter System Off.
+
+### Other Possible Contributors
+
+**Pins not disconnected in System Off:**
+- P0.14 (battery divider enable) — if floating/LOW, enables the 1M+510K divider (~2.8µA)
+- P0.13 (charge current set) — dropped immediately after init, may float
+- P0.06, P0.26, P0.30 (LEDs) — set HIGH but not disconnected
+
+**Fix:** Disconnect all unnecessary pins in `enter_system_off()`:
+```
+Pins to disconnect: 3, 5, 6, 13, 14, 17, 20, 21, 22, 23, 24, 26, 30
+Keep: P0.25 (QSPI CS, driven HIGH), P0.28 (boost SHDN, driven LOW)
+```
+
+**Charge current pin (P0.13) behavior:** Created as `Output`, immediately dropped. Embassy may
+reset the pin on drop, leaving it floating. BQ25101 ISET behavior with floating input is undefined.
+
+### Action Items
+1. **Add 5-minute advertising timeout** — enter System Off if no BLE connection
+2. **Disconnect all unused GPIO pins** before System Off
+3. **Measure System Off current** with multimeter to verify fix
+4. **Measure active gaming current** to get real battery life numbers
+
+---
+
+## Battery Testing Plan — 2026-02-21
+
+### Goal
+Verify battery life is at least 3-4 hours of active gaming, System Off draws <20µA,
+and the battery is protected from damage in all scenarios.
+
+### Equipment Needed
+
+| Tool | Purpose | Cost | Priority |
+|------|---------|------|----------|
+| Multimeter (any) | Measure current in all states | Already have | Essential |
+| USB power meter | Verify charging current and USB-powered draw | ~$10-15 | Nice to have |
+| INA219 breakout | Continuous current logging via I2C | ~$3-8 | Nice to have |
+| Nordic PPK2 | µA-resolution power profiling, sees BLE events | ~$99 | Gold standard |
+
+### Test Procedures
+
+#### Test 1: System Off Current (CRITICAL — do this first)
+**Purpose:** Verify the overnight drain is fixed.
+
+1. Put multimeter in µA (microamp) mode, 200µA or 2000µA range
+2. Disconnect battery positive from board
+3. Connect multimeter in series: battery(+) → multimeter(+), multimeter(-) → board BAT(+)
+4. Boot the device, wait for it to start advertising
+5. Enter System Off via 7s hold (or wait for advertising timeout once implemented)
+6. Read the multimeter — should be **<20µA** for the whole board
+7. If >100µA, something is still drawing power — investigate pin by pin
+
+**Expected breakdown:**
+- nRF52840 System Off: ~1.9µA
+- QSPI flash in DPD: ~3µA
+- BQ25101 quiescent: ~1µA
+- LDO quiescent: ~2µA
+- Total: ~8µA
+
+**If reading is milliamps:** The device is not actually in System Off. Check RTT for boot loops,
+verify `sd_power_system_off()` is being called, check SENSE pin configuration.
+
+#### Test 2: Advertising Current
+**Purpose:** Know the idle draw when waiting for BLE connection.
+
+1. Multimeter in mA mode, in series with battery
+2. Boot device, do NOT connect BLE
+3. Wait for advertising to stabilize (~5s past fast reconnect)
+4. Read — should be **0.5-2mA** (slow reconnect at 500ms interval)
+
+#### Test 3: Active Gaming Current
+**Purpose:** Calculate real battery life.
+
+1. Multimeter in mA mode (use 10A jack if >200mA)
+2. Boot, connect BLE, connect controller
+3. Move stick / press buttons
+4. Read — expect **120-190mA** (boost converter efficiency means battery
+   draws more than the 5V rail: P_bat = P_5V / efficiency)
+
+**Battery life = 500mAh / measured_mA**
+
+If reading is 180mA → ~2.8 hours. If 130mA → ~3.8 hours.
+
+#### Test 4: Charging Verification
+**Purpose:** Confirm battery charges correctly and safely.
+
+1. Discharge battery to ~3.3V (just above cutoff)
+2. Connect USB power brick (not laptop)
+3. Verify `PWR: Charging` in RTT log
+4. Monitor battery voltage over time — should rise steadily
+5. When BQ25101 STAT goes HIGH, battery should read 4.1-4.2V
+6. Disconnect USB, wait 30 minutes, read voltage — should stay >4.1V
+
+#### Test 5: Low Battery Cutoff
+**Purpose:** Verify graceful shutdown protects the battery.
+
+1. Let the device run on battery until cutoff triggers
+2. Verify RTT shows `PWR: Low battery (XXXXmV), entering System Off`
+3. Verify the cutoff voltage is ~3200mV (our threshold)
+4. After cutoff, measure battery resting voltage — should be above 3.0V
+   (voltage rebounds after load is removed)
+
+#### Test 6: Wake and Reconnect Cycle
+**Purpose:** Verify the full sleep/wake lifecycle works.
+
+1. Enter System Off (manual 7s hold)
+2. Press sync button — should wake and boot
+3. Verify it reconnects to previously bonded host
+4. Let it auto-sleep from inactivity timeout (10 min)
+5. Wake again — verify reconnect still works
+6. Repeat 2-3 times to confirm reliability
+
+### Timed Battery Life Test
+**Purpose:** Real-world battery life measurement.
+
+1. Fully charge battery (4.2V, charging complete)
+2. Disconnect USB
+3. Boot, connect BLE, connect controller
+4. Start a stopwatch
+5. Use controller normally (or leave stick slightly deflected to prevent inactivity sleep)
+6. Note the time when low battery cutoff triggers
+7. That's your actual battery life
+
+---
+
+## General Low-Power Embedded Best Practices
+
+Guidelines applicable to any battery-powered embedded project, not just this one.
+
+### 1. Account for Every Microamp in Sleep
+
+In deep sleep, every component matters. Create a sleep current budget:
+- List every IC on the board and its quiescent/shutdown current from datasheets
+- List every GPIO pin and its state (output high/low, input with pull, disconnected)
+- Calculate current through every resistor divider, pull-up, and pull-down
+- Measure and compare — the delta reveals hidden drains
+
+Common hidden drains:
+- **Flash/EEPROM chips** not in deep power down (2-5mA!)
+- **Voltage regulators** with high quiescent current (some LDOs draw 100µA+)
+- **Pull-up/pull-down resistors** through powered external ICs
+- **Floating GPIO pins** that oscillate and cause internal shoot-through current
+- **LED indicators** left in undefined states
+- **I2C/SPI bus pull-ups** to powered peripherals
+
+### 2. Pin Management Before Sleep
+
+Every GPIO pin should be in one of these states before deep sleep:
+- **Disconnected** (input, no pull) — lowest power, use for unused pins
+- **Output driven** — only for pins that must maintain state (e.g., chip select HIGH)
+- **Input with pull + SENSE** — only for wake sources
+
+Never leave pins floating — a floating CMOS input can oscillate between high and low,
+causing both P-channel and N-channel transistors to conduct simultaneously (shoot-through).
+This can waste 10-100µA per floating pin.
+
+### 3. Peripheral Shutdown Checklist
+
+Before entering deep sleep, ensure every peripheral is properly shut down:
+- ADC/SAADC: disabled (some draw 100µA+ when enabled but idle)
+- Timers: stopped
+- UART/SPI/I2C: disabled, pins disconnected
+- Radio: handled by SoftDevice on nRF, but verify on other platforms
+- DMA: no active transfers
+- External peripherals: in shutdown/DPD mode, not just idle
+
+### 4. Advertising Strategy for BLE Devices
+
+BLE advertising is the second-biggest power consumer after active operation:
+
+| Interval | Avg Current | Discovery Time | Use Case |
+|----------|-------------|---------------|----------|
+| 20ms | ~3mA | Instant | Pairing mode (time-limited!) |
+| 100ms | ~0.5mA | <1s | Fast reconnect window |
+| 500ms | ~0.15mA | 1-3s | Normal reconnect |
+| 1000ms | ~0.08mA | 2-5s | Background / low priority |
+| 2500ms | ~0.04mA | 5-15s | Ultra low power beacon |
+
+**Best practice:** Tiered advertising with timeouts:
+1. Fast (20-100ms) for 5-10 seconds after disconnect
+2. Slow (500-1000ms) for 1-5 minutes
+3. System Off if nobody connects
+
+**Never advertise indefinitely** — this is the most common BLE battery drain bug.
+
+### 5. Measure Before and After Every Change
+
+Never assume a change saves power — measure it. The most common mistakes:
+- Enabling DCDC but the inductor is wrong → worse efficiency than LDO
+- Reducing advertising interval but increasing TX power → net increase
+- Disconnecting a pin but enabling its pull-up → 100µA+ through the pull
+
+A multimeter in series with the battery is the minimum viable power measurement setup.
+If your device has distinct states (advertising, connected, active), measure each separately.
+
+### 6. Voltage Regulator Selection
+
+For battery-powered devices, regulator quiescent current matters enormously:
+
+| Type | Typical Iq | Best For |
+|------|-----------|----------|
+| LDO (basic) | 50-500µA | Active mode, simplicity |
+| LDO (low-Iq) | 1-10µA | Sleep mode, always-on rails |
+| Buck (switching) | 10-50µA | High current loads, efficiency |
+| Buck (nano-power) | 300nA-5µA | Ultra low power, always-on |
+
+If your regulator has 100µA quiescent current, that alone limits battery life to
+500mAh / 0.1mA = 5000 hours (208 days). Sounds fine, but it's the *floor* — everything
+else adds to it.
+
+### 7. LiPo Safety Essentials
+
+| Threshold | Voltage | Action |
+|-----------|---------|--------|
+| Full charge | 4.20V | Stop charging (charger IC handles this) |
+| Low battery warning | 3.50V | Alert user, reduce features |
+| Shutdown cutoff | 3.20V | Enter deep sleep immediately |
+| Damage threshold | 2.50V | Permanent capacity loss begins |
+| Fire risk (charge) | >4.30V | Hardware protection required |
+| Cold charge risk | <0°C | Do not charge below freezing |
+
+**Voltage under load vs resting:** A battery reading 3.2V under 120mA load has an internal
+resistance drop of ~24mV (at 200mΩ typical), so its resting voltage is ~3.22V. Account for
+this when setting cutoff thresholds.
+
+**Recovery from deep discharge:** Cells above 2.8V generally recover fully. Between 2.5-2.8V,
+capacity may be reduced 5-10%. Below 2.5V, copper dendrites can form internally — the cell
+may work but has increased failure risk. Replace if possible.
+
+### 8. Power Budget Template
+
+For any battery project, fill out this table:
+
+```
+| State          | Current | Duty Cycle | Weighted    |
+|----------------|---------|------------|-------------|
+| Deep sleep     | ___µA   | ___%       | ___µA       |
+| Advertising    | ___mA   | ___%       | ___mA       |
+| Connected idle | ___mA   | ___%       | ___mA       |
+| Active         | ___mA   | ___%       | ___mA       |
+| TOTAL WEIGHTED |         |            | ___mA       |
+| Battery life   |         |            | ___mAh/___mA = ___ hours |
+```
+
+Fill in measured values, estimate duty cycles for your use case, calculate weighted average.
+This is more accurate than "it draws X mA" because real usage mixes states.
