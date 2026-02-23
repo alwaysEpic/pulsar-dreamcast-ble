@@ -859,3 +859,32 @@ MAIN: BLE connected, enabling controller
 ### Files Changed
 - `src/board/xiao.rs` — rewrote `qspi_flash_deep_power_down()` as GPIO bit-bang
 - `src/main.rs` — added initial battery read at startup
+
+---
+
+## Session: 2026-02-23 — System Off Power Hardening
+
+### Problem
+Battery drained overnight despite System Off. Two issues identified:
+1. **Phase 2 (controller detection) has no timeout** — if BLE connects (e.g., Mac auto-reconnects) but no controller is plugged in, the device retries forever with boost potentially enabled. This is the likely overnight drain cause.
+2. **Only 3 GPIO pins disconnected in `enter_system_off()`** — remaining configured pins (LEDs, ADC, charge STAT) leak microamps through output drivers or pull resistors.
+
+### Changes
+
+**`src/board/xiao.rs` — Expanded pin disconnect in `enter_system_off()`**
+Previously disconnected: P0.05 (SDCKA), P0.03 (SDCKB), P0.17 (charge STAT)
+Now also disconnects: P0.06 (LED B), P0.14 (ADC enable), P0.26 (LED R), P0.30 (LED G), P0.31 (ADC input)
+
+Pins intentionally kept driven:
+- P0.25: QSPI CS HIGH (keeps flash in Deep Power Down)
+- P0.28: Boost SHDN LOW (keeps boost off)
+- P0.13: Charge ISET LOW (keeps BQ25101 at 100mA rate)
+- P1.15: Wake button with SENSE LOW (wake source, unchanged)
+
+**`src/main.rs` — Added 60s timeout to Phase 2 controller detection**
+New constant `DETECT_TIMEOUT_MS = 60_000`. If no controller is found within 60 seconds of BLE connecting, enters System Off. This prevents the scenario where BLE auto-reconnects but no controller is present, keeping the device awake indefinitely.
+
+### Expected Effect
+- System Off current should drop closer to the theoretical ~5µA
+- Device will no longer stay awake indefinitely when BLE connects without a controller
+- Wake via sync button (P1.15 SENSE LOW) is preserved — pin not touched by disconnect changes

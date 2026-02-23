@@ -40,6 +40,11 @@ const MAX_RETRY_DELAY_MS: u64 = 1000;
 /// How often to check BLE connection state while waiting (ms).
 const BLE_WAIT_CHECK_MS: u64 = 100;
 
+/// Timeout for initial controller detection (ms).
+/// Enter System Off if no controller found within 60 seconds of BLE connecting.
+#[cfg(feature = "board-xiao")]
+const DETECT_TIMEOUT_MS: u64 = 60_000;
+
 /// Timeout before entering sleep when controller is idle (ms).
 /// 10 minutes with no input change triggers System Off.
 #[cfg(feature = "board-xiao")]
@@ -247,10 +252,24 @@ async fn main(spawner: Spawner) {
         status.show_searching();
         let mut retry_delay_ms: u64 = INITIAL_RETRY_DELAY_MS;
         let mut timeout_logged = false;
+        #[cfg(feature = "board-xiao")]
+        let detect_start = Instant::now();
         let controller_found = loop {
             // Abort detection if BLE disconnects
             if get_connection_state() != ConnectionState::Connected {
                 break false;
+            }
+
+            // Enter System Off if no controller found within timeout
+            #[cfg(feature = "board-xiao")]
+            if detect_start.elapsed().as_millis() >= DETECT_TIMEOUT_MS {
+                rprintln!(
+                    "MAPLE: Detect timeout ({}s), entering System Off",
+                    DETECT_TIMEOUT_MS / 1000
+                );
+                unsafe {
+                    board::enter_system_off();
+                }
             }
 
             status.tx_activity_on();

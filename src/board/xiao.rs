@@ -350,13 +350,29 @@ pub unsafe fn enter_system_off() -> ! {
     rprintln!("SLEEP: Entering System Off");
     disable_boost();
 
-    // Disconnect Maple Bus pins to prevent pull-up current waste (~0.7 mA)
-    // GPIO state survives System Off — must explicitly disconnect
-    // Reset value 0x00000002 = input disconnected, no pull
+    // Disconnect GPIO pins to minimize current draw in System Off.
+    // GPIO state survives System Off — must explicitly disconnect.
+    // Value 0x00000002 = input disconnected, no pull (Hi-Z, ~0 µA).
+    //
+    // Pins NOT disconnected (must maintain state):
+    // - P0.25: QSPI CS, output HIGH — keeps flash in Deep Power Down
+    // - P0.28: Boost SHDN, output LOW — keeps boost converter off
+    // - P0.13: Charge ISET, output LOW — keeps BQ25101 at 100mA rate
+    // - P1.15: Wake button, input with pull-up + SENSE LOW — wake source
     const P0_PIN_CNF_BASE: *mut u32 = (0x5000_0000 + 0x700) as *mut u32;
-    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(5), 0x0000_0002); // SDCKA P0.05
-    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(3), 0x0000_0002); // SDCKB P0.03
-    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(17), 0x0000_0002); // Charge STAT P0.17
+    const DISCONNECT: u32 = 0x0000_0002;
+    for pin in [
+        3,  // SDCKB — external 4.7kΩ pull-up, disconnect to prevent current
+        5,  // SDCKA — external 4.7kΩ pull-up, disconnect to prevent current
+        6,  // LED B (sync) — set HIGH above, disconnect driver
+        14, // Battery ADC enable — output, not needed in sleep
+        17, // Charge STAT — input with pull-up, disconnect
+        26, // LED R — set HIGH above, disconnect driver
+        30, // LED G — set HIGH above, disconnect driver
+        31, // Battery ADC input (AIN7) — SAADC configured, disconnect
+    ] {
+        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), DISCONNECT);
+    }
 
     // Configure wake pin: input with pull-up + SENSE LOW
     // P1.15 = PIN_CNF[15] on P1
