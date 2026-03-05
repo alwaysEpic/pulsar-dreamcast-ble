@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! Maple Bus host controller.
 //!
 //! This module implements the host side of Maple Bus communication,
@@ -22,7 +25,7 @@ pub mod commands {
 /// Maple Bus function codes (device types).
 pub mod functions {
     /// Standard controller.
-    pub const CONTROLLER: u32 = dc_protocol::controller_state::CONTROLLER_FUNCTION;
+    pub const CONTROLLER: u32 = maple_protocol::controller_state::CONTROLLER_FUNCTION;
 }
 
 /// Maple Bus addressing.

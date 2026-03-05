@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! GPIO-based Maple Bus implementation for nRF52840.
 //!
 //! This module implements the Maple Bus wire protocol using bit-banging.

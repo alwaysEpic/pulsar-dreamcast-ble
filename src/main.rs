@@ -1,24 +1,27 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 #![no_std]
 #![no_main]
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
-use embedded_rust_setup::ble::{get_connection_state, ConnectionState};
-use embedded_rust_setup::maple::host::MapleResult;
-use embedded_rust_setup::maple::{ControllerState, MapleBus, MapleHost};
-use embedded_rust_setup::{ble, board, CONTROLLER_STATE};
+use pulsar_dreamcast_ble::ble::{get_connection_state, ConnectionState};
+use pulsar_dreamcast_ble::maple::host::MapleResult;
+use pulsar_dreamcast_ble::maple::{ControllerState, MapleBus, MapleHost};
+use pulsar_dreamcast_ble::{ble, board, CONTROLLER_STATE};
 
 #[cfg(feature = "board-xiao")]
 use embassy_time::Instant;
-#[cfg(feature = "board-xiao")]
-use embedded_rust_setup::SLEEP_TIMEOUT_MS;
 use nrf_softdevice::Softdevice;
 use panic_reset as _;
+#[cfg(feature = "board-xiao")]
+use pulsar_dreamcast_ble::SLEEP_TIMEOUT_MS;
 use rtt_target::{rprintln, rtt_init_print};
 use static_cell::StaticCell;
 
 #[cfg(feature = "board-xiao")]
-use embedded_rust_setup::BATTERY_LEVEL;
+use pulsar_dreamcast_ble::BATTERY_LEVEL;
 
 #[cfg(feature = "board-xiao")]
 embassy_nrf::bind_interrupts!(struct SaadcIrqs {
@@ -144,7 +147,7 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "board-xiao")]
     let mut battery_reader = board::BatteryReader::new(p.P0_14, p.P0_31, p.SAADC, SaadcIrqs);
 
-    if let Ok(token) = embedded_rust_setup::button::sync_button_task(sync_button, sync_led) {
+    if let Ok(token) = pulsar_dreamcast_ble::button::sync_button_task(sync_button, sync_led) {
         spawner.spawn(token);
     }
 

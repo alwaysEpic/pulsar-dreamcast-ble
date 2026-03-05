@@ -1,0 +1,11 @@
+[package]
+name = "maple-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["alwaysEpic"]
+description = "Dreamcast Maple Bus protocol library"
+repository = "https://github.com/alwaysEpic/pulsar-dreamcast-ble"
+
+[dependencies]
+heapless = "0.8.0"

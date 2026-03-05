@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! Flash-based bonding storage.
 //!
 //! Stores BLE bonding data in the last flash page so it persists across power cycles.

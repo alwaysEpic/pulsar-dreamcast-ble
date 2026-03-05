@@ -1,153 +1,88 @@
 # Maple Bus Implementation Learnings
 
-Key lessons from implementing Maple Bus RX on nRF52840 at 2Mbps.
+Key lessons from implementing Maple Bus communication on the nRF52840 at 2Mbps. These apply broadly to any high-speed GPIO protocol on a microcontroller.
 
 ---
 
-## Hardware Setup (Working Configuration)
+## 1. Bulk Sampling Beats Real-Time Edge Detection
 
-### Pin Assignments
-- **P0.05** = SDCKA (Red wire)
-- **P0.06** = SDCKB (White wire)
-- **5V** = Controller power (from external supply or DK VDD)
-- **GND** = Controller ground + Sense pin (Green wire)
+At 2Mbps, each bit lasts 500ns. Trying to detect edges and make decisions within that window is fragile — any function call, branch mispredict, or interrupt can miss data.
 
-### Pull-ups
-- 4.7kΩ pull-ups from both data lines to 3.3V
-- Controller signals are 3.3V TTL compatible
+**Solution:** Capture raw GPIO samples into a large static buffer as fast as possible, then decode offline. This separates "is the signal there?" from "can we decode it?" and makes debugging much easier.
 
-### Idle State
-- SDCKA = HIGH
-- SDCKB = LOW
-- If you see the opposite at startup (A=0, B=1), **check wiring** - cables may be swapped
+At 64MHz, the nRF52840 gets ~15 samples per bit period — plenty of resolution for post-processing.
 
----
+## 2. Every Microsecond Counts in the Hot Path
 
-## Critical Timing Lessons
+A single `rprintln!()` call costs ~15-20µs via RTT — that's 30-40 bits lost. The controller responds within ~100µs of a request, so any debug logging between TX and RX will miss the entire response.
 
-### 1. Every Microsecond Counts
-At 2Mbps, one bit = 500ns. A single `rprintln!()` costs 1000+ cycles (~15µs) = 30 bits missed. Debug prints in the critical path will corrupt your data.
+**Rule:** Zero logging in the TX→RX→decode path. Log before TX and after decode, never in between.
 
-### 2. Function Call Overhead Matters
-Returning from `wait_for_start()` then calling `bulk_sample()` added enough delay to miss the first clock edge. **Solution:** Combine detection and sampling in one function - start sampling inline the moment you detect the trigger condition.
+## 3. Function Call Overhead Kills Timing
 
-### 3. Stack Allocation is Not Free
-Allocating a 96KB buffer on the stack (`[u32; 24576]`) caused measurable delay. By the time allocation completed, data transmission was already in progress. **Solution:** Use `static mut` buffers - pre-allocated at startup, zero runtime cost.
+Returning from a `wait_for_start()` function and then calling `bulk_sample()` introduced enough delay to miss the first clock edges. Even a handful of nanoseconds matters when the controller starts transmitting immediately after the start pattern.
 
----
+**Solution:** Combine detection and sampling in a single function. The moment the start pattern is detected, begin sampling inline — no function returns, no setup overhead.
 
-## Protocol Implementation Lessons
+## 4. Static Buffers, Not Stack Allocation
 
-### 4. Sample AT the Edge, Not After
-Original code: `samples[i+1]` (one sample after detecting edge)
-Fixed code: `samples[i]` (at the edge)
+Allocating a 96KB buffer on the stack (`[u32; 24576]`) takes measurable time. By the time the stack frame is set up, the controller's response is already in progress.
 
-At ~15 samples per bit, even one sample delay can catch the data line mid-transition.
+**Solution:** Use `static mut` buffers — pre-allocated at link time, zero runtime cost.
 
-### 5. Phase Alignment is Critical
-If your first detected edge is B falling (Phase 2) instead of A falling (Phase 1), all subsequent bits are shifted by one position. **Solution:** Skip edges until you see the first A fall, ensuring correct phase.
+## 5. Phase Alignment Is Critical
 
-### 6. Bulk Sampling > Real-Time Edge Detection
-Real-time edge detection requires making decisions in <500ns windows. Bulk sampling (capture everything, decode later) eliminates timing-critical logic during receive.
+Maple Bus alternates which line is clock and which is data:
+- Phase 1: A falls → sample B
+- Phase 2: B falls → sample A
 
----
+If the first detected edge is B falling instead of A falling, every subsequent bit is shifted by one position. The result looks almost right but every byte is wrong.
 
-## Hardware/Tooling Lessons
+**Solution:** After detecting the start pattern, skip any B edges until the first A fall. This guarantees correct phase alignment.
 
-### 7. Check for Blocking Processes Before Flashing
-VS Code extensions (nRF Connect), stale probe-rs processes, and JLink GUI can hold the debugger connection. Always run:
+## 6. Release Builds Are Mandatory
+
+Embassy's `Flex::set_high()` / `set_low()` are `#[inline]` wrappers around single OUTSET/OUTCLR register writes. In a release build, these inline to ~1 instruction each. In a debug build, `#[inline]` is ignored — each pin toggle becomes 4+ nested function calls, destroying TX timing. The controller won't recognize the malformed request.
+
 ```bash
-ps aux | grep -iE 'jlink|probe-rs|nrf' | grep -v grep
+# Correct — TX timing works:
+cargo embed --release --no-default-features --features board-xiao
+
+# Broken — controller won't respond:
+cargo embed --no-default-features --features board-xiao
 ```
 
-### 8. Pull-ups Are Essential
-Both SDCKA and SDCKB need pull-ups to 3.3V. Without them, floating lines cause false edge detection.
+This was the root cause of the XIAO board not working — the DK happened to always be built with `--release`.
 
-### 9. Ground the Sense Pin
-Dreamcast controllers won't respond unless the GND/Sense pin (Green wire) is connected to ground.
+## 7. Check Wiring with Initial State
 
----
-
-## Debugging Strategies That Worked
-
-### 10. Capture Raw Data First, Analyze Later
-Bulk sampling let us see exactly what the signals looked like, independent of our decode logic. This separated "is the signal there?" from "are we decoding it right?"
-
-### 11. Add Diagnostic Counters
-Counting B transitions during start pattern (expected: 8) immediately revealed when we were detecting false starts. Simple counters catch problems faster than trying to interpret corrupted data.
-
-### 12. Compare Expected vs Actual Bit-by-Bit
-When frame bytes were wrong, comparing individual bits showed patterns (e.g., "5 of 8 bits match, shifted by 1") that pointed to phase alignment issues.
-
----
-
-## The Winning Configuration
-
-### Key Parameters (DO NOT CHANGE)
-```rust
-// In wait_and_sample():
-b_transitions >= 3    // Minimum B transitions to accept start pattern
-
-// In read_packet_bulk():
-find_first_edges(samples, count, 40)  // Analyze 40 edges for late-start detection
-                                       // DO NOT reduce to 10 - causes decode failures!
-
-// Buffer size:
-static mut SAMPLE_BUFFER: [u32; 24576]  // 96KB static buffer
+Before any communication, read both pins as inputs:
+```
+Expected idle: A=1, B=0
+A=0, B=1 → Wires are swapped
+A=0, B=0 → Controller not powered or not connected
+A=1, B=1 → Pull-up problem or pin short
 ```
 
-### Combined Wait + Sample Pattern
-```rust
-pub fn wait_and_sample(&mut self, timeout: u32) -> (...) {
-    // Wait for idle (both HIGH), then A LOW, count B transitions
-    if a && b_transitions >= 3 {
-        // IMMEDIATELY sample - no function return delay!
-        compiler_fence(Ordering::SeqCst);
-        for i in 0..24576 {
-            samples[i] = p0_in.read().bits();
-        }
-        compiler_fence(Ordering::SeqCst);
-        return (true, ...);
-    }
-}
-```
+## 8. Pull-Ups Are Non-Negotiable
 
-### Phase-Aligned Decoding
-```rust
-// In decode_bulk_samples():
-if last_a && !a {  // A fell (Phase 1)
-    seen_first_a_fall = true;
-    bits.push((samples[i] & PIN_B_MASK != 0) as u8);  // Sample B AT edge
-}
-else if last_b && !b {  // B fell (Phase 2)
-    if seen_first_a_fall {  // Only after first A fall!
-        bits.push((samples[i] & PIN_A_MASK != 0) as u8);  // Sample A AT edge
-    }
-}
-```
+Both SDCKA and SDCKB need external pull-ups to 3.3V (4.7kΩ works well). Without them, floating lines cause false edge detection and unreliable communication. Internal pull-ups (~13kΩ) are too weak and vary with temperature.
 
----
+## 9. Ground the Sense Pin
 
-## Common Regressions to Avoid
+Dreamcast controllers won't respond at all unless the GND/Sense pin (green wire) is connected to ground. This catches people every time.
 
-### 13. Edge Count for Late-Start Detection
-The `find_first_edges()` call must analyze **40 edges**, not 10. Reducing this causes the late-start detection to fail, resulting in garbage frame data even though sampling works.
+## 10. Check for Pin Shorts on Perfboard
 
-```rust
-// CORRECT:
-let edges = self.find_first_edges(samples, count, 40);
+Flux residue or solder bridges (especially under castellated-pad boards like the XIAO) can short pins to power rails. Symptoms:
+- `Initial state A=1 B=1` (B should be 0)
+- Board resets when grounding a data wire (shorted directly to 3.3V, not through pull-up)
 
-// WRONG - causes decode failures:
-let edges = self.find_first_edges(samples, count, 10);
-```
+**Diagnostic:** Short each data wire to GND one at a time. Board stays alive + pin reads LOW = correct (current through pull-up). Board resets = pin shorted to power rail.
 
-### 14. Verify Wiring with Initial State
-At startup, before configuring outputs, read pins as pull-up inputs:
-```
-Expected idle: A=1 B=0
-If you see:    A=0 B=1  → Wires are swapped!
-If you see:    A=0 B=0  → Controller not powered or not connected
-```
+## 11. Power Routing Matters
+
+The XIAO's 3.3V regulator can't supply enough current for the boost converter + controller (~200mA+). Feeding the Pololu VIN from the 3.3V rail causes brownouts. The battery must feed the boost converter directly.
 
 ---
 
@@ -155,57 +90,22 @@ If you see:    A=0 B=0  → Controller not powered or not connected
 
 | Problem | Symptom | Solution |
 |---------|---------|----------|
-| Debug prints in critical path | Garbage data, missed bits | Remove all prints before sampling |
-| Stack allocation delay | Initial state A=0 B=0 | Use static buffer |
-| Function return delay | First edge is B not A | Combine wait+sample |
-| Sampling after edge | Bit values off by ~1 | Sample at `samples[i]` |
+| Debug prints in hot path | Garbage data, missed bits | Remove all logging between TX and RX |
+| Stack allocation delay | First edge missed | Use static buffer |
+| Function return delay | First edge is B not A | Combine wait + sample in one function |
 | Wrong phase start | Bytes shifted by 1 bit | Skip B edges until first A fall |
-| Probe "not found" | Can't flash | Kill nrfutil-device/probe-rs processes |
-| find_first_edges too small | Frame=garbage, b_trans OK | Use 40 edges, not 10 |
-| Initial state A=0 B=1 | No response (b_trans=0) | Wires swapped - check Red→P0.05, White→P0.06 |
-| Core locked | Flash fails with lock error | `probe-rs erase --chip nRF52840_xxAA --allow-erase-all` |
-| Dev build (no --release) | Controller never responds | Always use `--release` — Embassy GPIO calls not inlined in debug |
-| RTT logging in hot path | Intermittent missed responses | Remove rprintln from TX/RX/polling path |
-
-### 15. Always Build with `--release` for Maple Bus
-Embassy's `Flex::set_high()` / `set_low()` are `#[inline]` wrappers around single OUTSET/OUTCLR register writes. In a release build, these inline to ~1 instruction each. In a **dev build**, `#[inline]` is ignored — each pin toggle becomes 4+ nested function calls (`Flex::set_high → SealedPin::set_high → block() → outset() → write()`), completely destroying TX timing. The controller won't recognize the malformed request.
-
-This was the root cause of the XIAO not working: the DK was always built with `--release`, while the XIAO was accidentally built without it.
-
-```bash
-# CORRECT:
-cargo embed --release --no-default-features --features board-xiao
-
-# WRONG — TX timing broken, controller won't respond:
-cargo embed --no-default-features --features board-xiao
-```
-
-### 16. RTT Logging in Polling Loop Causes Missed Responses
-Each `rprintln!` call costs ~20ms via RTT. In the 60Hz polling loop (~16ms interval), debug logging between TX and RX or in `wait_and_sample()` / `read_packet_bulk()` causes entire responses to be missed. Keep the hot path free of all logging in production builds.
-
-### 17. Power Routing: Battery Direct to Boost Converter
-The XIAO 3.3V regulator cannot supply enough current for the Pololu boost converter + Dreamcast controller (~200mA+). Feeding the Pololu VIN from the XIAO 3.3V rail causes brownouts — the board resets when the controller is plugged in. **Battery must feed Pololu VIN directly.**
-
-### 18. Check for Pin Shorts on Perfboard
-Flux residue or solder bridges (especially under castellated pad boards like the XIAO) can short adjacent pins to power rails. Symptoms:
-- `BUS: Initial state A=1 B=1` (B should be 0 — controller can't pull it LOW against a power short)
-- Board resets when manually grounding the data wire (direct short to 3.3V, not through pull-up resistor)
-
-**Diagnostic test:** Manually short each data wire to GND one at a time:
-- Board stays alive + pin reads LOW → path is through pull-up resistor (correct)
-- Board resets → pin is shorted directly to a power rail (bad)
-
-### 19. diagnose_bus() for Hardware Debugging
-A simple post-TX diagnostic that samples 1000 reads and counts LOW samples + transitions on each line immediately reveals whether the problem is hardware (zero activity = wiring issue) vs software (activity present but decode fails).
+| Debug build | Controller never responds | Always use `--release` |
+| Wires swapped | Initial state A=0, B=1 | Check Red→SDCKA, White→SDCKB |
+| No pull-ups | False edges, unreliable reads | 4.7kΩ external pull-ups to 3.3V |
+| Sense pin floating | Zero response from controller | Connect GND/Sense to ground |
+| Pin short on perfboard | A=1, B=1 or board resets | Test each data wire to GND individually |
 
 ---
 
 ## Expected Working Output
 
-When everything is correct, you should see:
 ```
 Initial bus state (as inputs): A=1 B=0
-...
 TX: DeviceInfoRequest
 RX: Frame=0x0500201C cmd=0x05 len=28
 RX: OK!
@@ -213,7 +113,7 @@ Controller detected!
   Functions: 0x00000001
 ```
 
-Key indicators:
-- **A=1 B=0** at startup (correct idle state)
-- **Frame=0x0500201C** = Device Info Response (cmd=0x05, len=28, sender=0x20, recipient=0x00)
-- **Functions: 0x00000001** = Standard controller
+- **A=1, B=0** = correct idle state
+- **cmd=0x05** = Device Info Response
+- **len=28** = full 28-word payload (standard controller)
+- **Functions: 0x00000001** = controller function code

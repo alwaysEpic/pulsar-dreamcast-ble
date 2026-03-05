@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! Board support for the Seeed XIAO nRF52840.
 //!
 //! Pin assignments:
 //! - SDCKA: P0.05 (D5), SDCKB: P0.03 (D1)
 //! - RGB LED: R=P0.26, G=P0.30, B=P0.06 (all active LOW, internal)
-//! - Sync button: P1.15 (D10, wired to VMU MODE button)
-//! - Wake button: P0.02 (D0, wired to VMU SLEEP button, GPIO SENSE wake)
+//! - Sync button: P1.15 (D10, wired to VMU MODE button, doubles as wake source)
 //! - Boost SHDN: P0.28 (D2, HIGH=on, LOW=shutdown)
 //! - Battery ADC: P0.31 (internal, via P0.14 enable — future)
 

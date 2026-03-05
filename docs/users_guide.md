@@ -2,14 +2,13 @@
 
 ## What You Need
 
-- A standard Dreamcast controller (with cable)
-- The wireless adapter board (connected to the controller's cable)
+- Controller wired with Pulsar device
 - A Bluetooth Low Energy capable device (phone, tablet, PC, or Dreamcast with BLE receiver like iBlueControlMod)
 
 ## First-Time Pairing
 
-1. **Power on** the adapter. The LED will blink green briefly, then turn red while it searches for the controller.
-2. Once the controller is detected, the LED turns green.
+1. **Power on** the adapter. The LED will blink briefly, then blink rapidly while it searches for the controller.
+2. Once the controller is detected, the LED turns a solid color.
 3. The adapter automatically enters **pairing mode** on first boot (since no device is bonded yet). It will be discoverable for 60 seconds.
 4. On your host device, open Bluetooth settings and look for **"Xbox Wireless Controller"**.
 5. Select it to pair. The LED will turn solid to indicate a connection.

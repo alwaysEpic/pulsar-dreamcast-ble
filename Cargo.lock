@@ -209,13 +209,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dc-protocol"
-version = "0.1.0"
-dependencies = [
- "heapless 0.8.0",
-]
-
-[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -461,31 +454,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "embedded_rust_setup"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "dc-protocol",
- "embassy-executor",
- "embassy-futures 0.1.2 (git+https://github.com/embassy-rs/embassy)",
- "embassy-nrf",
- "embassy-sync 0.7.2",
- "embassy-time",
- "embedded-hal 0.2.7",
- "embedded-hal 1.0.0",
- "embedded-storage-async",
- "futures",
- "heapless 0.8.0",
- "nb 1.1.0",
- "nrf-softdevice",
- "nrf-softdevice-s140",
- "panic-reset",
- "rtt-target",
- "static_cell",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -679,6 +647,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "maple-protocol"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -833,6 +808,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ee95bc4ef87b8d5ba32e8b7714ccc834865276eab0aed5c9958d00ec45f49e8"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulsar-dreamcast-ble"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "embassy-executor",
+ "embassy-futures 0.1.2 (git+https://github.com/embassy-rs/embassy)",
+ "embassy-nrf",
+ "embassy-sync 0.7.2",
+ "embassy-time",
+ "embedded-hal 0.2.7",
+ "embedded-hal 1.0.0",
+ "embedded-storage-async",
+ "futures",
+ "heapless 0.8.0",
+ "maple-protocol",
+ "nb 1.1.0",
+ "nrf-softdevice",
+ "nrf-softdevice-s140",
+ "panic-reset",
+ "rtt-target",
+ "static_cell",
 ]
 
 [[package]]

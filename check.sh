@@ -18,16 +18,16 @@ echo "=== Formatting ==="
 cargo fmt --all && pass "cargo fmt"
 
 echo ""
-echo "=== dc-protocol tests ==="
-(cd dc-protocol && cargo test) && pass "cargo test" || fail "cargo test"
+echo "=== maple-protocol tests ==="
+(cd maple-protocol && cargo test) && pass "cargo test" || fail "cargo test"
 
 echo ""
 echo "=== Clippy (main crate, default features) ==="
 cargo clippy -- -W clippy::all -W clippy::pedantic && pass "clippy (dk)" || fail "clippy (dk)"
 
 echo ""
-echo "=== Clippy (dc-protocol) ==="
-(cd dc-protocol && cargo clippy -- -W clippy::all -W clippy::pedantic) && pass "clippy (dc-protocol)" || fail "clippy (dc-protocol)"
+echo "=== Clippy (maple-protocol) ==="
+(cd maple-protocol && cargo clippy -- -W clippy::all -W clippy::pedantic) && pass "clippy (maple-protocol)" || fail "clippy (maple-protocol)"
 
 echo ""
 echo "=== Build: XIAO release ==="

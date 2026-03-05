@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! Dreamcast controller protocol library.
 //!
 //! Pure logic for Maple Bus packet construction, controller state parsing,
@@ -16,5 +19,5 @@
 #![no_std]
 
 pub mod controller_state;
-pub mod hid;
 pub mod packet;
+pub mod xbox_hid;

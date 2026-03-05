@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! Board-specific pin mappings and peripherals.
 //!
 //! Each board module exports:

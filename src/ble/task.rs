@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! BLE advertising and connection handling task.
 
 use embassy_time::{Duration, Instant, Timer};

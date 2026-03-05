@@ -1,6 +1,11 @@
-# Maple Bus Debug Log
+# nRF52840 DK — Development Log
 
-Running log of tests, assumptions, and results for the Dreamcast controller adapter project.
+> **Historical record** of the debugging process for the DK board. The project is fully functional.
+> This log preserves the investigation process, including dead ends and reverted changes.
+> Entries were written in real-time during debugging — some hypotheses and conclusions were
+> later proven wrong. Do not treat this as a source of truth; see the main docs for accurate information.
+
+Running log of tests, assumptions, and results for Maple Bus bring-up on the nRF52840 DK.
 
 ---
 

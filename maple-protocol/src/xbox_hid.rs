@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! Xbox One S BLE HID gamepad report types.
 //!
 //! Contains the `GamepadReport` struct and byte serialization.

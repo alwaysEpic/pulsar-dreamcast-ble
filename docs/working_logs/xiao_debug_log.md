@@ -1,6 +1,11 @@
-# XIAO nRF52840 Debug Log
+# Seeed XIAO nRF52840 — Development Log
 
-Running log specific to the XIAO board build. The XIAO has never successfully received Maple Bus responses — this log tracks the investigation.
+> **Historical record** of the debugging process for the XIAO board. The project is fully functional.
+> This log preserves the investigation process, including dead ends and reverted changes.
+> Entries were written in real-time during debugging — some hypotheses and conclusions were
+> later proven wrong. Do not treat this as a source of truth; see the main docs for accurate information.
+
+Running log specific to XIAO board bring-up. Covers the investigation into why the XIAO initially failed to receive Maple Bus responses (root cause: debug builds not inlining Embassy GPIO calls).
 
 ---
 

@@ -1,148 +1,105 @@
-# Flash and Debug Commands Reference
+# Flash & Debug Quick Reference
 
-Common commands for flashing and debugging the nRF52840 DK.
+## Environment Setup
 
-## Prerequisites
+### Toolchain
+```bash
+rustup target add thumbv7em-none-eabihf
+cargo install cargo-embed
+```
 
-- `nrfjprog` (Nordic command-line tools)
-- `probe-rs` (Rust embedded tools)
-- `cargo-embed` (optional, for integrated flash+debug)
+### Debug Probe
+- **nRF52840 DK**: Built-in J-Link — just connect USB
+- **XIAO nRF52840**: Needs external SWD probe (J-Link, DK as programmer, or CMSIS-DAP)
 
----
-
-## Recovery (When Chip is Locked)
+### SoftDevice
+The Nordic S140 SoftDevice must be flashed once before the application. Download from [Nordic's website](https://www.nordicsemi.com/Products/Development-software/s140).
 
 ```bash
-# Full chip recovery (use when chip is unresponsive)
-nrfjprog --recover
-
-# Erase all flash
+# Erase chip and flash SoftDevice
 nrfjprog --eraseall
+nrfjprog --program s140_nrf52_7.3.0_softdevice.hex --verify
 ```
 
 ---
 
-## Flashing SoftDevice (One-Time)
+## Building & Flashing
 
+### DK (default target)
 ```bash
-# Erase chip first
-nrfjprog --eraseall
-
-# Flash S140 SoftDevice
-nrfjprog --program vendor/s140_softdevice/s140_nrf52_7.3.0_softdevice.hex --verify
-```
-
----
-
-## Flashing Application
-
-### Using nrfjprog (recommended)
-
-```bash
-# Build release
-cargo build --release
-
-# Convert ELF to hex
-arm-none-eabi-objcopy -O ihex \
-    target/thumbv7em-none-eabihf/release/embedded_rust_setup \
-    target/app.hex
-
-# Flash (preserves SoftDevice)
-nrfjprog --program target/app.hex --verify
-
-# Reset to start
-nrfjprog --reset
-```
-
-### Using probe-rs
-
-```bash
-# Flash and run
-probe-rs download --chip nRF52840_xxAA \
-    target/thumbv7em-none-eabihf/release/embedded_rust_setup
-
-# Or with cargo-embed (if configured)
 cargo embed --release
 ```
 
----
-
-## Debug and RTT
-
-### Attach to running target with RTT
-
+### XIAO
+**Must use `--release`** — debug builds break Maple Bus timing (Embassy GPIO calls don't inline).
 ```bash
-probe-rs attach --chip nRF52840_xxAA \
-    target/thumbv7em-none-eabihf/release/embedded_rust_setup
+cargo embed --release --no-default-features --features board-xiao
 ```
 
-### Run with debugger (GDB)
-
+### Build Only (no flash)
 ```bash
-probe-rs gdb --chip nRF52840_xxAA \
-    target/thumbv7em-none-eabihf/release/embedded_rust_setup
+# DK
+cargo build --release
+
+# XIAO
+cargo build --release --no-default-features --features board-xiao
 ```
 
 ---
 
-## Status Commands
+## Debugging
 
+### RTT (Real-Time Transfer)
+`cargo embed` opens RTT automatically after flashing.
+
+To attach to an already-running device:
 ```bash
-# List connected probes
-probe-rs list
+probe-rs attach --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble
+```
 
-# Check device info
-nrfjprog --deviceversion
-
-# Read device memory
-nrfjprog --memrd 0x00027000 --n 16
+### GDB
+```bash
+probe-rs gdb --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble
 ```
 
 ---
 
-## Reset Commands
+## Recovery
 
-```bash
-# Soft reset
-nrfjprog --reset
-
-# Pin reset (hardware)
-nrfjprog --pinreset
-```
-
----
-
-## Erase Commands
-
-```bash
-# Erase all (including SoftDevice!)
-nrfjprog --eraseall
-
-# Erase only app section (preserves SoftDevice)
-nrfjprog --erasepage 0x27000-0x100000
-```
-
----
-
-## Troubleshooting
-
-### "Core is in locked up status"
+### Chip Locked / Unresponsive
 ```bash
 nrfjprog --recover
 ```
 
-### "Probe not found"
-- Unplug and replug USB
-- Check `probe-rs list` output
-- Try `nrfjprog --deviceversion` to verify connection
-
-### Flash verify fails
+### Re-flash Everything
 ```bash
 nrfjprog --eraseall
-# Then re-flash SoftDevice and app
+nrfjprog --program s140_nrf52_7.3.0_softdevice.hex --verify
+cargo embed --release
 ```
 
-### BLE not advertising
-- Verify SoftDevice is flashed at 0x0
-- Check that app starts at 0x27000 (memory.x)
-- RTT should show "BLE: Advertising..."
+### Probe Not Found
+- Unplug and replug USB
+- Check `probe-rs list` for connected probes
+- Kill stale processes: `ps aux | grep -iE 'jlink|probe-rs|nrf' | grep -v grep`
+
+---
+
+## Useful Commands
+
+```bash
+# Check connected probes
+probe-rs list
+
+# Device info
+nrfjprog --deviceversion
+
+# Read flash memory
+nrfjprog --memrd 0x00027000 --n 16
+
+# Soft reset
+nrfjprog --reset
+
+# Erase app only (preserves SoftDevice)
+nrfjprog --erasepage 0x27000-0x100000
+```

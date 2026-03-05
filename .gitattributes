@@ -1,0 +1,10 @@
+# 3D model binary files
+*.stl binary
+*.STL binary
+*.step binary
+*.STEP binary
+*.blend binary
+*.3mf binary
+*.obj binary
+*.rar binary
+*.zip binary

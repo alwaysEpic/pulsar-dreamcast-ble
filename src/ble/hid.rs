@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! HID over GATT (HOG) implementation for gamepad.
 //!
 //! Implements Xbox One S BLE HID format (Model 1708, PID `0x02E0`).
-//! Pure report types re-exported from `dc_protocol::hid`.
+//! Pure report types re-exported from `maple_protocol::xbox_hid`.
 
 #![allow(clippy::redundant_else)] // Macro-generated code
 #![allow(clippy::missing_errors_doc)] // Internal API
@@ -10,7 +13,7 @@
 #![allow(dead_code)] // Macro-generated event enum fields
 
 #[allow(unused_imports)] // Re-exports for external consumers
-pub use dc_protocol::hid::{buttons, hat, GamepadReport};
+pub use maple_protocol::xbox_hid::{buttons, hat, GamepadReport};
 
 use heapless::Vec;
 use nrf_softdevice::ble::gatt_server::{NotifyValueError, SetValueError};

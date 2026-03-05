@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 pub mod controller_state;
 pub mod gpio_bus;
 pub mod host;

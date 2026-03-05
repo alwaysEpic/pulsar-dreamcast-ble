@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
+//! Bluetooth LE adapter for Dreamcast controllers.
+//!
+//! Speaks the Dreamcast Maple Bus protocol over GPIO and presents controller
+//! input as an Xbox One S BLE HID gamepad. Built on Embassy async with the
+//! Nordic `SoftDevice` S140 BLE stack.
+
 #![no_std]
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2025-2026 alwaysEpic
+
 //! Dreamcast controller state representation.
 //!
 //! Holds the parsed state from a `Get Condition` (`0x09`) response.
@@ -162,8 +165,8 @@ impl ControllerState {
     /// - Dreamcast L/R triggers -> Brake/Accelerator (10-bit, 0-1023)
     #[must_use]
     #[allow(clippy::items_after_statements)]
-    pub fn to_gamepad_report(self) -> crate::hid::GamepadReport {
-        use crate::hid::{buttons, hat, GamepadReport};
+    pub fn to_gamepad_report(self) -> crate::xbox_hid::GamepadReport {
+        use crate::xbox_hid::{buttons, hat, GamepadReport};
 
         let mut btns: u16 = 0;
         if self.buttons.a {
@@ -446,7 +449,7 @@ mod tests {
             ..Default::default()
         };
         let report = state.to_gamepad_report();
-        use crate::hid::buttons;
+        use crate::xbox_hid::buttons;
         assert_ne!(report.buttons & buttons::A, 0);
         assert_ne!(report.buttons & buttons::B, 0);
         assert_ne!(report.buttons & buttons::X, 0);
@@ -457,7 +460,7 @@ mod tests {
 
     #[test]
     fn to_gamepad_report_dpad_all_directions() {
-        use crate::hid::hat;
+        use crate::xbox_hid::hat;
 
         let directions = [
             (true, false, false, false, hat::NORTH),

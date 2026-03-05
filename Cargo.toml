@@ -1,13 +1,19 @@
 [workspace]
-members = [".", "dc-protocol"]
+members = [".", "maple-protocol"]
 
 [package]
-name = "embedded_rust_setup"
+name = "pulsar-dreamcast-ble"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["alwaysEpic"]
+description = "Bluetooth LE adapter for Dreamcast controllers — Rust on nRF52840"
+repository = "https://github.com/alwaysEpic/pulsar-dreamcast-ble"
+keywords = ["embedded", "dreamcast", "bluetooth", "nrf52", "gamepad"]
+categories = ["embedded", "hardware-support", "no-std"]
 
 [dependencies]
-dc-protocol = { path = "dc-protocol" }
+maple-protocol = { path = "maple-protocol" }
 # Core
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
@@ -49,11 +55,3 @@ debug = 2             # Keep debug info for probe-rs
 default = ["board-dk"]
 board-dk = []
 board-xiao = []
-
-[[example]]
-name = "blinky"
-path = "examples/blinky.rs"
-
-[[example]]
-name = "maple_device_info"
-path = "examples/maple_device_info.rs"

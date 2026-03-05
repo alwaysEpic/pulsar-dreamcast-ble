@@ -327,151 +327,66 @@ SDCKA → HIGH
 
 ---
 
-## Implementation Notes
+## Our Implementation (nRF52840 at 64MHz)
 
-### For nRF52840 at 64MHz
+### Timing Budget
 
-| Parameter | Cycles |
-|-----------|--------|
-| 1 bit (1µs) | 64 cycles |
-| Half bit (0.5µs) | 32 cycles |
-| Start pattern (~4µs) | ~256 cycles |
-| Typical response delay | 60-100µs = 4000-6400 cycles |
+| Parameter | Cycles | Time |
+|-----------|--------|------|
+| 1 bit | 64 | 1µs |
+| Half bit (one phase) | 32 | 0.5µs |
+| Start pattern | ~256 | ~4µs |
+| Controller response delay | 4000-6400 | 60-100µs |
+| Data stable window | ~15 | ~240ns |
 
-### Reception Strategy
+At 64MHz we get ~15 samples per bit — enough resolution for reliable post-processing.
 
-From [gmanmodz]:
-> "Since data is transmitted at 1MB/S, a fast microcontroller capable of accurately sampling bits is required—approximately 200 instructions available per bit at 200MHz."
+### Approach: Bulk Sampling
 
-At 64MHz, we have ~64 cycles per bit. Direct register access is essential.
+Real-time edge detection at 2Mbps is fragile — any function call, branch, or interrupt can miss the ~240ns stable window. Instead, we capture raw GPIO samples into a 96KB static buffer as fast as possible, then decode offline:
 
-### Key Implementation Points
-
-1. **After start pattern ends (A=HIGH, B=LOW), immediately be ready to read**
-   - Don't add delays - controller starts sending data right away
-
-2. **Sample data on falling edge of clock line**
-   - Phase 1: When A falls, sample B
-   - Phase 2: When B falls, sample A
-
-3. **Controller responds slower than host transmits**
-   - Host: ~160ns/phase
-   - Controller: ~250ns/phase
-   - Give extra time when reading
-
----
-
-## Real-World Implementation Insights
-
-### From raphnet (AVR-based Dreamcast USB Adapter)
-Source: https://www.raphnet.net/programmation/dreamcast_usb/index_en.php
-
-**Critical Timing Discovery:**
-- Documentation says 250ns/phase, but **data is only stable for ~240ns**
-- This 10ns difference caused unreliable reads at slower clock speeds
-
-**Clock Speed Requirements:**
-- 12 MHz (83.3ns/cycle) had high error rate - not enough samples in 240ns window
-- **16 MHz (62.5ns/cycle) worked reliably** - gets ~4 samples per stable window
-- At 64 MHz (15.6ns/cycle), we should get ~15 samples per stable window
-
-**Successful Implementation Strategy ("Memory Hungry But Fast"):**
+```rust
+// Tight sampling loop — no decisions, just capture
+for i in 0..24576 {
+    samples[i] = p0_in.read().bits();
+}
+// Decode later: find edges, extract bits, verify CRC
 ```
-Rather than detect edges in real-time, sample the port many times:
-1. After detecting start pattern, immediately enter tight sampling loop
-2. Sample GPIO register 640 times consecutively (assembly: in r16, PINC; st z+, r16)
-3. Store all samples in RAM buffer
-4. AFTER sampling complete, post-process to find edges and extract bits
-```
-This eliminates timing-critical decision-making during the receive window.
 
-**Controller Response Time Variance:**
+This is the same approach used by raphnet's AVR-based Dreamcast adapter. It separates signal capture from decode logic, making both more reliable and easier to debug.
+
+### Key Implementation Details
+
+- **Combined wait + sample** — Start pattern detection and sampling happen in one function. No function return delay between detecting the trigger and beginning capture.
+- **Phase-aligned decoding** — Skip B edges until the first A fall to guarantee correct phase. Without this, every byte is shifted by 1 bit.
+- **40-edge analysis window** — `find_first_edges()` analyzes 40 edges for late-start detection. Reducing to 10 causes decode failures.
+- **`--release` builds required** — Embassy GPIO calls must inline for correct TX timing. Debug builds break communication entirely.
+- **Static buffer** — `static mut [u32; 24576]` avoids stack allocation delay.
+
+### Expected Waveform
+
+For a Device Info Response from the controller:
+- Response delay: 50-160µs after request ends
+- Start pattern: ~4µs (A LOW, B toggles 4x, A HIGH, B LOW)
+- Data: 29 words × 32 bits × 500ns/bit = ~464µs
+- Inter-chunk gaps: 110-130µs between 4-word blocks
+- Total response: ~500-600µs
+
+### Controller Response Variance
+
 | Controller Type | Response Delay |
 |-----------------|----------------|
 | Official Sega | ~56 µs |
 | Third-party | up to 159 µs |
 
-**Voltage/Signal Issues:**
-- 3.3V open-drain with pull-ups had problems due to cable capacitance
-- Faster rise times needed - consider stronger pull-ups or active drive
-
-### From ismell/maplebus (FPGA Implementation)
-Source: https://github.com/ismell/maplebus
-
-**Timing Constraints:**
-- Controller must respond within **1 millisecond** of receiving command
-- USB 2.0 latency (125µs minimum per transaction) made PC-based solutions difficult
-- Hardware-level timing control (FPGA/dedicated MCU) is much more reliable
-
-### From Gmanmodz (PIC32 Implementation)
-Source: https://github.com/Gmanmodz/Dreamcast-Controller-Emulator
-
-- PIC32 at 200 MHz gives ~200 instructions per bit
-- Uses dedicated timing loops in C++
-- Successfully emulates controller TO the Dreamcast (opposite direction from us)
-
-### From dreamcast.wiki
-Source: https://dreamcast.wiki/Maple_bus
-
-**Additional Timing Details:**
-- Host transmits at ~160ns/phase (faster)
-- Peripherals transmit at ~250ns/phase (slower)
-- Edge transition between lines: ~125ns minimum
-- Edge transition on same line: ~225ns minimum
-- Inter-chunk delay: 110-130µs between 4-word blocks
-
 ---
 
-## Lessons for Our Implementation
+## Community Implementations
 
-### Why Real-Time Edge Detection is Hard
-At 2 Mbps with ~240ns stable windows:
-- Must detect falling edge AND sample other pin within ~240ns
-- Any delay (function calls, branches, debug prints) can miss the window
-- Polling loop overhead adds uncertainty
+Other Maple Bus implementations that informed this project:
 
-### Alternative: Bulk Sampling Approach
-```rust
-// Instead of:
-loop {
-    if pin_a_low() {
-        bit = sample_pin_b();  // Timing critical!
-        break;
-    }
-}
+- **[raphnet](https://www.raphnet.net/programmation/dreamcast_usb/index_en.php)** (AVR) — Pioneered the bulk sampling approach. Found that data is stable for only ~240ns (not 250ns as documented). 16MHz minimum for reliable reads.
+- **[ismell/maplebus](https://github.com/ismell/maplebus)** (FPGA) — Controller must respond within 1ms. USB 2.0 latency makes PC-based solutions difficult; dedicated hardware is more reliable.
+- **[Gmanmodz](https://github.com/Gmanmodz/Dreamcast-Controller-Emulator)** (PIC32) — Emulates a controller TO the Dreamcast (opposite direction). PIC32 at 200MHz gives ~200 instructions per bit.
 
-// Try:
-let mut samples: [u32; 256] = [0; 256];
-for i in 0..256 {
-    samples[i] = gpio_register.read();  // Just sample, no decisions
-}
-// Now decode samples offline - find edges, extract bits
-```
-
-### Expected Waveform Characteristics
-For Device Info Response from controller:
-- Response delay: 50-160µs after our request ends
-- Start pattern: A LOW, B toggles 4x, A HIGH, B LOW (~4µs)
-- Data: 29 words × 32 bits × 500ns/bit = ~464µs
-- Total response: ~500-600µs
-
----
-
-## Our Current Issue (Updated)
-
-**Status:** Can detect start pattern, reading data but misaligned by 1-2 bits
-
-**Current Results:**
-- Frame = 0x03000004
-- cmd = 0x03 (expected 0x05, differ by 2 bits)
-- Initial state after start pattern is now correct (A=1, B=0)
-
-**Hypotheses:**
-1. Edge detection timing is marginal - sometimes catching, sometimes missing
-2. May need bulk sampling approach instead of real-time edge detection
-3. Signal integrity issues - scope verification would help
-
-**Next Steps:**
-1. Use scope to verify actual waveform timing
-2. Consider implementing bulk sampling approach
-3. Try relaxed timing with small delays after edge detection
+See [learnings.md](learnings.md) for detailed implementation lessons from this project.
