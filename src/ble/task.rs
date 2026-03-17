@@ -243,7 +243,10 @@ async fn handle_connection(
     // Run GATT server while connected
     let gatt_future = gatt_server::run(&conn, server, |_| {});
 
-    // Notification sender - sends HID reports at fixed interval (like real controllers)
+    // Notification sender - sends HID reports at fixed 125Hz interval.
+    // Reads state changes promptly (so the Signal is cleared before the next
+    // poll overwrites it), but always waits for the timer before sending to
+    // maintain a steady cadence that matches the BLE connection interval.
     let notify_future = async {
         // Wait for client to discover services and subscribe
         Timer::after(Duration::from_millis(crate::SERVICE_DISCOVERY_DELAY_MS)).await;
@@ -252,13 +255,19 @@ async fn handle_connection(
         let mut notify_fails: u8 = 0;
 
         loop {
-            // Check for new state (non-blocking via try semantics).
-            // signaled() + wait() is safe on single-core Embassy (no preemption).
+            // Read any pending state change promptly, then wait for send timer.
             if CONTROLLER_STATE.signaled() {
                 current_state = CONTROLLER_STATE.wait().await;
             }
 
-            // Always send reports at fixed interval (8ms ≈ 125Hz)
+            // Fixed-rate send at ~125Hz — matches Xbox cadence and BLE conn interval
+            Timer::after(Duration::from_millis(crate::NOTIFY_INTERVAL_MS)).await;
+
+            // Grab any state that arrived during the wait
+            if CONTROLLER_STATE.signaled() {
+                current_state = CONTROLLER_STATE.wait().await;
+            }
+
             let report = current_state.to_gamepad_report();
             let report_bytes = report.to_bytes();
             let _ = server.hid.report_set(&report_bytes);
@@ -271,8 +280,6 @@ async fn handle_connection(
             } else {
                 notify_fails = 0;
             }
-
-            Timer::after(Duration::from_millis(crate::NOTIFY_INTERVAL_MS)).await;
         }
     };
 

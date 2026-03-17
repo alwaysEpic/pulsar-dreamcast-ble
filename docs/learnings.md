@@ -84,6 +84,19 @@ Flux residue or solder bridges (especially under castellated-pad boards like the
 
 The XIAO's 3.3V regulator can't supply enough current for the boost converter + controller (~200mA+). Feeding the Pololu VIN from the 3.3V rail causes brownouts. The battery must feed the boost converter directly.
 
+## 12. Input Pipeline: Signal, Not Channel
+
+The controller state flows from Maple Bus poll → `Signal` → BLE notify task. Embassy's `Signal` is last-writer-wins (only holds one value), which matches the industry standard for gamepad HID — every major controller (Xbox, PlayStation, Switch Pro, BlueRetro) sends state snapshots, not event queues.
+
+A `Channel` (FIFO queue) was considered but rejected: analog stick jitter fills the queue every poll, and the BLE task would process stale queued states, adding 32-64ms of latency for stick movements. Channels solve a problem that doesn't exist for gamepads.
+
+**Optimizations applied (in order of impact):**
+
+1. **Only signal on change** — reduces the window where a button press can be overwritten by identical idle-state polls. Analog jitter no longer constantly overwrites the signal.
+2. **Wake BLE task immediately on state change** — use `select` between timer and signal instead of fixed 8ms sleep, so the BLE task reads new state within ~1ms instead of up to 8ms.
+
+**Future option if needed:** Button edge accumulation — track a bitmask of buttons pressed since the last BLE read, OR it into the signaled state. This catches press+release within one poll cycle, but adds complexity and only helps when the BLE task is delayed past 16ms (rare with optimizations #1 and #2). The Maple Bus poll at 60Hz (16ms) already means sub-16ms taps are missed at the hardware level, matching original Dreamcast behavior.
+
 ---
 
 ## Quick Reference
