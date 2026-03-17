@@ -66,7 +66,7 @@ A=1, B=1 → Pull-up problem or pin short
 
 ## 8. Pull-Ups Are Non-Negotiable
 
-Both SDCKA and SDCKB need external pull-ups to 3.3V (4.7kΩ works well). Without them, floating lines cause false edge detection and unreliable communication. Internal pull-ups (~13kΩ) are too weak and vary with temperature.
+Both SDCKA and SDCKB need external pull-ups to 3.3V. 10kΩ works reliably and saves a bit of current over 4.7kΩ. Without external pull-ups, floating lines cause false edge detection and unreliable communication. Internal pull-ups (~13kΩ) are too weak and vary with temperature.
 
 ## 9. Ground the Sense Pin
 
@@ -96,7 +96,7 @@ The XIAO's 3.3V regulator can't supply enough current for the boost converter + 
 | Wrong phase start | Bytes shifted by 1 bit | Skip B edges until first A fall |
 | Debug build | Controller never responds | Always use `--release` |
 | Wires swapped | Initial state A=0, B=1 | Check Red→SDCKA, White→SDCKB |
-| No pull-ups | False edges, unreliable reads | 4.7kΩ external pull-ups to 3.3V |
+| No pull-ups | False edges, unreliable reads | 10kΩ external pull-ups to 3.3V |
 | Sense pin floating | Zero response from controller | Connect GND/Sense to ground |
 | Pin short on perfboard | A=1, B=1 or board resets | Test each data wire to GND individually |
 

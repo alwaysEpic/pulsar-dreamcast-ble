@@ -2,6 +2,13 @@
 .DS_Store
 .idea/
 *.swp
+*.blend1
 .claude/
 .mcp.json
 CLAUDE.md
+vendor/
+*.rar
+*.hex
+*.uf2
+uf2conv.py
+uf2families.json

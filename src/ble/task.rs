@@ -113,8 +113,14 @@ pub async fn ble_task(
 
                 if let Some(conn) = conn {
                     set_connection_state(ConnectionState::Connected);
-                    handle_connection(sd, server, bonder, &mut flash, conn).await;
-                    transition_after_disconnect(bonder);
+                    let sync = handle_connection(sd, server, bonder, &mut flash, conn).await;
+                    if sync {
+                        bonder.clear();
+                        let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
+                        set_connection_state(ConnectionState::SyncMode);
+                    } else {
+                        transition_after_disconnect(bonder);
+                    }
                 }
             }
 
@@ -161,8 +167,14 @@ pub async fn ble_task(
 
                 if let Some(conn) = conn {
                     set_connection_state(ConnectionState::Connected);
-                    handle_connection(sd, server, bonder, &mut flash, conn).await;
-                    transition_after_disconnect(bonder);
+                    let sync = handle_connection(sd, server, bonder, &mut flash, conn).await;
+                    if sync {
+                        bonder.clear();
+                        let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
+                        set_connection_state(ConnectionState::SyncMode);
+                    } else {
+                        transition_after_disconnect(bonder);
+                    }
                 }
             }
 
@@ -184,6 +196,7 @@ fn transition_after_disconnect(bonder: &Bonder) {
 }
 
 /// Handle an active BLE connection.
+/// Returns `true` if disconnected due to sync mode request.
 #[allow(clippy::too_many_lines)]
 async fn handle_connection(
     _sd: &'static Softdevice,
@@ -191,8 +204,15 @@ async fn handle_connection(
     bonder: &'static Bonder,
     flash: &mut nrf_softdevice::Flash,
     conn: nrf_softdevice::ble::Connection,
-) {
+) -> bool {
     rprintln!("BLE: Connected!");
+
+    // If sync was requested before we got here, honor it immediately
+    if SYNC_MODE.signaled() {
+        SYNC_MODE.wait().await;
+        rprintln!("BLE: Sync requested during connection setup");
+        return true;
+    }
 
     bonder.load_sys_attrs(&conn);
     Timer::after(Duration::from_millis(100)).await;
@@ -301,62 +321,80 @@ async fn handle_connection(
         }
     };
 
-    // Run all until one completes (connection drops)
+    // Wait for sync mode request — disconnects active connection
+    let sync_future = SYNC_MODE.wait();
+
+    // Run all until one completes (connection drops or sync requested)
     #[cfg(feature = "board-xiao")]
-    let result = {
-        let combined = embassy_futures::select::select(
-            embassy_futures::select::select3(gatt_future, notify_future, battery_future),
-            bond_save_future,
-        )
-        .await;
-        match combined {
-            embassy_futures::select::Either::First(inner) => inner,
-            embassy_futures::select::Either::Second(()) => unreachable!(),
+    let sync_requested = {
+        let main_futures =
+            embassy_futures::select::select3(gatt_future, notify_future, battery_future);
+        let combined =
+            embassy_futures::select::select3(main_futures, bond_save_future, sync_future);
+        match combined.await {
+            embassy_futures::select::Either3::First(inner) => {
+                match inner {
+                    embassy_futures::select::Either3::First(gatt_result) => {
+                        rprintln!("BLE: Disconnected (GATT: {:?})", gatt_result);
+                    }
+                    embassy_futures::select::Either3::Second(()) => {
+                        rprintln!("BLE: Disconnected (notify failure)");
+                    }
+                    embassy_futures::select::Either3::Third(()) => {
+                        rprintln!("BLE: Disconnected (battery task ended)");
+                    }
+                }
+                false
+            }
+            embassy_futures::select::Either3::Second(()) => unreachable!(),
+            embassy_futures::select::Either3::Third(()) => {
+                rprintln!("BLE: Sync mode requested, disconnecting");
+                true
+            }
         }
     };
     #[cfg(not(feature = "board-xiao"))]
-    let result = {
-        let combined = embassy_futures::select::select(
-            embassy_futures::select::select(gatt_future, notify_future),
-            bond_save_future,
-        )
-        .await;
-        match combined {
-            embassy_futures::select::Either::First(inner) => inner,
-            embassy_futures::select::Either::Second(()) => unreachable!(),
+    let sync_requested = {
+        let main_futures = embassy_futures::select::select(gatt_future, notify_future);
+        let combined =
+            embassy_futures::select::select3(main_futures, bond_save_future, sync_future);
+        match combined.await {
+            embassy_futures::select::Either3::First(inner) => {
+                match inner {
+                    embassy_futures::select::Either::First(gatt_result) => {
+                        rprintln!("BLE: Disconnected (GATT: {:?})", gatt_result);
+                    }
+                    embassy_futures::select::Either::Second(()) => {
+                        rprintln!("BLE: Disconnected (notify failure)");
+                    }
+                }
+                false
+            }
+            embassy_futures::select::Either3::Second(()) => unreachable!(),
+            embassy_futures::select::Either3::Third(()) => {
+                rprintln!("BLE: Sync mode requested, disconnecting");
+                true
+            }
         }
     };
 
-    #[cfg(feature = "board-xiao")]
-    match result {
-        embassy_futures::select::Either3::First(gatt_result) => {
-            rprintln!("BLE: Disconnected (GATT: {:?})", gatt_result);
+    // Explicitly disconnect so the host sees a clean GAP termination
+    // before we start advertising in sync mode.
+    if sync_requested {
+        let _ = conn.disconnect();
+        // Give the host time to process the disconnect
+        Timer::after(Duration::from_millis(1000)).await;
+    } else {
+        bonder.save_sys_attrs(&conn);
+        if let Some((master_id, enc_info, peer_id)) = bonder.get_bond_data() {
+            let sys_attrs = bonder.get_sys_attrs();
+            let _ = crate::ble::flash_bond::save_bond(
+                flash, &master_id, &enc_info, &peer_id, &sys_attrs,
+            )
+            .await;
         }
-        embassy_futures::select::Either3::Second(()) => {
-            rprintln!("BLE: Disconnected (notify failure)");
-        }
-        embassy_futures::select::Either3::Third(()) => {
-            rprintln!("BLE: Disconnected (battery task ended)");
-        }
-    }
-    #[cfg(not(feature = "board-xiao"))]
-    match result {
-        embassy_futures::select::Either::First(gatt_result) => {
-            rprintln!("BLE: Disconnected (GATT: {:?})", gatt_result);
-        }
-        embassy_futures::select::Either::Second(()) => {
-            rprintln!("BLE: Disconnected (notify failure)");
-        }
+        Timer::after(Duration::from_millis(500)).await;
     }
 
-    // Save system attributes and bond to flash
-    bonder.save_sys_attrs(&conn);
-    if let Some((master_id, enc_info, peer_id)) = bonder.get_bond_data() {
-        let sys_attrs = bonder.get_sys_attrs();
-        let _ =
-            crate::ble::flash_bond::save_bond(flash, &master_id, &enc_info, &peer_id, &sys_attrs)
-                .await;
-    }
-
-    Timer::after(Duration::from_millis(500)).await;
+    sync_requested
 }

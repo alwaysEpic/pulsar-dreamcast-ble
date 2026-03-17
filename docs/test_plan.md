@@ -15,7 +15,7 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 | XIAO nRF52840 adapter (prototype) | Device under test (DUT) |
 | Dreamcast controller (OEM) | Input source |
 | Dreamcast controller (third-party, if available) | Compatibility |
-| LiPo cell (500mAh or similar) | Battery power |
+| LiPo cell (1000mAh) | Battery power |
 | Multimeter (DC voltage, current) | Voltage/current measurements |
 | USB power meter (e.g., ChargerLAB KM003C) | USB draw, charge current |
 | Laptop with Bluetooth (macOS/Windows/Linux) | BLE host, RTT console |

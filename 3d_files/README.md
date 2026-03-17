@@ -11,6 +11,10 @@ This directory contains 3D models for a VMU-shaped enclosure for the Dreamcast B
 
 The original VMU 3D scan archives (`VMU.rar`, `VMUCapScan.rar`) are large binary files and not included in the repository. They are available as assets on the [GitHub Releases](https://github.com/alwaysEpic/pulsar-dreamcast-ble/releases) page to preserve them in case the original sources go offline.
 
+## Printing Tips
+
+The front and back halves print best at roughly a 45-degree angle with a few supports. This gives cleaner surfaces and avoids overhangs on the curved shell edges.
+
 ## Attribution
 
 - **Modified enclosure** (Blender files, edited STLs) by [alwaysEpic](https://github.com/alwaysEpic) — if you use or remix these, please credit the original author

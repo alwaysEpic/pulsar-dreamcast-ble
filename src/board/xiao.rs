@@ -138,13 +138,6 @@ pub fn init_pins(
     }
 }
 
-/// P1 GPIO base address for register access.
-const P1_BASE: u32 = 0x5000_0300;
-/// Offset to `PIN_CNF` registers within GPIO peripheral.
-const PIN_CNF_OFFSET: u32 = 0x700;
-/// Wake pin number (P1.15 / D10 — sync button doubles as wake).
-const WAKE_PIN_NUM: u32 = 15;
-
 /// Static storage for the boost converter control pin.
 /// Used during System Off entry to disable 5V output.
 ///
@@ -259,6 +252,36 @@ impl<'d> BatteryReader<'d> {
     }
 }
 
+/// Disconnect all GPIO pins to clear bootloader residue.
+///
+/// The UF2 bootloader may leave QSPI, NeoPixel, or LED pins configured,
+/// which can draw current. This resets all P0 and P1 pins to input
+/// disconnected (Hi-Z). Call once at early boot, before pin init.
+///
+/// Skips P0.28 (boost SHDN) to preserve its LOW state from System Off —
+/// disconnecting it would let the Pololu's pull-up momentarily enable 5V.
+///
+/// # Safety
+/// Must be called before any Embassy pin peripherals are configured, since
+/// it writes directly to PIN_CNF registers.
+pub unsafe fn disconnect_all_pins() {
+    const P0_PIN_CNF_BASE: *mut u32 = (0x5000_0000 + 0x700) as *mut u32;
+    const P1_PIN_CNF_BASE: *mut u32 = (0x5000_0300 + 0x700) as *mut u32;
+    const DISCONNECT: u32 = 0x0000_0002;
+    for pin in 0..32 {
+        // Skip P0.28 (boost SHDN) — preserve LOW state from System Off.
+        // Disconnecting it lets the Pololu's internal pull-up enable the
+        // boost converter, causing a momentary 5V spike on wake.
+        if pin == 28 {
+            continue;
+        }
+        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), DISCONNECT);
+    }
+    for pin in 0..16 {
+        core::ptr::write_volatile(P1_PIN_CNF_BASE.add(pin), DISCONNECT);
+    }
+}
+
 /// Put the onboard P25Q16H QSPI flash into Deep Power Down mode.
 ///
 /// Bit-bangs SPI to send the DPD command (0xB9) — avoids QSPI peripheral
@@ -352,36 +375,40 @@ pub unsafe fn enter_system_off() -> ! {
     rprintln!("SLEEP: Entering System Off");
     disable_boost();
 
-    // Disconnect GPIO pins to minimize current draw in System Off.
-    // GPIO state survives System Off — must explicitly disconnect.
+    // Disconnect ALL GPIO pins to minimize current draw in System Off.
+    // GPIO state survives System Off — any pin left configured (by Embassy,
+    // SoftDevice, or bootloader) could leak through external components.
+    // Disconnect everything first, then re-configure only the pins we need.
     // Value 0x00000002 = input disconnected, no pull (Hi-Z, ~0 µA).
-    //
-    // Pins NOT disconnected (must maintain state):
-    // - P0.25: QSPI CS, output HIGH — keeps flash in Deep Power Down
-    // - P0.28: Boost SHDN, output LOW — keeps boost converter off
-    // - P0.13: Charge ISET, output LOW — keeps BQ25101 at 100mA rate
-    // - P1.15: Wake button, input with pull-up + SENSE LOW — wake source
     const P0_PIN_CNF_BASE: *mut u32 = (0x5000_0000 + 0x700) as *mut u32;
+    const P1_PIN_CNF_BASE: *mut u32 = (0x5000_0300 + 0x700) as *mut u32;
     const DISCONNECT: u32 = 0x0000_0002;
-    for pin in [
-        3,  // SDCKB — external 4.7kΩ pull-up, disconnect to prevent current
-        5,  // SDCKA — external 4.7kΩ pull-up, disconnect to prevent current
-        6,  // LED B (sync) — set HIGH above, disconnect driver
-        14, // Battery ADC enable — output, not needed in sleep
-        17, // Charge STAT — input with pull-up, disconnect
-        26, // LED R — set HIGH above, disconnect driver
-        30, // LED G — set HIGH above, disconnect driver
-        31, // Battery ADC input (AIN7) — SAADC configured, disconnect
-    ] {
+    for pin in 0..32 {
         core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), DISCONNECT);
     }
+    for pin in 0..16 {
+        core::ptr::write_volatile(P1_PIN_CNF_BASE.add(pin), DISCONNECT);
+    }
 
-    // Configure wake pin: input with pull-up + SENSE LOW
-    // P1.15 = PIN_CNF[15] on P1
-    let cnf_addr = (P1_BASE + PIN_CNF_OFFSET + WAKE_PIN_NUM * 4) as *mut u32;
-    let cnf = core::ptr::read_volatile(cnf_addr);
-    let cnf = (cnf & !(0x3 << 16) & !(0x3 << 2)) | (0x3 << 16) | (0x3 << 2);
-    core::ptr::write_volatile(cnf_addr, cnf);
+    // Re-configure the 4 pins that must maintain state:
+    // P0.25: QSPI CS — output HIGH (keeps flash in Deep Power Down)
+    const OUTPUT_HIGH: u32 = 0x0000_0003; // DIR=output, INPUT=disconnected
+    core::ptr::write_volatile(P0_OUTSET, 1 << 25);
+    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(25), OUTPUT_HIGH);
+
+    // P0.28: Boost SHDN — output LOW (keeps boost converter off)
+    const P0_OUTCLR: *mut u32 = 0x5000_050C as *mut u32;
+    core::ptr::write_volatile(P0_OUTCLR, 1 << 28);
+    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(28), OUTPUT_HIGH);
+
+    // P0.13: Charge ISET — output LOW (BQ25101 at 100mA rate)
+    core::ptr::write_volatile(P0_OUTCLR, 1 << 13);
+    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(13), OUTPUT_HIGH);
+
+    // P1.15: Wake button — input with pull-up + SENSE LOW
+    // 0x0003_000C = INPUT=connected, PULL=pullup(11), SENSE=low(11)
+    const WAKE_INPUT_SENSE: u32 = 0x0003_000C;
+    core::ptr::write_volatile(P1_PIN_CNF_BASE.add(15), WAKE_INPUT_SENSE);
 
     nrf_softdevice::raw::sd_power_system_off();
 

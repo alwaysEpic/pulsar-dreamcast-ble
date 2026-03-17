@@ -74,6 +74,14 @@ async fn main(spawner: Spawner) {
     }
     let p = embassy_nrf::init(config);
 
+    // Disconnect all GPIO pins to clear any bootloader residue.
+    // After reset the nRF52840 defaults pins to disconnected, but the UF2
+    // bootloader may leave QSPI, NeoPixel, or LED pins configured.
+    #[cfg(feature = "board-xiao")]
+    unsafe {
+        board::disconnect_all_pins();
+    }
+
     // Put onboard QSPI flash into Deep Power Down (saves 2-5 mA)
     #[cfg(feature = "board-xiao")]
     unsafe {

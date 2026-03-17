@@ -25,19 +25,21 @@ enum HoldResult {
 
 /// Wait while button is held, blinking LED and checking for sync (3s) / sleep (10s).
 ///
-/// Returns `ShortPress` if released early, `SyncMode` if held past 3s.
-/// If held 10s, enters System Off directly (never returns on XIAO).
+/// Returns `ShortPress` if released early, `SyncMode` if held past 3s but released
+/// before 10s. If held 10s, enters System Off directly (never returns on XIAO).
+/// Sync mode is only signaled on release — holding through to sleep skips sync
+/// so the bond is preserved and the device reconnects on wake.
 async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) -> HoldResult {
     let press_start = Instant::now();
     let mut led_state = false;
     let mut last_blink = Instant::now();
-    let mut sync_triggered = false;
+    let mut past_sync_threshold = false;
 
     while button.is_low() {
         let elapsed = press_start.elapsed().as_millis();
 
-        // Blink LED — faster after sync triggers to indicate sleep is coming
-        let blink_rate = if sync_triggered {
+        // Blink LED — faster after sync threshold to indicate sleep is coming
+        let blink_rate = if past_sync_threshold {
             BLINK_INTERVAL_MS / 2
         } else {
             BLINK_INTERVAL_MS
@@ -65,16 +67,18 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
             }
         }
 
-        if !sync_triggered && elapsed >= HOLD_SYNC_MS {
-            sync_triggered = true;
-            rprintln!("SYNC: Entering pairing mode (60s)");
-            SYNC_MODE.signal(());
+        if !past_sync_threshold && elapsed >= HOLD_SYNC_MS {
+            past_sync_threshold = true;
+            rprintln!("SYNC: Past sync threshold, release for pairing or keep holding for sleep");
         }
 
         Timer::after(Duration::from_millis(20)).await;
     }
 
-    if sync_triggered {
+    // Only signal sync mode on release — not if held through to sleep
+    if past_sync_threshold {
+        rprintln!("SYNC: Entering pairing mode (60s)");
+        SYNC_MODE.signal(());
         HoldResult::SyncMode
     } else {
         HoldResult::ShortPress

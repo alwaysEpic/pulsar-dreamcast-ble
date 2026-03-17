@@ -1,6 +1,6 @@
 # Battery & Power Optimization
 
-Power management strategy for the XIAO nRF52840 Dreamcast BLE adapter running on a 500mAh LiPo.
+Power management strategy for the XIAO nRF52840 Dreamcast BLE adapter running on a 1000mAh LiPo.
 
 ---
 
@@ -8,11 +8,11 @@ Power management strategy for the XIAO nRF52840 Dreamcast BLE adapter running on
 
 | State | Current Draw | Notes |
 |-------|-------------|-------|
-| Active gaming | ~120 mA | Boost converter + controller + BLE radio |
-| BLE advertising (slow) | ~0.5-2 mA | 500ms interval, boost off |
-| System Off | ~5-8 µA | QSPI flash in DPD, pins disconnected |
+| Active gaming | ~120 mA | Boost converter + controller + BLE radio | - non tested
+| BLE advertising (slow) | ~0.5-2 mA | 500ms interval, boost off | - non tested
+| System Off | ~5-8 µA | QSPI flash in DPD, pins disconnected | - from specs
 
-With a 500mAh battery, expect ~4 hours of active gaming. System Off standby lasts months.
+With a 1000mAh battery, expect ~8 hours of active gaming at the estimated ~120 mA draw. System Off standby lasts months.
 
 ---
 
@@ -41,7 +41,7 @@ The XIAO has the inductor for REG1 DCDC (confirmed via Zephyr devicetree). Enabl
 
 GPIO state survives System Off on the nRF52840. Every unused pin is explicitly disconnected (input, no pull, Hi-Z) before entering System Off to prevent current leakage. Eight pins are disconnected; three are kept driven (QSPI CS HIGH, boost SHDN LOW, charge ISET LOW).
 
-During BLE advertising (boost off), Maple Bus pins are also disconnected via `MapleBus::set_low_power()`. The external 4.7kΩ pull-ups hold both lines at 3.3V with zero current.
+During BLE advertising (boost off), Maple Bus pins are also disconnected via `MapleBus::set_low_power()`. The external 10kΩ pull-ups hold both lines at 3.3V with zero current.
 
 ### 5. HighDrive Mode for TX
 
@@ -84,16 +84,13 @@ Two 1N5817 Schottky diodes in an OR configuration route either USB VBUS or boost
 | DualSense | 1560 mAh | 6-12 hr | ~100 mA |
 | Switch Pro | 1300 mAh | 40 hr | ~32 mA |
 | 8BitDo Pro 2 | 1000 mAh | 20 hr | ~50 mA |
-| **This project** | **500 mAh** | **~4 hr** | **~120 mA** |
+| **This project** | **1000 mAh** | **~8 hr** | **~120 mA** |
 
-Our draw is dominated by the 5V boost converter + Dreamcast controller (~60-80 mA). The nRF52840 + BLE radio is only ~15 mA of the total. A larger battery (1000+ mAh) would bring us in line with the DualSense.
+Our draw is dominated by the 5V boost converter + Dreamcast controller (~60-80 mA). The nRF52840 + BLE radio is only ~15 mA of the total.
 
 ---
 
 ## Possible Next Steps
 
-- **Higher-resistance pull-ups** — Test 6.8kΩ or 10kΩ to save ~0.2-0.4 mA during active polling. Rise time at 10kΩ should still fit in the turnaround gap.
 - **Slave latency** — Setting BLE slave_latency to 2-4 could save ~200-300 µA during idle connected periods. Deferred due to compatibility risk with iBlueControlMod.
-- **Boost converter upgrade** — TPS61099x50 (SOT-23-5) offers ~90% efficiency vs ~87% for the current Pololu, plus 5µA quiescent vs 50µA. Worth doing on a dedicated PCB.
-- **Larger battery** — 1000mAh LiPo would give ~8 hours of active gaming without any other changes.
-- **Dedicated PCB** — Eliminates perfboard losses, allows SMD Schottky diodes (BAT54, ~0.23V drop vs 0.3-0.4V), and integrated charging circuit.
+- **Dedicated PCB** — Eliminates perfboard losses and enables SMD components: TPS61099x50 boost converter (~90% efficiency, 5µA quiescent vs 50µA on current Pololu), BAT54 Schottky diodes (~0.23V drop vs 0.3-0.4V), and integrated charging circuit.

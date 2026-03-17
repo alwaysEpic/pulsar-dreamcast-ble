@@ -49,7 +49,9 @@ The Dreamcast controller has one analog stick, which maps to the left stick. The
 The sync button on the adapter has three functions:
 
 ### Pair with a New Device (Hold 3 seconds)
-Hold the sync button for 3 seconds. The LED will blink while you hold it. When released, the adapter enters **pairing mode** for 60 seconds. This clears any existing pairing, so you'll need to pair again from your host device.
+Hold the sync button for 3 seconds. The LED will blink while you hold it. When released, the adapter disconnects from the current host and enters **pairing mode** for 60 seconds. This clears any existing pairing, so you'll need to pair again from your host device.
+
+**Important:** After syncing to a new device, the old host may still show the adapter in its Bluetooth settings. You must manually **"Forget This Device"** on the old host before it can pair with the adapter again. This is normal for single-bond Bluetooth devices (same behavior as Xbox controllers).
 
 ### Manual Sleep (Hold 10 seconds)
 Keep holding past the 3-second sync point. The LED blink rate will double to indicate sleep is approaching. At 10 seconds, the adapter enters deep sleep immediately. This is useful for conserving battery or allowing the battery to charge on USB without the controller drawing power.
@@ -109,6 +111,10 @@ When asleep, the adapter draws minimal power (~5 microamps). The battery charges
 - The adapter may not be in pairing mode. Hold the sync button for 3 seconds to enter pairing mode.
 - Make sure you're within Bluetooth range (about 10 meters / 30 feet).
 - On some devices, you may need to "forget" the old pairing first, then hold sync for 3 seconds to re-pair.
+
+**Previously paired device can't reconnect after syncing to a new device**
+- Go to Bluetooth settings on the old device and select "Forget This Device" for the adapter.
+- Then hold the sync button for 3 seconds on the adapter to enter pairing mode and pair fresh.
 
 **Connected but no input**
 - Some hosts need a moment after connecting to discover services. Wait a few seconds after the connection is established.
