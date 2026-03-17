@@ -6,13 +6,30 @@ Power management strategy for the XIAO nRF52840 Dreamcast BLE adapter running on
 
 ## Power Budget
 
-| State | Current Draw | Notes |
-|-------|-------------|-------|
-| Active gaming | ~120 mA | Boost converter + controller + BLE radio | - non tested
-| BLE advertising (slow) | ~0.5-2 mA | 500ms interval, boost off | - non tested
-| System Off | ~5-8 µA | QSPI flash in DPD, pins disconnected | - from specs
+| State | Current Draw | Source | Notes |
+|-------|-------------|--------|-------|
+| Active gaming | ~57-67 mA | Measured (FNB58) | Boost converter + controller + BLE radio |
+| BLE advertising (slow) | ~0.5-2 mA | Estimated | 500ms interval, boost off |
+| System Off | ~5-8 µA | Datasheet | QSPI flash in DPD, pins disconnected |
 
-With a 1000mAh battery, expect ~8 hours of active gaming at the estimated ~120 mA draw. System Off standby lasts months.
+### Measured Battery Life (500mAh LiPo)
+
+Tested with FNB58 USB power meter, active BLE connection with occasional controller input:
+
+- **Idle connected draw:** ~57 mA
+- **Active input draw:** ~67 mA
+- **Sleep drain:** Negligible (~2% overnight, likely self-discharge)
+
+Testing in progress — preliminary results suggest ~7-8 hours on 500mAh. Battery life estimates will be updated with more complete discharge data.
+
+### Estimated Battery Life by Capacity
+
+| Battery | Active Gaming | Sleep Standby |
+|---------|--------------|---------------|
+| 500 mAh | ~7-8 hours (preliminary) | Months |
+| 1000 mAh | ~14-16 hours (estimated) | Months |
+
+Note: The LiPo discharge curve is nonlinear. The battery spends a long time in the 3.7-3.9V plateau then drops quickly below 3.5V. Actual runtime may vary with controller usage intensity.
 
 ---
 
@@ -84,9 +101,10 @@ Two 1N5817 Schottky diodes in an OR configuration route either USB VBUS or boost
 | DualSense | 1560 mAh | 6-12 hr | ~100 mA |
 | Switch Pro | 1300 mAh | 40 hr | ~32 mA |
 | 8BitDo Pro 2 | 1000 mAh | 20 hr | ~50 mA |
-| **This project** | **1000 mAh** | **~8 hr** | **~120 mA** |
+| **This project** | **500 mAh** | **~7-8 hr** | **~60 mA** |
+| **This project** | **1000 mAh** | **~14-16 hr** | **~60 mA** |
 
-Our draw is dominated by the 5V boost converter + Dreamcast controller (~60-80 mA). The nRF52840 + BLE radio is only ~15 mA of the total.
+Our draw is dominated by the 5V boost converter + Dreamcast controller (~45 mA). The nRF52840 + BLE radio is only ~15 mA of the total.
 
 ---
 

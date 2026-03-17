@@ -14,7 +14,7 @@ Use your Dreamcast controller wirelessly with any Bluetooth device. Pulsar speak
 - Works with any BLE HID host (PC, iOS, Android, Switch, Dreamcast via iBlueControlMod)
 - 60Hz controller polling with continuous BLE reporting
 - Pairing persists across power cycles (flash-based bonding)
-- Battery powered with sleep/wake support
+- Battery powered (~7-8 hrs on 500mAh, ~14-16 hrs on 1000mAh) with sleep/wake support
 - 3D-printable VMU-shaped enclosure included
 
 ## Compatibility
