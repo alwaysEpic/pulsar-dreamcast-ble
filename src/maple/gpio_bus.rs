@@ -149,7 +149,7 @@ impl MapleBus {
     /// Diagnostic: sample the bus briefly and report what we see.
     /// Call this after TX to check if any activity is present.
     pub fn diagnose_bus(&mut self) {
-        use rtt_target::rprintln;
+        use crate::log;
         self.set_input_mode();
 
         // Quick sample: 1000 reads
@@ -175,7 +175,7 @@ impl MapleBus {
         let final_val = read_p0_in();
         let final_a = (final_val & PIN_A_MASK) != 0;
         let final_b = (final_val & PIN_B_MASK) != 0;
-        rprintln!(
+        log!(
             "DIAG: A_low={}/1000 B_low={}/1000 trans={} final A={} B={}",
             a_low_count,
             b_low_count,

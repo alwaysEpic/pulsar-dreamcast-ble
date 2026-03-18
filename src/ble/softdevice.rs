@@ -3,10 +3,10 @@
 
 //! `SoftDevice` initialization and BLE advertising.
 
+use crate::log;
 use core::sync::atomic::{AtomicU8, Ordering};
 use nrf_softdevice::ble::{peripheral, Connection};
 use nrf_softdevice::{raw, Softdevice};
-use rtt_target::rprintln;
 
 use crate::ble::hid::GamepadServer;
 use crate::ble::security::Bonder;
@@ -283,7 +283,7 @@ pub async fn advertise(
         AdvertiseMode::Reconnect => 2,
     };
     if LAST_ADV_MODE.swap(mode_id, core::sync::atomic::Ordering::Relaxed) != mode_id {
-        rprintln!("{}", log_msg);
+        log!("{}", log_msg);
     }
 
     peripheral::advertise_pairable(sd, adv, &config, bonder).await

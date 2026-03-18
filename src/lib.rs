@@ -12,10 +12,41 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
+/// RTT print macro — compiles to nothing when the `rtt` feature is disabled.
+#[cfg(feature = "rtt")]
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => { rtt_target::rprintln!($($arg)*) };
+}
+
+/// RTT print macro — compiles to nothing when the `rtt` feature is disabled.
+#[cfg(not(feature = "rtt"))]
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {{}};
+}
+
+/// RTT init — compiles to nothing when the `rtt` feature is disabled.
+#[cfg(feature = "rtt")]
+#[macro_export]
+macro_rules! log_init {
+    () => {
+        rtt_target::rtt_init_print!()
+    };
+}
+
+/// RTT init — compiles to nothing when the `rtt` feature is disabled.
+#[cfg(not(feature = "rtt"))]
+#[macro_export]
+macro_rules! log_init {
+    () => {{}};
+}
+
 pub mod ble;
 pub mod board;
 pub mod button;
 pub mod maple;
+pub mod panic_handler;
 
 /// BLE HID notification interval (~125Hz, matches Xbox One S).
 pub const NOTIFY_INTERVAL_MS: u64 = 8;

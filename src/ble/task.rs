@@ -3,11 +3,11 @@
 
 //! BLE advertising and connection handling task.
 
+use crate::log;
 use embassy_time::{Duration, Instant, Timer};
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::security::SecurityHandler;
 use nrf_softdevice::Softdevice;
-use rtt_target::rprintln;
 
 use crate::ble::{
     advertise, get_connection_state, set_connection_state, AdvertiseMode, Bonder, ConnectionState,
@@ -42,7 +42,7 @@ pub async fn ble_task(
         // Check for name toggle request (non-blocking)
         if NAME_TOGGLE.signaled() {
             let new_pref = NAME_TOGGLE.wait().await;
-            rprintln!(
+            log!(
                 "NAME: Toggling to {}",
                 if new_pref { "Dreamcast" } else { "Xbox" }
             );
@@ -81,14 +81,14 @@ pub async fn ble_task(
                                 {
                                     #[cfg(feature = "board-xiao")]
                                     {
-                                        rprintln!("BLE: Reconnect timeout, entering System Off");
+                                        log!("BLE: Reconnect timeout, entering System Off");
                                         unsafe {
                                             crate::board::enter_system_off();
                                         }
                                     }
                                     #[cfg(not(feature = "board-xiao"))]
                                     {
-                                        rprintln!("BLE: Reconnect timeout, entering idle");
+                                        log!("BLE: Reconnect timeout, entering idle");
                                         set_connection_state(ConnectionState::Idle);
                                     }
                                 }
@@ -96,7 +96,7 @@ pub async fn ble_task(
                             }
                             embassy_futures::select::Either::Second(()) => {
                                 // Sync mode triggered
-                                rprintln!("BLE: Sync mode requested");
+                                log!("BLE: Sync mode requested");
                                 bonder.clear();
                                 let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
                                 set_connection_state(ConnectionState::SyncMode);
@@ -106,7 +106,7 @@ pub async fn ble_task(
                     }
                 } else {
                     // No bonded device - go straight to sync mode
-                    rprintln!("BLE: No bond, auto-entering sync mode");
+                    log!("BLE: No bond, auto-entering sync mode");
                     set_connection_state(ConnectionState::SyncMode);
                     None
                 };
@@ -135,7 +135,7 @@ pub async fn ble_task(
 
                 let conn = loop {
                     if start.elapsed().as_millis() >= SYNC_TIMEOUT_MS {
-                        rprintln!("BLE: Sync mode timeout");
+                        log!("BLE: Sync mode timeout");
                         // Return to appropriate state
                         if bonder.has_bond() {
                             set_connection_state(ConnectionState::Reconnecting);
@@ -144,7 +144,7 @@ pub async fn ble_task(
                             // Wake via sync button → full reset → auto sync mode.
                             #[cfg(feature = "board-xiao")]
                             {
-                                rprintln!("BLE: No bond after sync timeout, entering System Off");
+                                log!("BLE: No bond after sync timeout, entering System Off");
                                 unsafe {
                                     crate::board::enter_system_off();
                                 }
@@ -205,12 +205,12 @@ async fn handle_connection(
     flash: &mut nrf_softdevice::Flash,
     conn: nrf_softdevice::ble::Connection,
 ) -> bool {
-    rprintln!("BLE: Connected!");
+    log!("BLE: Connected!");
 
     // If sync was requested before we got here, honor it immediately
     if SYNC_MODE.signaled() {
         SYNC_MODE.wait().await;
-        rprintln!("BLE: Sync requested during connection setup");
+        log!("BLE: Sync requested during connection setup");
         return true;
     }
 
@@ -236,7 +236,7 @@ async fn handle_connection(
             )
         };
         if rc != 0 {
-            rprintln!("BLE: Conn param update failed: {}", rc);
+            log!("BLE: Conn param update failed: {}", rc);
         }
     }
 
@@ -274,7 +274,7 @@ async fn handle_connection(
             if server.send_report(&conn, &report).is_err() {
                 notify_fails += 1;
                 if notify_fails > crate::MAX_NOTIFY_FAILURES {
-                    rprintln!("BLE: Too many notify failures, disconnecting");
+                    log!("BLE: Too many notify failures, disconnecting");
                     break;
                 }
             } else {
@@ -296,7 +296,7 @@ async fn handle_connection(
                     flash, &master_id, &enc_info, &peer_id, &sys_attrs,
                 )
                 .await;
-                rprintln!("BLE: Bond saved");
+                log!("BLE: Bond saved");
                 break;
             }
         }
@@ -304,7 +304,7 @@ async fn handle_connection(
         loop {
             if NAME_TOGGLE.signaled() {
                 let new_pref = NAME_TOGGLE.wait().await;
-                rprintln!(
+                log!(
                     "NAME: Toggling to {}",
                     if new_pref { "Dreamcast" } else { "Xbox" }
                 );
@@ -342,20 +342,20 @@ async fn handle_connection(
             embassy_futures::select::Either3::First(inner) => {
                 match inner {
                     embassy_futures::select::Either3::First(gatt_result) => {
-                        rprintln!("BLE: Disconnected (GATT: {:?})", gatt_result);
+                        log!("BLE: Disconnected (GATT: {:?})", gatt_result);
                     }
                     embassy_futures::select::Either3::Second(()) => {
-                        rprintln!("BLE: Disconnected (notify failure)");
+                        log!("BLE: Disconnected (notify failure)");
                     }
                     embassy_futures::select::Either3::Third(()) => {
-                        rprintln!("BLE: Disconnected (battery task ended)");
+                        log!("BLE: Disconnected (battery task ended)");
                     }
                 }
                 false
             }
             embassy_futures::select::Either3::Second(()) => unreachable!(),
             embassy_futures::select::Either3::Third(()) => {
-                rprintln!("BLE: Sync mode requested, disconnecting");
+                log!("BLE: Sync mode requested, disconnecting");
                 true
             }
         }
@@ -369,17 +369,17 @@ async fn handle_connection(
             embassy_futures::select::Either3::First(inner) => {
                 match inner {
                     embassy_futures::select::Either::First(gatt_result) => {
-                        rprintln!("BLE: Disconnected (GATT: {:?})", gatt_result);
+                        log!("BLE: Disconnected (GATT: {:?})", gatt_result);
                     }
                     embassy_futures::select::Either::Second(()) => {
-                        rprintln!("BLE: Disconnected (notify failure)");
+                        log!("BLE: Disconnected (notify failure)");
                     }
                 }
                 false
             }
             embassy_futures::select::Either3::Second(()) => unreachable!(),
             embassy_futures::select::Either3::Third(()) => {
-                rprintln!("BLE: Sync mode requested, disconnecting");
+                log!("BLE: Sync mode requested, disconnecting");
                 true
             }
         }

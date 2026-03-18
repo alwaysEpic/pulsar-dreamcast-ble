@@ -97,6 +97,36 @@ A `Channel` (FIFO queue) was considered but rejected: analog stick jitter fills 
 
 **Future option if needed:** Button edge accumulation — track a bitmask of buttons pressed since the last BLE read, OR it into the signaled state. This catches press+release within one poll cycle, but adds complexity and only helps when the BLE task is delayed past 16ms (rare with optimizations #1 and #2). The Maple Bus poll at 60Hz (16ms) already means sub-16ms taps are missed at the hardware level, matching original Dreamcast behavior.
 
+## 13. Voltage-Based Battery Percentage Is Good Enough
+
+A 10-point LiPo discharge curve lookup table with linear interpolation is the industry standard for embedded gamepads. Xbox controllers only report 4 levels. Meshtastic uses an 11-point table nearly identical to ours.
+
+**Key findings from discharge testing (500mAh LiPo, FNB58 meter):**
+
+- Linear voltage mapping is misleading — battery sat at "57%" for over an hour during the 3.7-3.9V plateau
+- The protection circuit cuts off at ~3300mV under load, not 3.0V — the battery never reaches the theoretical minimum
+- Voltage recovery after sleep or load removal causes readings to temporarily increase, confusing users
+
+**Solutions applied:**
+- Lookup table calibrated to measured cutoff (0% = 3300mV)
+- 8x hardware oversampling (SAADC) for noise reduction
+- Monotonic decrease constraint — percentage never goes up unless charging is detected
+
+**What we didn't do (and why):**
+- Fuel gauge IC (MAX17048) — adds hardware complexity, only +/-5% vs our +/-10-15%, not worth it without a custom PCB
+- Rolling average — the monotonic decrease constraint handles the main noise source (voltage bounce) without the complexity
+- Reading during radio idle — marginal benefit, the 8x oversampling handles transients
+
+## 14. Flash-Based Panic Logging
+
+`panic-reset` silently resets with no diagnostic information. Writing the panic message to a dedicated flash page before reset costs almost nothing (a few microseconds of NVMC writes) and provides critical debugging data on the next boot.
+
+**Implementation notes:**
+- Must use raw NVMC register writes — the SoftDevice async flash API is not available in a panic handler
+- Use a fixed flash page well away from SoftDevice and application data (0xFC000)
+- Always erase the page after reading to prevent stale data and limit flash wear
+- nRF52840 flash is rated for ~10,000 erase cycles per page — not a concern
+
 ---
 
 ## Quick Reference

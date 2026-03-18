@@ -3,9 +3,9 @@
 
 //! Sync button monitoring task.
 
+use crate::log;
 use embassy_nrf::gpio::{Input, Output};
 use embassy_time::{Duration, Instant, Timer};
-use rtt_target::rprintln;
 
 use crate::ble::{get_connection_state, ConnectionState};
 use crate::{NAME_TOGGLE, SYNC_MODE};
@@ -55,7 +55,7 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
         }
 
         if elapsed >= HOLD_SLEEP_MS {
-            rprintln!("SYNC: 10s hold — waiting for release, then System Off");
+            log!("SYNC: 10s hold — waiting for release, then System Off");
             // Solid LED to confirm sleep is committed
             led.set_low();
             while button.is_low() {
@@ -69,7 +69,7 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
 
         if !past_sync_threshold && elapsed >= HOLD_SYNC_MS {
             past_sync_threshold = true;
-            rprintln!("SYNC: Past sync threshold, release for pairing or keep holding for sleep");
+            log!("SYNC: Past sync threshold, release for pairing or keep holding for sleep");
         }
 
         Timer::after(Duration::from_millis(20)).await;
@@ -77,7 +77,7 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
 
     // Only signal sync mode on release — not if held through to sleep
     if past_sync_threshold {
-        rprintln!("SYNC: Entering pairing mode (60s)");
+        log!("SYNC: Entering pairing mode (60s)");
         SYNC_MODE.signal(());
         HoldResult::SyncMode
     } else {
@@ -89,7 +89,7 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
 async fn handle_triple_press(led: &mut Output<'static>) {
     let current = crate::ble::flash_bond::load_name_preference();
     let new_pref = !current;
-    rprintln!(
+    log!(
         "NAME: Triple-press! Switching to {}",
         if new_pref { "Dreamcast" } else { "Xbox" }
     );

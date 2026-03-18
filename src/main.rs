@@ -14,10 +14,10 @@ use pulsar_dreamcast_ble::{ble, board, CONTROLLER_STATE};
 #[cfg(feature = "board-xiao")]
 use embassy_time::Instant;
 use nrf_softdevice::Softdevice;
-use panic_reset as _;
+// Panic handler is registered via #[panic_handler] in pulsar_dreamcast_ble::panic_handler
 #[cfg(feature = "board-xiao")]
 use pulsar_dreamcast_ble::SLEEP_TIMEOUT_MS;
-use rtt_target::{rprintln, rtt_init_print};
+use pulsar_dreamcast_ble::{log, log_init};
 use static_cell::StaticCell;
 
 #[cfg(feature = "board-xiao")]
@@ -61,8 +61,9 @@ const LOW_BATTERY_CUTOFF_MV: u32 = 3200;
 #[allow(clippy::items_after_statements)] // StaticCell pattern requires inline statics
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    rtt_init_print!();
-    rprintln!("DC Adapter Starting");
+    log_init!();
+    pulsar_dreamcast_ble::panic_handler::check_panic_log();
+    log!("DC Adapter Starting");
 
     // Initialize Embassy with interrupt priorities that don't conflict with SoftDevice
     let mut config = embassy_nrf::config::Config::default();
@@ -91,9 +92,9 @@ async fn main(spawner: Spawner) {
     // Load name preference from flash (Xbox vs Dreamcast)
     let is_dreamcast = ble::flash_bond::load_name_preference();
     if is_dreamcast {
-        rprintln!("Name: Dreamcast Wireless Controller");
+        log!("Name: Dreamcast Wireless Controller");
     } else {
-        rprintln!("Name: Xbox Wireless Controller");
+        log!("Name: Xbox Wireless Controller");
     }
 
     // Initialize SoftDevice with chosen name
@@ -165,7 +166,7 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "board-xiao")]
     let mut was_charging = {
         let charging = charge_stat.is_low();
-        rprintln!(
+        log!(
             "PWR: {}",
             if charging { "Charging" } else { "Not charging" }
         );
@@ -177,18 +178,18 @@ async fn main(spawner: Spawner) {
     let host = MapleHost::new();
 
     #[cfg(feature = "board-xiao")]
-    const BATTERY_READ_INTERVAL_MS: u64 = 60_000;
+    const BATTERY_READ_INTERVAL: Duration = Duration::from_secs(60);
     #[cfg(feature = "board-xiao")]
-    let mut battery_read_countdown: u64 = BATTERY_READ_INTERVAL_MS;
+    let mut last_battery_read: Instant = Instant::now();
 
     // Initial battery read at startup
     #[cfg(feature = "board-xiao")]
     {
-        let (mv, percent) = battery_reader.read().await;
         let charging = charge_stat.is_low();
+        let (mv, percent) = battery_reader.read(charging).await;
         BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
         if !charging && mv < LOW_BATTERY_CUTOFF_MV {
-            rprintln!("PWR: Low battery ({}mV), entering System Off", mv);
+            log!("PWR: Low battery ({}mV), entering System Off", mv);
             unsafe {
                 board::enter_system_off();
             }
@@ -198,7 +199,7 @@ async fn main(spawner: Spawner) {
     // Outer loop: wait for BLE connection, then poll controller
     loop {
         // --- Phase 1: Wait for BLE connection ---
-        rprintln!("MAIN: Waiting for BLE connection...");
+        log!("MAIN: Waiting for BLE connection...");
         bus.set_low_power();
         status.off();
         loop {
@@ -211,7 +212,7 @@ async fn main(spawner: Spawner) {
                 // Battery/charge monitoring while waiting for BLE
                 let charging = charge_stat.is_low();
                 if charging != was_charging {
-                    rprintln!(
+                    log!(
                         "CHG: {}",
                         if charging {
                             "Charging started"
@@ -222,14 +223,13 @@ async fn main(spawner: Spawner) {
                     was_charging = charging;
                 }
 
-                battery_read_countdown = battery_read_countdown.saturating_sub(BLE_WAIT_CHECK_MS);
-                if battery_read_countdown == 0 {
-                    let (mv, percent) = battery_reader.read().await;
+                if last_battery_read.elapsed() >= BATTERY_READ_INTERVAL {
+                    let (mv, percent) = battery_reader.read(charging).await;
                     BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
-                    battery_read_countdown = BATTERY_READ_INTERVAL_MS;
+                    last_battery_read = Instant::now();
 
                     if !charging && mv < LOW_BATTERY_CUTOFF_MV {
-                        rprintln!("PWR: Low battery ({}mV), entering System Off", mv);
+                        log!("PWR: Low battery ({}mV), entering System Off", mv);
                         unsafe {
                             board::enter_system_off();
                         }
@@ -239,7 +239,7 @@ async fn main(spawner: Spawner) {
 
             Timer::after(Duration::from_millis(BLE_WAIT_CHECK_MS)).await;
         }
-        rprintln!("MAIN: BLE connected, enabling controller");
+        log!("MAIN: BLE connected, enabling controller");
 
         // --- Phase 2: Enable boost and detect controller ---
         // Skip boost if USB is providing 5V through Schottky diode passthrough
@@ -247,7 +247,7 @@ async fn main(spawner: Spawner) {
         let mut usb_powered = board::is_usb_connected();
         #[cfg(feature = "board-xiao")]
         if usb_powered {
-            rprintln!("PWR: USB detected, boost off (passthrough)");
+            log!("PWR: USB detected, boost off (passthrough)");
         } else {
             unsafe {
                 board::enable_boost();
@@ -274,7 +274,7 @@ async fn main(spawner: Spawner) {
             // Enter System Off if no controller found within timeout
             #[cfg(feature = "board-xiao")]
             if detect_start.elapsed().as_millis() >= DETECT_TIMEOUT_MS {
-                rprintln!(
+                log!(
                     "MAPLE: Detect timeout ({}s), entering System Off",
                     DETECT_TIMEOUT_MS / 1000
                 );
@@ -290,18 +290,18 @@ async fn main(spawner: Spawner) {
             match &result {
                 MapleResult::Ok(_) => {
                     status.show_controller_found();
-                    rprintln!("MAPLE: Controller detected");
+                    log!("MAPLE: Controller detected");
                     break true;
                 }
                 MapleResult::Timeout => {
                     if !timeout_logged {
-                        rprintln!("MAPLE: Timeout (retrying...)");
+                        log!("MAPLE: Timeout (retrying...)");
                         bus.diagnose_bus();
                         timeout_logged = true;
                     }
                 }
                 MapleResult::UnexpectedResponse(cmd) => {
-                    rprintln!("MAPLE: Unexpected cmd=0x{:02X}", cmd);
+                    log!("MAPLE: Unexpected cmd=0x{:02X}", cmd);
                 }
             }
 
@@ -310,7 +310,7 @@ async fn main(spawner: Spawner) {
         };
 
         if !controller_found {
-            rprintln!("MAIN: BLE disconnected during detection, disabling boost");
+            log!("MAIN: BLE disconnected during detection, disabling boost");
             #[cfg(feature = "board-xiao")]
             unsafe {
                 board::disable_boost();
@@ -327,7 +327,7 @@ async fn main(spawner: Spawner) {
         loop {
             // Check for BLE disconnect
             if get_connection_state() != ConnectionState::Connected {
-                rprintln!("MAIN: BLE disconnected, disabling boost");
+                log!("MAIN: BLE disconnected, disabling boost");
                 #[cfg(feature = "board-xiao")]
                 unsafe {
                     board::disable_boost();
@@ -339,7 +339,7 @@ async fn main(spawner: Spawner) {
 
             if let MapleResult::Ok(state) = host.get_condition(&mut bus) {
                 if fail_count >= CONTROLLER_LOST_THRESHOLD {
-                    rprintln!("MAPLE: Controller reconnected");
+                    log!("MAPLE: Controller reconnected");
                 }
                 fail_count = 0;
 
@@ -361,7 +361,7 @@ async fn main(spawner: Spawner) {
             } else {
                 fail_count = fail_count.saturating_add(1);
                 if fail_count == CONTROLLER_LOST_THRESHOLD {
-                    rprintln!("MAPLE: Controller lost, re-detecting...");
+                    log!("MAPLE: Controller lost, re-detecting...");
                     CONTROLLER_STATE.signal(ControllerState::default());
                     last_state = None;
                     status.show_searching();
@@ -377,7 +377,7 @@ async fn main(spawner: Spawner) {
 
                         #[cfg(feature = "board-xiao")]
                         if redetect_start.elapsed().as_millis() >= SLEEP_TIMEOUT_MS {
-                            rprintln!("MAPLE: Re-detect timeout, entering System Off");
+                            log!("MAPLE: Re-detect timeout, entering System Off");
                             unsafe {
                                 board::enter_system_off();
                             }
@@ -385,7 +385,7 @@ async fn main(spawner: Spawner) {
 
                         let result = host.request_device_info(&mut bus);
                         if let MapleResult::Ok(_) = &result {
-                            rprintln!("MAPLE: Controller re-detected");
+                            log!("MAPLE: Controller re-detected");
                             status.show_controller_found();
                             fail_count = 0;
                             #[cfg(feature = "board-xiao")]
@@ -400,7 +400,7 @@ async fn main(spawner: Spawner) {
 
                     // If BLE disconnected during re-detection, break to outer loop
                     if get_connection_state() != ConnectionState::Connected {
-                        rprintln!("MAIN: BLE disconnected during re-detect, disabling boost");
+                        log!("MAIN: BLE disconnected during re-detect, disabling boost");
                         #[cfg(feature = "board-xiao")]
                         unsafe {
                             board::disable_boost();
@@ -419,12 +419,12 @@ async fn main(spawner: Spawner) {
                 if usb_now != usb_powered {
                     usb_powered = usb_now;
                     if usb_now {
-                        rprintln!("PWR: USB connected, disabling boost (passthrough)");
+                        log!("PWR: USB connected, disabling boost (passthrough)");
                         unsafe {
                             board::disable_boost();
                         }
                     } else {
-                        rprintln!("PWR: USB removed, enabling boost");
+                        log!("PWR: USB removed, enabling boost");
                         unsafe {
                             board::enable_boost();
                         }
@@ -433,7 +433,7 @@ async fn main(spawner: Spawner) {
 
                 let charging = charge_stat.is_low();
                 if charging != was_charging {
-                    rprintln!(
+                    log!(
                         "CHG: {}",
                         if charging {
                             "Charging started"
@@ -444,14 +444,13 @@ async fn main(spawner: Spawner) {
                     was_charging = charging;
                 }
 
-                battery_read_countdown = battery_read_countdown.saturating_sub(POLL_INTERVAL_MS);
-                if battery_read_countdown == 0 {
-                    let (mv, percent) = battery_reader.read().await;
+                if last_battery_read.elapsed() >= BATTERY_READ_INTERVAL {
+                    let (mv, percent) = battery_reader.read(charging).await;
                     BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
-                    battery_read_countdown = BATTERY_READ_INTERVAL_MS;
+                    last_battery_read = Instant::now();
 
                     if !charging && mv < LOW_BATTERY_CUTOFF_MV {
-                        rprintln!("PWR: Low battery ({}mV), entering System Off", mv);
+                        log!("PWR: Low battery ({}mV), entering System Off", mv);
                         unsafe {
                             board::enter_system_off();
                         }
@@ -461,7 +460,7 @@ async fn main(spawner: Spawner) {
 
             #[cfg(feature = "board-xiao")]
             if last_activity.elapsed().as_millis() >= INACTIVITY_TIMEOUT_MS {
-                rprintln!("MAIN: Inactivity timeout (10 min), entering System Off");
+                log!("MAIN: Inactivity timeout (10 min), entering System Off");
                 unsafe {
                     board::enter_system_off();
                 }

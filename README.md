@@ -111,10 +111,14 @@ cargo install cargo-embed
 
 **XIAO** (must use `--release` — debug builds break Maple Bus timing):
 ```bash
+# Production
 cargo embed --release --no-default-features --features board-xiao
+
+# Development (with RTT debug logging)
+cargo embed --release --no-default-features --features board-xiao,rtt
 ```
 
-**DK:**
+**DK** (RTT always enabled):
 ```bash
 cargo embed --release
 ```

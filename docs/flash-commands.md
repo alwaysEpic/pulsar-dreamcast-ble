@@ -17,8 +17,11 @@ The easiest way to flash the XIAO — no debug probe needed. The XIAO ships with
 ### Build and Flash from Source
 
 ```bash
-# Build
+# Build (production — no RTT logging)
 cargo build --release --no-default-features --features board-xiao
+
+# Build (development — with RTT debug logging)
+cargo build --release --no-default-features --features board-xiao,rtt
 
 # Convert ELF → HEX → UF2
 rust-objcopy -O ihex \
@@ -74,20 +77,27 @@ nrfjprog --program s140_nrf52_7.3.0_softdevice.hex --verify
 
 **XIAO** — must use `--release` (debug builds break Maple Bus timing):
 ```bash
+# Development (with RTT logging)
+cargo embed --release --no-default-features --features board-xiao,rtt
+
+# Production (no RTT — smaller binary, slightly lower power)
 cargo embed --release --no-default-features --features board-xiao
 ```
 
-**DK** (default target):
+**DK** (default target, always includes RTT):
 ```bash
 cargo embed --release
 ```
 
 ### Build Only (no flash)
 ```bash
-# DK
+# DK (includes RTT by default)
 cargo build --release
 
-# XIAO
+# XIAO development (with RTT)
+cargo build --release --no-default-features --features board-xiao,rtt
+
+# XIAO production (no RTT)
 cargo build --release --no-default-features --features board-xiao
 ```
 
@@ -96,12 +106,21 @@ cargo build --release --no-default-features --features board-xiao
 ## Debugging
 
 ### RTT (Real-Time Transfer)
-`cargo embed` opens RTT automatically after flashing.
 
-To attach to an already-running device:
+RTT logging is gated behind the `rtt` feature flag. The DK board always includes it. For XIAO, add `rtt` to the features list:
+
+```bash
+cargo embed --release --no-default-features --features board-xiao,rtt
+```
+
+`cargo embed` opens RTT automatically after flashing. To attach to an already-running device:
 ```bash
 probe-rs attach --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble
 ```
+
+### Panic Logging
+
+On panic, the firmware writes the panic message to flash (`0xFC000`) and resets. On the next boot (with RTT enabled), the stored panic is printed and cleared. This helps diagnose crashes without needing to reproduce them with a debugger attached.
 
 ### GDB
 ```bash

@@ -17,13 +17,8 @@ maple-protocol = { path = "maple-protocol" }
 # Core
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
-embedded-hal = "1.0.0"
-embedded-hal-02 = { package = "embedded-hal", version = "0.2.7" }
-panic-reset = "0.1.1"
-nb = "1.1.0"
 heapless = "0.8.0"
 static_cell = "2.1"
-futures = { version = "0.3", default-features = false }
 
 # Embassy async runtime (git versions for nrf-softdevice compatibility)
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = ["arch-cortex-m", "executor-thread", "embassy-time-driver"] }
@@ -39,8 +34,8 @@ nrf-softdevice-s140 = { git = "https://github.com/embassy-rs/nrf-softdevice" }
 # Flash storage
 embedded-storage-async = "0.4.1"
 
-# RTT debugging
-rtt-target = { version = "0.3.1", features = ["cortex-m"] }
+# RTT debugging (optional — disable for production builds to save power/size)
+rtt-target = { version = "0.3.1", features = ["cortex-m"], optional = true }
 
 # Note: We use embassy-nrf's peripheral access for everything
 # No legacy HAL to avoid duplicate interrupt vector table
@@ -52,6 +47,7 @@ codegen-units = 1     # Single codegen unit for maximum optimization
 debug = 2             # Keep debug info for probe-rs
 
 [features]
-default = ["board-dk"]
-board-dk = []
+default = ["board-dk", "rtt"]
+rtt = ["dep:rtt-target"]
+board-dk = ["rtt"]
 board-xiao = []

@@ -775,15 +775,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
-name = "panic-reset"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cf1ff2a5b1a478dd94572aa43476b6630e72071cbd016985003ad3903a3a4f5"
-dependencies = [
- "cortex-m",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -821,16 +812,11 @@ dependencies = [
  "embassy-nrf",
  "embassy-sync 0.7.2",
  "embassy-time",
- "embedded-hal 0.2.7",
- "embedded-hal 1.0.0",
  "embedded-storage-async",
- "futures",
  "heapless 0.8.0",
  "maple-protocol",
- "nb 1.1.0",
  "nrf-softdevice",
  "nrf-softdevice-s140",
- "panic-reset",
  "rtt-target",
  "static_cell",
 ]

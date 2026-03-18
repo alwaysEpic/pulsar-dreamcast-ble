@@ -189,6 +189,7 @@ pub fn is_usb_connected() -> bool {
 pub struct BatteryReader<'d> {
     saadc: Saadc<'d, 1>,
     enable: Output<'d>,
+    last_percent: u8,
 }
 
 impl<'d> BatteryReader<'d> {
@@ -209,19 +210,28 @@ impl<'d> BatteryReader<'d> {
         // Start with divider disabled (HIGH) to avoid current leak
         let enable = Output::new(enable_pin, Level::High, OutputDrive::Standard);
         let channel = saadc::ChannelConfig::single_ended(adc_pin);
-        let saadc = Saadc::new(saadc_peri, irq, saadc::Config::default(), [channel]);
-        Self { saadc, enable }
+        let mut config = saadc::Config::default();
+        config.oversample = saadc::Oversample::OVER8X;
+        let saadc = Saadc::new(saadc_peri, irq, config, [channel]);
+        Self {
+            saadc,
+            enable,
+            last_percent: 100,
+        }
     }
 
     /// Read battery voltage and return `(millivolts, percentage)`.
     ///
     /// Enables the voltage divider (P0.14 LOW), takes a sample, disables (P0.14 HIGH).
+    /// Uses 8x hardware oversampling for stable readings.
     ///
     /// 12-bit SAADC with 0.6V internal ref, 1/6 gain gives 0-3.6V range.
     /// Divider: 1M + 510K → V_adc = V_bat * 510 / 1510.
-    /// Battery range: 3.0V (empty) to 4.2V (full).
+    ///
+    /// When `charging` is false, percentage never increases (monotonic decrease)
+    /// to avoid confusing voltage-recovery bounces. Resets when charging.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    pub async fn read(&mut self) -> (u32, u8) {
+    pub async fn read(&mut self, charging: bool) -> (u32, u8) {
         self.enable.set_low(); // Enable divider
         Timer::after(Duration::from_micros(100)).await;
 
@@ -237,9 +247,17 @@ impl<'d> BatteryReader<'d> {
         // Combined: v_bat_mv = raw * 3600 * 1510 / (4095 * 510) ≈ raw * 10663 / 4095
         let v_bat_mv = (u64::from(raw) * 10_663 / 4095) as u32;
 
-        let percent = lipo_voltage_to_percent(v_bat_mv);
+        let mut percent = lipo_voltage_to_percent(v_bat_mv);
 
-        rtt_target::rprintln!("BAT: {}mV {}%", v_bat_mv, percent);
+        if charging {
+            self.last_percent = percent;
+        } else {
+            // Never report higher than previous reading when discharging
+            percent = percent.min(self.last_percent);
+            self.last_percent = percent;
+        }
+
+        crate::log!("BAT: {}mV {}%", v_bat_mv, percent);
 
         (v_bat_mv, percent)
     }
@@ -249,11 +267,14 @@ impl<'d> BatteryReader<'d> {
 ///
 /// Based on a typical single-cell LiPo discharge profile. The curve is
 /// relatively flat from 3.7-3.9V and drops steeply below 3.5V.
+/// Cutoff at 3300mV — the battery protection circuit shuts down around
+/// this voltage (measured: device dies at ~3.3V under load).
 /// Table entries: (millivolts, percentage).
 #[allow(clippy::cast_possible_truncation)]
 fn lipo_voltage_to_percent(mv: u32) -> u8 {
-    // Voltage-to-percent lookup based on typical LiPo discharge curve
-    const TABLE: [(u32, u8); 11] = [
+    // Voltage-to-percent lookup based on typical LiPo discharge curve.
+    // 0% = 3300mV (protection circuit cutoff, measured empirically).
+    const TABLE: [(u32, u8); 10] = [
         (4200, 100),
         (4100, 90),
         (4000, 80),
@@ -261,10 +282,9 @@ fn lipo_voltage_to_percent(mv: u32) -> u8 {
         (3800, 40),
         (3700, 30),
         (3600, 20),
-        (3500, 15),
-        (3400, 10),
-        (3300, 5),
-        (3000, 0),
+        (3500, 10),
+        (3400, 5),
+        (3300, 0),
     ];
 
     if mv >= TABLE[0].0 {
@@ -331,7 +351,7 @@ pub unsafe fn disconnect_all_pins() {
 /// # Safety
 /// Writes directly to GPIO peripheral registers.
 pub unsafe fn qspi_flash_deep_power_down() {
-    use rtt_target::rprintln;
+    use crate::log;
 
     const P0_OUTSET: *mut u32 = 0x5000_0508 as *mut u32;
     const P0_OUTCLR: *mut u32 = 0x5000_050C as *mut u32;
@@ -387,7 +407,7 @@ pub unsafe fn qspi_flash_deep_power_down() {
         core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin as usize), DISCONNECT);
     }
 
-    rprintln!("QSPI: Flash in Deep Power Down");
+    log!("QSPI: Flash in Deep Power Down");
 }
 
 /// Enter System Off mode (deep sleep, ~5µA draw).
@@ -402,14 +422,14 @@ pub unsafe fn qspi_flash_deep_power_down() {
 /// # Safety
 /// This function does not return. The `SoftDevice` must be initialized.
 pub unsafe fn enter_system_off() -> ! {
-    use rtt_target::rprintln;
+    use crate::log;
 
     // Turn off all LEDs (active low: HIGH = off)
     // P0 OUTSET register: set P0.26 (R), P0.30 (G), P0.06 (B)
     const P0_OUTSET: *mut u32 = 0x5000_0508 as *mut u32;
     core::ptr::write_volatile(P0_OUTSET, (1 << 26) | (1 << 30) | (1 << 6));
 
-    rprintln!("SLEEP: Entering System Off");
+    log!("SLEEP: Entering System Off");
     disable_boost();
 
     // Disconnect ALL GPIO pins to minimize current draw in System Off.

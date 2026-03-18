@@ -30,7 +30,11 @@ echo "=== Clippy (maple-protocol) ==="
 (cd maple-protocol && cargo clippy -- -W clippy::all -W clippy::pedantic) && pass "clippy (maple-protocol)" || fail "clippy (maple-protocol)"
 
 echo ""
-echo "=== Build: XIAO release ==="
+echo "=== Build: XIAO release (with RTT) ==="
+cargo build --release --no-default-features --features board-xiao,rtt && pass "build (xiao+rtt)" || fail "build (xiao+rtt)"
+
+echo ""
+echo "=== Build: XIAO release (production, no RTT) ==="
 cargo build --release --no-default-features --features board-xiao && pass "build (xiao)" || fail "build (xiao)"
 
 echo ""

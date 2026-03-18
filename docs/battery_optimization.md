@@ -1,6 +1,6 @@
 # Battery & Power Optimization
 
-Power management strategy for the XIAO nRF52840 Dreamcast BLE adapter running on a 1000mAh LiPo.
+Power management strategy for the XIAO nRF52840 Dreamcast BLE adapter running on a single-cell LiPo (tested with 500mAh, recommended 1000mAh).
 
 ---
 
@@ -30,6 +30,36 @@ Testing in progress — preliminary results suggest ~7-8 hours on 500mAh. Batter
 | 1000 mAh | ~14-16 hours (estimated) | Months |
 
 Note: The LiPo discharge curve is nonlinear. The battery spends a long time in the 3.7-3.9V plateau then drops quickly below 3.5V. Actual runtime may vary with controller usage intensity.
+
+---
+
+## Battery Percentage Estimation
+
+Voltage-based percentage using a 10-point LiPo discharge curve lookup table with linear interpolation between entries. This is the industry standard approach for embedded devices — Xbox controllers only report 4 discrete levels, and projects like Meshtastic use similar tables.
+
+### Lookup Table
+
+| Voltage | Percentage |
+|---------|-----------|
+| 4200 mV | 100% |
+| 4100 mV | 90% |
+| 4000 mV | 80% |
+| 3900 mV | 60% |
+| 3800 mV | 40% |
+| 3700 mV | 30% |
+| 3600 mV | 20% |
+| 3500 mV | 10% |
+| 3400 mV | 5% |
+| 3300 mV | 0% |
+
+- **0% = 3300mV** — the battery protection circuit shuts down at this voltage under load (measured empirically: device dies at ~3.3V)
+- **8x SAADC oversampling** — hardware-averaged ADC reads for noise reduction
+- **Monotonic decrease** — reported percentage never increases unless USB charging is detected, eliminating confusing voltage-recovery bounces after sleep or load changes
+- **60-second read interval** — uses `Instant` comparison for drift-free timing
+
+### Accuracy
+
+Realistic accuracy is +/-10-15% in the flat middle region (3.7-3.9V), better at extremes. This is consistent with other voltage-based approaches and adequate for a battery indicator. A fuel gauge IC (e.g., MAX17048 ~$1.50) would improve to +/-5% but only makes sense on a custom PCB.
 
 ---
 
@@ -108,7 +138,19 @@ Our draw is dominated by the 5V boost converter + Dreamcast controller (~45 mA).
 
 ---
 
+### 10. RTT Feature Gate (saves flash size + minor power)
+
+RTT debug logging is gated behind an `rtt` Cargo feature. DK builds always include it. XIAO production builds omit it — all `log!()` calls compile to nothing, reducing binary size and eliminating string formatting overhead. Development builds opt in with `--features board-xiao,rtt`.
+
+### 11. Flash-Based Panic Logging
+
+On panic, the firmware writes the panic message to a dedicated flash page (`0xFC000`) using raw NVMC register writes (no SoftDevice dependency), then resets. On the next boot with RTT enabled, the stored panic is printed and the page is cleared. This replaces the silent `panic-reset` behavior with something debuggable.
+
+---
+
 ## Possible Next Steps
 
-- **Slave latency** — Setting BLE slave_latency to 2-4 could save ~200-300 µA during idle connected periods. Deferred due to compatibility risk with iBlueControlMod.
+- **Slave latency** — Setting BLE slave_latency to 2-4 could save ~200-300 µA during idle connected periods. Deferred due to compatibility risk with iBlueControlMod. Only effective if combined with skipping notifications when state is unchanged, which may break Xbox HID compatibility.
 - **Dedicated PCB** — Eliminates perfboard losses and enables SMD components: TPS61099x50 boost converter (~90% efficiency, 5µA quiescent vs 50µA on current Pololu), BAT54 Schottky diodes (~0.23V drop vs 0.3-0.4V), and integrated charging circuit.
+- **Fuel gauge IC** — MAX17048 (~$1.50, I2C) for +/-5% battery accuracy vs current +/-10-15%. Only practical on a custom PCB.
+- **TX power reduction** — Lowering BLE TX from 0dBm to -4dBm would save ~1mA with no perceptible range impact at gamepad distances. Deferred pending range testing through plastic enclosure.
