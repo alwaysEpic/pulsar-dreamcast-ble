@@ -269,14 +269,17 @@ impl<'d> BatteryReader<'d> {
 /// relatively flat from 3.7-3.9V and drops steeply below 3.5V.
 /// Cutoff at 3300mV — the battery protection circuit shuts down around
 /// this voltage (measured: device dies at ~3.3V under load).
+/// Top clamped at 4100mV — charger often terminates before reaching
+/// 4200mV, so anything above 4.1V reports as 100% to match user
+/// expectations (same approach as phones/laptops).
 /// Table entries: (millivolts, percentage).
 #[allow(clippy::cast_possible_truncation)]
 fn lipo_voltage_to_percent(mv: u32) -> u8 {
     // Voltage-to-percent lookup based on typical LiPo discharge curve.
+    // 100% = 4100mV (charger terminates near here, report "full" early).
     // 0% = 3300mV (protection circuit cutoff, measured empirically).
-    const TABLE: [(u32, u8); 10] = [
-        (4200, 100),
-        (4100, 90),
+    const TABLE: [(u32, u8); 9] = [
+        (4100, 100),
         (4000, 80),
         (3900, 60),
         (3800, 40),

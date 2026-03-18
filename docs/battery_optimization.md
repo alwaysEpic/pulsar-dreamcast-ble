@@ -41,8 +41,7 @@ Voltage-based percentage using a 10-point LiPo discharge curve lookup table with
 
 | Voltage | Percentage |
 |---------|-----------|
-| 4200 mV | 100% |
-| 4100 mV | 90% |
+| 4100 mV | 100% |
 | 4000 mV | 80% |
 | 3900 mV | 60% |
 | 3800 mV | 40% |
@@ -52,6 +51,7 @@ Voltage-based percentage using a 10-point LiPo discharge curve lookup table with
 | 3400 mV | 5% |
 | 3300 mV | 0% |
 
+- **100% = 4100mV** — the BQ25101 charger often terminates before reaching 4200mV. Reporting 100% at 4.1V matches user expectations (same approach as phones/laptops)
 - **0% = 3300mV** — the battery protection circuit shuts down at this voltage under load (measured empirically: device dies at ~3.3V)
 - **8x SAADC oversampling** — hardware-averaged ADC reads for noise reduction
 - **Monotonic decrease** — reported percentage never increases unless USB charging is detected, eliminating confusing voltage-recovery bounces after sleep or load changes
