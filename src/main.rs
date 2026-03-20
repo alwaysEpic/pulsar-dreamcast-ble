@@ -318,10 +318,9 @@ async fn main(spawner: Spawner) {
             continue;
         }
 
-        // --- VMU: best-effort write (fire and forget) ---
-        let mut vmu_written = false;
-
         // --- Phase 3: Poll loop (active gaming) ---
+        let mut vmu_delay: u16 = 180; // ~3s delay before VMU attempt
+        let mut vmu_lcd_bars: Option<u8> = None;
         let mut last_state: Option<ControllerState> = None;
         let mut fail_count: u16 = 0;
         #[cfg(feature = "board-xiao")]
@@ -362,14 +361,21 @@ async fn main(spawner: Spawner) {
                     }
                 }
 
-                // VMU: try once after first successful controller poll
-                if !vmu_written {
+                // VMU: best-effort write after BLE stabilization delay.
+                // Try once — if it works, track bars for battery updates.
+                if vmu_delay > 0 {
+                    vmu_delay -= 1;
+                } else if vmu_lcd_bars.is_none() {
                     let _ = host.enumerate_vmu(&mut bus);
-                    let mut frame = pulsar_dreamcast_ble::vmu::PULSAR_LOGO;
-                    pulsar_dreamcast_ble::vmu::composite_battery(&mut frame, 100, true);
-                    pulsar_dreamcast_ble::vmu::rotate_180(&mut frame);
-                    let _ = host.write_vmu_lcd(&mut bus, &frame);
-                    vmu_written = true;
+                    let frame = pulsar_dreamcast_ble::vmu::build_frame(100);
+                    if host.write_vmu_lcd(&mut bus, &frame) {
+                        vmu_lcd_bars = Some(pulsar_dreamcast_ble::vmu::bars_for_percent(100));
+                        log!("VMU: LCD write succeeded");
+                    } else {
+                        // Failed — set to a sentinel so we don't retry
+                        vmu_lcd_bars = Some(u8::MAX);
+                        log!("VMU: LCD write failed, skipping");
+                    }
                 }
             } else {
                 fail_count = fail_count.saturating_add(1);

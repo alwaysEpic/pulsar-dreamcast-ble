@@ -259,3 +259,15 @@ pub fn composite_battery(frame: &mut [u8; LCD_BYTES], percent: u8, visible: bool
         }
     }
 }
+
+/// Build a complete VMU framebuffer ready to send.
+///
+/// Composites the pulsar logo with battery overlay and rotates 180°
+/// for the VMU's upside-down mount in the controller.
+#[must_use]
+pub fn build_frame(battery_percent: u8) -> [u8; LCD_BYTES] {
+    let mut frame = PULSAR_LOGO;
+    composite_battery(&mut frame, battery_percent, true);
+    rotate_180(&mut frame);
+    frame
+}

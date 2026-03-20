@@ -330,47 +330,6 @@ impl MapleBus {
         self.send_end_pattern();
     }
 
-    /// Write a VMU LCD frame directly to the bus without buffering the full payload.
-    ///
-    /// Constructs and streams a `BLOCK_WRITE` (0x0C) packet with `FUNC_LCD` (0x04)
-    /// addressed to `dest`, followed by 192 bytes of pixel data from `framebuffer`.
-    /// This avoids needing a 49-word `MaplePacket` payload.
-    pub fn write_lcd(&mut self, sender: u8, dest: u8, framebuffer: &[u8; 192]) {
-        self.set_output_mode();
-        self.set_idle();
-        delay_half_bit();
-        let mut phase = true;
-        self.send_start_pattern();
-
-        let mut crc: u8 = 0;
-
-        // Frame word: 50 payload words, sender, dest, command=0x0C
-        let frame: u32 = (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | 50;
-        self.write_word(frame, &mut phase);
-        Self::update_crc(frame, &mut crc);
-
-        // Function type word: FUNC_LCD = 0x0000_0004 (little-endian)
-        let func: u32 = 0x0000_0004;
-        self.write_word(func, &mut phase);
-        Self::update_crc(func, &mut crc);
-
-        // Location word: partition=0, phase=0, block=0 for LCD writes
-        let loc: u32 = 0x0000_0000;
-        self.write_word(loc, &mut phase);
-        Self::update_crc(loc, &mut crc);
-
-        // Stream 192 bytes of LCD data as 48 words (4 bytes each).
-        // Bytes reversed within each word — VMU interprets words as big-endian.
-        for chunk in framebuffer.chunks_exact(4) {
-            let word = u32::from_le_bytes([chunk[3], chunk[2], chunk[1], chunk[0]]);
-            self.write_word(word, &mut phase);
-            Self::update_crc(word, &mut crc);
-        }
-
-        self.write_byte(crc, &mut phase);
-        self.send_end_pattern();
-    }
-
     /// Update CRC with a word (bytewise XOR).
     fn update_crc(word: u32, crc: &mut u8) {
         for &b in &word.to_le_bytes() {
