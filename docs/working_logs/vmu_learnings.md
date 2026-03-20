@@ -55,11 +55,11 @@
 
 ## What Doesn't Work Yet
 
-### BLE Coexistence
-- **The timeslot TX disrupts BLE connections.** Even with NORMAL priority and opening/closing the session around each write, the BLE connection drops temporarily after a VMU write.
-- Keeping a radio session open permanently causes periodic BLE disconnects (~10s cycle).
-- Opening/closing the session per-write still causes a momentary disconnect.
-- **This is the primary blocker.** The timeslot approach works for the Maple Bus TX but needs further investigation for BLE stability.
+### BLE Coexistence — RESOLVED
+- **The timeslot API was the problem, not the long TX.** Direct bit-bang TX (~1.6ms) works fine alongside BLE — the SoftDevice interrupts either don't fire during that window or the VMU tolerates minor timing glitches.
+- The Radio Timeslot API disrupted BLE regardless of priority (HIGH/NORMAL) or session lifecycle (persistent/per-write open-close). Even a single timeslot use left BLE in a fragile state where controller inputs caused crashes.
+- **Solution:** Use the same direct bit-bang approach as controller polling. No timeslot needed. The timeslot version is preserved as `write_vmu_lcd_timeslot()` for reference.
+- VMU reseat causes a brief BLE connection blip (controller resets Maple Bus), but it recovers automatically.
 
 ### VMU Presence Detection
 - **Sender bit checking (`pkt.sender & 0x01`)** on GET_CONDITION responses should work per the protocol spec (confirmed by KallistiOS, dreamwave, MaplePad sources), but was unreliable in our testing.
@@ -114,10 +114,11 @@
 
 ## Next Steps
 
-1. **RTT diagnostic session** — Log `pkt.sender` values to determine if sender bit detection actually works.
-2. **BLE + timeslot coexistence** — Investigate why the timeslot disrupts BLE. May need to coordinate with BLE connection intervals or use a different approach entirely.
-3. **Alternative TX approach** — Consider whether the existing CPU bit-bang (without timeslot) works for VMU writes if timed to avoid SoftDevice radio events.
-4. **Dongle architecture** — Long-term: Dreamcast-side dongle intercepts VMU LCD writes over Maple Bus, forwards via BLE to Pulsar adapter.
+1. **Make VMU writes more consistent** — Currently works on first boot but not after VMU reseat. Need reliable detection/re-enumeration without disrupting controller polling.
+2. **RTT diagnostic session** — Log `pkt.sender` values to determine if sender bit detection actually works.
+3. **Battery percent integration** — Wire actual battery level into `build_frame()` instead of hardcoded 100%.
+4. **Hot-plug support** — Detect VMU insertion/removal during gameplay.
+5. **Dongle architecture** — Long-term: Dreamcast-side dongle intercepts VMU LCD writes over Maple Bus, forwards via BLE to Pulsar adapter.
 
 ---
 
