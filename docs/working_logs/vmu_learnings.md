@@ -72,6 +72,19 @@
 - Sending DEVICE_INFO repeatedly to a connected VMU causes it to power-cycle (beep every few minutes).
 - **Enumeration should be done exactly once**, not repeatedly.
 
+### Controller Recovery After VMU Write
+- VMU bus traffic (enumerate + LCD write) causes the controller to stop responding to GET_CONDITION for an extended period.
+- **The OEM controller needs ~50ms to recover from a VMU reseat**, but our recovery takes ~10s due to the exponential backoff in the re-detection loop (100→200→400→800→1000ms).
+- **The backoff is necessary** — fixed 100ms retry (no backoff) prevents the controller from recovering entirely. The controller needs breathing room between DEVICE_INFO requests.
+- Sending DEVICE_INFO to the controller (0x20) immediately after VMU write made things worse (sluggish, bad reconnect).
+- **Theory:** VMU bus traffic confuses the controller's Maple Bus state. It stops responding to GET_CONDITION until it receives a well-timed DEVICE_INFO. The backoff accidentally provides this by spacing out requests.
+- **Needs RTT investigation** to see fail_count, pkt.sender, and bus state during VMU reseat.
+
+### Battery Updates — WORKING
+- Battery percent is wired to VMU LCD writes via `vmu_battery_percent`.
+- Bar count change (75% threshold crossed) triggers a re-write automatically.
+- Confirmed working: display updated from 4 bars to 3 bars during testing.
+
 ---
 
 ## Key Findings
@@ -114,11 +127,10 @@
 
 ## Next Steps
 
-1. **Make VMU writes more consistent** — Currently works on first boot but not after VMU reseat. Need reliable detection/re-enumeration without disrupting controller polling.
-2. **RTT diagnostic session** — Log `pkt.sender` values to determine if sender bit detection actually works.
-3. **Battery percent integration** — Wire actual battery level into `build_frame()` instead of hardcoded 100%.
-4. **Hot-plug support** — Detect VMU insertion/removal during gameplay.
-5. **Dongle architecture** — Long-term: Dreamcast-side dongle intercepts VMU LCD writes over Maple Bus, forwards via BLE to Pulsar adapter.
+1. **RTT diagnostic session (DK board)** — Use the DK's built-in J-Link to log `pkt.sender` values, fail_count during VMU reseat, and bus state during recovery. This will answer whether sender bit detection works and why recovery takes ~10s.
+2. **Controller recovery hardening** — Once we understand the bus state via RTT, optimize the re-detection loop for VMU-caused glitches without breaking real disconnect recovery.
+3. **Hot-plug support** — Detect VMU insertion/removal during gameplay and re-write the screen.
+4. **Dongle architecture** — Long-term: Dreamcast-side dongle intercepts VMU LCD writes over Maple Bus, forwards via BLE to Pulsar adapter.
 
 ---
 
