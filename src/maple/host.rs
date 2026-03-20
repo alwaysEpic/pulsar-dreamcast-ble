@@ -170,6 +170,59 @@ impl MapleHost {
 
         MapleResult::Timeout
     }
+
+    /// Send a `DEVICE_INFO` request to the VMU sub-peripheral to enumerate it.
+    ///
+    /// The VMU will not accept `BLOCK_WRITE` until it has been enumerated.
+    pub fn enumerate_vmu(&self, bus: &mut MapleBus) -> bool {
+        let packet = MaplePacket {
+            sender: addressing::HOST,
+            recipient: 0x01, // SUB_PERIPHERAL_1
+            command: commands::DEVICE_INFO_REQUEST,
+            payload: Vec::new(),
+        };
+
+        bus.write_packet(&packet);
+
+        let response = bus.read_packet_bulk(self.timeout_cycles);
+        matches!(response, Some(pkt) if pkt.command == commands::DEVICE_INFO_RESPONSE)
+    }
+
+    /// Write a framebuffer to the VMU LCD in slot 1.
+    ///
+    /// Uses the SoftDevice Radio Timeslot API for interrupt-free TX,
+    /// then reads the ACK via bulk sampling.
+    pub fn write_vmu_lcd(&self, bus: &mut MapleBus, framebuffer: &[u8; 192]) -> bool {
+        use super::timeslot_tx;
+
+        if !timeslot_tx::open_session() {
+            return false;
+        }
+
+        if !timeslot_tx::request_lcd_tx(0x00, 0x01, framebuffer) {
+            timeslot_tx::close_session();
+            return false;
+        }
+
+        let mut timeout = 0u32;
+        while !timeslot_tx::is_tx_complete() && !timeslot_tx::is_tx_failed() {
+            cortex_m::asm::nop();
+            timeout += 1;
+            if timeout > 1_000_000 {
+                timeslot_tx::close_session();
+                return false;
+            }
+        }
+
+        timeslot_tx::close_session();
+
+        if timeslot_tx::is_tx_failed() {
+            return false;
+        }
+
+        let response = bus.read_packet_bulk(self.timeout_cycles);
+        matches!(response, Some(pkt) if pkt.command == 0x07)
+    }
 }
 
 impl Default for MapleHost {

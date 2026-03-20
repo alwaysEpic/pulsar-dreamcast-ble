@@ -318,6 +318,9 @@ async fn main(spawner: Spawner) {
             continue;
         }
 
+        // --- VMU: best-effort write (fire and forget) ---
+        let mut vmu_written = false;
+
         // --- Phase 3: Poll loop (active gaming) ---
         let mut last_state: Option<ControllerState> = None;
         let mut fail_count: u16 = 0;
@@ -357,6 +360,16 @@ async fn main(spawner: Spawner) {
                     {
                         last_activity = Instant::now();
                     }
+                }
+
+                // VMU: try once after first successful controller poll
+                if !vmu_written {
+                    let _ = host.enumerate_vmu(&mut bus);
+                    let mut frame = pulsar_dreamcast_ble::vmu::PULSAR_LOGO;
+                    pulsar_dreamcast_ble::vmu::composite_battery(&mut frame, 100, true);
+                    pulsar_dreamcast_ble::vmu::rotate_180(&mut frame);
+                    let _ = host.write_vmu_lcd(&mut bus, &frame);
+                    vmu_written = true;
                 }
             } else {
                 fail_count = fail_count.saturating_add(1);

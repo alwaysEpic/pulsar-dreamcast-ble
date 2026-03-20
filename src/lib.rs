@@ -47,6 +47,7 @@ pub mod board;
 pub mod button;
 pub mod maple;
 pub mod panic_handler;
+pub mod vmu;
 
 /// BLE HID notification interval (~125Hz, matches Xbox One S).
 pub const NOTIFY_INTERVAL_MS: u64 = 8;
