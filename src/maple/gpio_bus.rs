@@ -330,6 +330,39 @@ impl MapleBus {
         self.send_end_pattern();
     }
 
+    /// Write a VMU LCD frame via direct bit-bang (no timeslot).
+    pub fn write_lcd(&mut self, sender: u8, dest: u8, framebuffer: &[u8; 192]) {
+        self.set_output_mode();
+        self.set_idle();
+        delay_half_bit();
+        let mut phase = true;
+        self.send_start_pattern();
+
+        let mut crc: u8 = 0;
+
+        let frame: u32 =
+            (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | 50;
+        self.write_word(frame, &mut phase);
+        Self::update_crc(frame, &mut crc);
+
+        let func: u32 = 0x0000_0004;
+        self.write_word(func, &mut phase);
+        Self::update_crc(func, &mut crc);
+
+        let loc: u32 = 0x0000_0000;
+        self.write_word(loc, &mut phase);
+        Self::update_crc(loc, &mut crc);
+
+        for chunk in framebuffer.chunks_exact(4) {
+            let word = u32::from_le_bytes([chunk[3], chunk[2], chunk[1], chunk[0]]);
+            self.write_word(word, &mut phase);
+            Self::update_crc(word, &mut crc);
+        }
+
+        self.write_byte(crc, &mut phase);
+        self.send_end_pattern();
+    }
+
     /// Update CRC with a word (bytewise XOR).
     fn update_crc(word: u32, crc: &mut u8) {
         for &b in &word.to_le_bytes() {

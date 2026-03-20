@@ -190,9 +190,26 @@ impl MapleHost {
 
     /// Write a framebuffer to the VMU LCD in slot 1.
     ///
-    /// Uses the SoftDevice Radio Timeslot API for interrupt-free TX,
-    /// then reads the ACK via bulk sampling.
+    /// Uses direct bit-bang TX (same as controller polling).
+    /// May be corrupted by SoftDevice interrupts during the ~1.6ms TX,
+    /// but avoids the BLE disruption caused by the timeslot API.
     pub fn write_vmu_lcd(&self, bus: &mut MapleBus, framebuffer: &[u8; 192]) -> bool {
+        bus.write_lcd(
+            addressing::HOST,
+            0x01, // SUB_PERIPHERAL_1
+            framebuffer,
+        );
+
+        let response = bus.read_packet_bulk(self.timeout_cycles);
+        matches!(response, Some(pkt) if pkt.command == 0x07)
+    }
+
+    /// Write a framebuffer to the VMU LCD using the SoftDevice Radio Timeslot API.
+    ///
+    /// Guarantees interrupt-free TX but disrupts BLE connections.
+    /// Kept for reference — use [`write_vmu_lcd`] for now.
+    #[allow(dead_code)]
+    pub fn write_vmu_lcd_timeslot(&self, bus: &mut MapleBus, framebuffer: &[u8; 192]) -> bool {
         use super::timeslot_tx;
 
         if !timeslot_tx::open_session() {
