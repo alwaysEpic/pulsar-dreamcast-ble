@@ -321,6 +321,8 @@ async fn main(spawner: Spawner) {
         // --- Phase 3: Poll loop (active gaming) ---
         let mut vmu_delay: u16 = 180; // ~3s delay before VMU attempt
         let mut vmu_lcd_bars: Option<u8> = None;
+        #[cfg_attr(not(feature = "board-xiao"), allow(unused_mut))]
+        let mut vmu_battery_percent: u8 = 100;
         let mut last_state: Option<ControllerState> = None;
         let mut fail_count: u16 = 0;
         #[cfg(feature = "board-xiao")]
@@ -361,21 +363,25 @@ async fn main(spawner: Spawner) {
                     }
                 }
 
-                // VMU: best-effort write after BLE stabilization delay.
-                // Try once — if it works, track bars for battery updates.
+                // VMU: write after BLE stabilization delay.
+                // Cooldown after each write prevents re-triggering from
+                // the brief controller-lost blip that writes can cause.
                 if vmu_delay > 0 {
                     vmu_delay -= 1;
-                } else if vmu_lcd_bars.is_none() {
+                } else if vmu_lcd_bars
+                    != Some(pulsar_dreamcast_ble::vmu::bars_for_percent(vmu_battery_percent))
+                {
                     let _ = host.enumerate_vmu(&mut bus);
-                    let frame = pulsar_dreamcast_ble::vmu::build_frame(100);
+                    let frame =
+                        pulsar_dreamcast_ble::vmu::build_frame(vmu_battery_percent);
                     if host.write_vmu_lcd(&mut bus, &frame) {
-                        vmu_lcd_bars = Some(pulsar_dreamcast_ble::vmu::bars_for_percent(100));
-                        log!("VMU: LCD write succeeded");
-                    } else {
-                        // Failed — set to a sentinel so we don't retry
-                        vmu_lcd_bars = Some(u8::MAX);
-                        log!("VMU: LCD write failed, skipping");
+                        vmu_lcd_bars = Some(
+                            pulsar_dreamcast_ble::vmu::bars_for_percent(vmu_battery_percent),
+                        );
+                        log!("VMU: LCD updated (bars={:?})", vmu_lcd_bars);
                     }
+                    // Cooldown regardless of success — avoid rapid retries
+                    vmu_delay = 180;
                 }
             } else {
                 fail_count = fail_count.saturating_add(1);
@@ -466,6 +472,7 @@ async fn main(spawner: Spawner) {
                 if last_battery_read.elapsed() >= BATTERY_READ_INTERVAL {
                     let (mv, percent) = battery_reader.read(charging).await;
                     BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
+                    vmu_battery_percent = if charging { 100 } else { percent };
                     last_battery_read = Instant::now();
 
                     if !charging && mv < LOW_BATTERY_CUTOFF_MV {
