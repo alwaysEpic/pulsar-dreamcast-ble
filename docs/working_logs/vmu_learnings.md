@@ -108,6 +108,14 @@
 - VMU ACK response: 0 payload words (just frame word + CRC = 5 bytes).
 - OEM controller uses hardware pin (ID2) for VMU detection — should be reliable.
 
+### Bus Hold / Pin-Hold Trick (from DreamPicoPort)
+- **OEM hardware holds bus pins low between data bursts** for large packets (e.g. controller device info). This is within spec — the Dreamcast tolerates extended packets.
+- **WinCE games fire commands within microseconds of receiving a reply** — leaves very little prep time for the device side.
+- **DreamPicoPort solution:** Hold SDCKB low after the end-of-packet pattern, only release it when ready to receive the next command. The Dreamcast waits for the bus to go idle before sending.
+- **Potential application to VMU writes (host side):** After sending a VMU LCD write, the controller forwards it down the LM Bus to the VMU. The controller may hold the Maple Bus pins during this forwarding. If we send GET_CONDITION before the controller releases the bus, it could fail. Adding a "wait for bus idle" (both pins HIGH) after the VMU write ACK read may prevent the controller-lost blip we see after VMU writes.
+- **Not yet tested** — noted for the RTT diagnostic session.
+- Source: DreamPicoPort (Tails), https://github.com/OrangeFox86/DreamPicoPort
+
 ---
 
 ## Files Created/Modified
