@@ -340,8 +340,7 @@ impl MapleBus {
 
         let mut crc: u8 = 0;
 
-        let frame: u32 =
-            (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | 50;
+        let frame: u32 = (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | 50;
         self.write_word(frame, &mut phase);
         Self::update_crc(frame, &mut crc);
 

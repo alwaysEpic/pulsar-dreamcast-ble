@@ -101,6 +101,13 @@ async fn main(spawner: Spawner) {
     ble::softdevice::set_name_mode(is_dreamcast);
     let sd = ble::softdevice::init_softdevice(is_dreamcast);
 
+    // Enable radio notifications for VMU write scheduling
+    if pulsar_dreamcast_ble::maple::radio_notify::init() {
+        log!("RADIO: Notifications enabled");
+    } else {
+        log!("RADIO: Notification setup failed");
+    }
+
     // Create HID Gamepad GATT server
     let Ok(server) = ble::GamepadServer::new(sd) else {
         loop {
@@ -320,7 +327,14 @@ async fn main(spawner: Spawner) {
 
         // --- Phase 3: Poll loop (active gaming) ---
         let mut vmu_delay: u16 = 180; // ~3s delay before VMU attempt
-        let mut vmu_lcd_bars: Option<u8> = None;
+        let mut vmu_enumerated = false;
+        let mut vmu_frame_dirty = true;
+        let mut vmu_framebuf = [0u8; pulsar_dreamcast_ble::vmu::LCD_BYTES];
+        let mut vmu_anim_step: u8 = 0;
+        let mut vmu_anim_counter: u16 = 0;
+        let mut vmu_idle_wait: u16 = 0;
+        const VMU_ANIM_INTERVAL: u16 = 10; // Advance animation every 10 polls (~160ms, ~6fps)
+        const VMU_IDLE_FALLBACK: u16 = 30; // Write anyway after 30 polls (~480ms) without radio idle
         #[cfg_attr(not(feature = "board-xiao"), allow(unused_mut))]
         let mut vmu_battery_percent: u8 = 100;
         let mut last_state: Option<ControllerState> = None;
@@ -363,25 +377,47 @@ async fn main(spawner: Spawner) {
                     }
                 }
 
-                // VMU: write after BLE stabilization delay.
-                // Cooldown after each write prevents re-triggering from
-                // the brief controller-lost blip that writes can cause.
+                // VMU animation: rotating pulsar with battery overlay.
+                // Runs continuously — will be overridden by dongle/game content in future.
                 if vmu_delay > 0 {
                     vmu_delay -= 1;
-                } else if vmu_lcd_bars
-                    != Some(pulsar_dreamcast_ble::vmu::bars_for_percent(vmu_battery_percent))
-                {
-                    let _ = host.enumerate_vmu(&mut bus);
-                    let frame =
-                        pulsar_dreamcast_ble::vmu::build_frame(vmu_battery_percent);
-                    if host.write_vmu_lcd(&mut bus, &frame) {
-                        vmu_lcd_bars = Some(
-                            pulsar_dreamcast_ble::vmu::bars_for_percent(vmu_battery_percent),
-                        );
-                        log!("VMU: LCD updated (bars={:?})", vmu_lcd_bars);
+                } else {
+                    vmu_anim_counter += 1;
+                    if vmu_anim_counter >= VMU_ANIM_INTERVAL {
+                        vmu_framebuf =
+                            pulsar_dreamcast_ble::vmu::build_animated_frame(vmu_anim_step);
+                        vmu_anim_step =
+                            (vmu_anim_step + 1) % pulsar_dreamcast_ble::vmu::ROTATION_FRAMES;
+                        vmu_anim_counter = 0;
+                        vmu_frame_dirty = true;
                     }
-                    // Cooldown regardless of success — avoid rapid retries
-                    vmu_delay = 180;
+                }
+
+                // VMU write: send current framebuffer when radio is idle.
+                // Battery overlay is composited here so every frame gets it
+                // regardless of content source (animation, dongle, game icon).
+                // Falls back to writing anyway if radio idle is never signaled.
+                if vmu_frame_dirty {
+                    let radio_ok = pulsar_dreamcast_ble::maple::radio_notify::is_radio_idle();
+                    if radio_ok || vmu_idle_wait >= VMU_IDLE_FALLBACK {
+                        if !vmu_enumerated {
+                            let _ = host.enumerate_vmu(&mut bus);
+                            vmu_enumerated = true;
+                        }
+                        let mut send_buf = vmu_framebuf;
+                        pulsar_dreamcast_ble::vmu::composite_battery(
+                            &mut send_buf,
+                            vmu_battery_percent,
+                            true,
+                        );
+                        pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
+                        if host.write_vmu_lcd(&mut bus, &send_buf) {
+                            vmu_frame_dirty = false;
+                        }
+                        vmu_idle_wait = 0;
+                    } else {
+                        vmu_idle_wait += 1;
+                    }
                 }
             } else {
                 fail_count = fail_count.saturating_add(1);
