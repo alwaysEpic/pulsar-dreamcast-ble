@@ -52,8 +52,18 @@ pub mod vmu;
 /// BLE HID notification interval (~125Hz, matches Xbox One S).
 pub const NOTIFY_INTERVAL_MS: u64 = 8;
 
-/// Delay for BLE client to discover services and subscribe (ms).
-pub const SERVICE_DISCOVERY_DELAY_MS: u64 = 5000;
+/// Delay before sending the first HID notify, giving the host time to
+/// finish service discovery and write the CCCD that subscribes to
+/// notifications. Reports sent before subscription return an error from
+/// `report_notify` and count toward `MAX_NOTIFY_FAILURES` — too short and
+/// we'll disconnect a slow-subscribing host.
+///
+/// Original value 5000 ms (commit 1d66d2c) bundled pairing time too, but
+/// pairing is now handled separately in `handle_connection` (~600 ms of
+/// explicit waits) before the notify task starts, so this only needs to
+/// cover service discovery + CCCD write, which macOS typically completes
+/// in well under 1 s. 1500 ms keeps a comfortable margin.
+pub const SERVICE_DISCOVERY_DELAY_MS: u64 = 1500;
 
 /// Max consecutive BLE notify failures before disconnecting.
 pub const MAX_NOTIFY_FAILURES: u8 = 10;
