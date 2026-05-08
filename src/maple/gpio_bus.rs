@@ -21,10 +21,10 @@ use heapless::Vec;
 const SAMPLE_BUFFER_LEN: usize = 24576;
 
 /// NOP iterations for a ~500ns half-bit delay at 64MHz.
-const HALF_BIT_NOPS: u32 = 32;
+pub const HALF_BIT_NOPS: u32 = 32;
 
 /// NOP iterations for pin stabilization after output mode set.
-const PIN_STABILIZE_NOPS: u32 = 100;
+pub const PIN_STABILIZE_NOPS: u32 = 100;
 
 /// NOP iterations for pull-up stabilization after input mode set.
 const PULLUP_STABILIZE_NOPS: u32 = 200;
@@ -54,7 +54,11 @@ const MIN_FRAME_BYTES: usize = 4;
 /// Accessed only from `wait_and_sample()` and `receive_frame()`, which run
 /// sequentially on a single-core Cortex-M4 with interrupts disabled during
 /// the sampling window. No concurrent or overlapping references are possible.
-static mut SAMPLE_BUFFER: [u32; SAMPLE_BUFFER_LEN] = [0; SAMPLE_BUFFER_LEN];
+/// Shared bulk sample / TX waveform buffer.
+///
+/// Used by RX for bulk GPIO sampling and by TX (timeslot) for pre-computed
+/// waveforms. TX and RX never overlap, so sharing is safe.
+pub(crate) static mut SAMPLE_BUFFER: [u32; SAMPLE_BUFFER_LEN] = [0; SAMPLE_BUFFER_LEN];
 
 const PIN_A_MASK: u32 = 1 << crate::board::PIN_A_BIT;
 const PIN_B_MASK: u32 = 1 << crate::board::PIN_B_BIT;
@@ -318,6 +322,38 @@ impl MapleBus {
         Self::update_crc(frame, &mut crc);
 
         for &word in &packet.payload {
+            self.write_word(word, &mut phase);
+            Self::update_crc(word, &mut crc);
+        }
+
+        self.write_byte(crc, &mut phase);
+        self.send_end_pattern();
+    }
+
+    /// Write a VMU LCD frame via direct bit-bang (no timeslot).
+    pub fn write_lcd(&mut self, sender: u8, dest: u8, framebuffer: &[u8; 192]) {
+        self.set_output_mode();
+        self.set_idle();
+        delay_half_bit();
+        let mut phase = true;
+        self.send_start_pattern();
+
+        let mut crc: u8 = 0;
+
+        let frame: u32 = (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | 50;
+        self.write_word(frame, &mut phase);
+        Self::update_crc(frame, &mut crc);
+
+        let func: u32 = 0x0000_0004;
+        self.write_word(func, &mut phase);
+        Self::update_crc(func, &mut crc);
+
+        let loc: u32 = 0x0000_0000;
+        self.write_word(loc, &mut phase);
+        Self::update_crc(loc, &mut crc);
+
+        for chunk in framebuffer.chunks_exact(4) {
+            let word = u32::from_le_bytes([chunk[3], chunk[2], chunk[1], chunk[0]]);
             self.write_word(word, &mut phase);
             Self::update_crc(word, &mut crc);
         }

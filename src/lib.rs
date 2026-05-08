@@ -47,12 +47,23 @@ pub mod board;
 pub mod button;
 pub mod maple;
 pub mod panic_handler;
+pub mod vmu;
 
 /// BLE HID notification interval (~125Hz, matches Xbox One S).
 pub const NOTIFY_INTERVAL_MS: u64 = 8;
 
-/// Delay for BLE client to discover services and subscribe (ms).
-pub const SERVICE_DISCOVERY_DELAY_MS: u64 = 5000;
+/// Delay before sending the first HID notify, giving the host time to
+/// finish service discovery and write the CCCD that subscribes to
+/// notifications. Reports sent before subscription return an error from
+/// `report_notify` and count toward `MAX_NOTIFY_FAILURES` — too short and
+/// we'll disconnect a slow-subscribing host.
+///
+/// Original value 5000 ms (commit 1d66d2c) bundled pairing time too, but
+/// pairing is now handled separately in `handle_connection` (~600 ms of
+/// explicit waits) before the notify task starts, so this only needs to
+/// cover service discovery + CCCD write, which macOS typically completes
+/// in well under 1 s. 1500 ms keeps a comfortable margin.
+pub const SERVICE_DISCOVERY_DELAY_MS: u64 = 1500;
 
 /// Max consecutive BLE notify failures before disconnecting.
 pub const MAX_NOTIFY_FAILURES: u8 = 10;
@@ -67,8 +78,22 @@ pub static CONTROLLER_STATE: Signal<CriticalSectionRawMutex, maple::ControllerSt
 /// Signal to trigger sync/pairing mode (clears bonds).
 pub static SYNC_MODE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// Signal to toggle device name and reset. Carries new `is_dreamcast` value.
-pub static NAME_TOGGLE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+/// Signal to switch active BLE profile and reset. Carries the new `ProfileId`.
+pub static PROFILE_CHANGE: Signal<CriticalSectionRawMutex, ble::ProfileId> = Signal::new();
+
+/// Set by the button task on a 10-second hold to request a graceful System Off.
+/// The main task picks this up, writes a "BYE" splash to the VMU, briefly
+/// holds, then enters System Off. Avoids sleeping mid-write so the goodbye
+/// frame actually lands on the LCD.
+pub static GOODBYE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Signaled by the button task on any short sync-button press. The BLE task
+/// uses this as the explicit "wake from silent reconnect-wait" trigger,
+/// matching how Xbox / PlayStation controllers use their dedicated wake
+/// buttons. Without this signal, the BLE task stays silent after the initial
+/// reconnect window so a sleeping host isn't woken by ongoing advertising.
+pub static WAKE_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Battery level percentage (0-100) for BLE reporting.
 /// Signals 0xFF when charging (tells BLE task to report "charging" state).

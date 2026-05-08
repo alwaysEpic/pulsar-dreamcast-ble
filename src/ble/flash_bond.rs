@@ -26,8 +26,10 @@ const PAGE_SIZE: u32 = 4096;
 /// Magic number to identify valid bonding data
 const BOND_MAGIC: u32 = 0xB00D_DA7A;
 
-/// Magic number to identify valid name preference data
-const NAME_MAGIC: u32 = 0x4E41_4D45; // "NAME"
+/// Magic number to identify valid profile preference data (V2 schema).
+/// Distinct from the legacy `NAME_MAGIC` so old prefs are ignored — fresh
+/// install or post-upgrade defaults to `ProfileId::Std`.
+const PROFILE_MAGIC: u32 = 0xB10F_C0DE;
 
 /// Stored bonding data structure (must be 4-byte aligned for flash writes)
 #[repr(C, align(4))]
@@ -176,32 +178,38 @@ pub async fn save_bond(
     Ok(())
 }
 
-/// Name preference stored in flash: magic (4 bytes) + preference byte (1 byte) + padding (3 bytes)
+/// Active profile stored in flash: magic (4 bytes) + profile id (1 byte) + padding (3 bytes).
 #[repr(C, align(4))]
-struct StoredNamePref {
+struct StoredProfile {
     magic: u32,
-    /// 0x00 = Xbox, 0x01 = Dreamcast
-    preference: u8,
+    /// `ProfileId` discriminant: 0 = Std, 1 = Ext.
+    profile_id: u8,
     _pad: [u8; 3],
 }
 
-/// Load name preference from flash. Returns true if Dreamcast name is selected.
-/// Defaults to false (Xbox name) if no preference is stored.
+/// Load active profile from flash, defaulting to `Std` when no valid pref is stored.
 #[must_use]
-pub fn load_name_preference() -> bool {
-    // SAFETY: NAME_FLASH_ADDR is a valid, aligned flash address. StoredNamePref is repr(C, align(4)).
-    let stored = unsafe { &*(NAME_FLASH_ADDR as *const StoredNamePref) };
-    if stored.magic != NAME_MAGIC {
-        return false; // Default to Xbox
+pub fn load_profile() -> crate::ble::profile::ProfileId {
+    use crate::ble::profile::ProfileId;
+    // SAFETY: NAME_FLASH_ADDR is a valid, aligned flash address. StoredProfile is repr(C, align(4)).
+    let stored = unsafe { &*(NAME_FLASH_ADDR as *const StoredProfile) };
+    if stored.magic != PROFILE_MAGIC {
+        return ProfileId::Std;
     }
-    stored.preference != 0
+    match stored.profile_id {
+        1 => ProfileId::Ext,
+        _ => ProfileId::Std,
+    }
 }
 
-/// Save name preference to flash. `is_dreamcast`: true = Dreamcast, false = Xbox.
-pub async fn save_name_preference(flash: &mut Flash, is_dreamcast: bool) -> Result<(), ()> {
-    let stored = StoredNamePref {
-        magic: NAME_MAGIC,
-        preference: u8::from(is_dreamcast),
+/// Save active profile to flash.
+pub async fn save_profile(
+    flash: &mut Flash,
+    profile_id: crate::ble::profile::ProfileId,
+) -> Result<(), ()> {
+    let stored = StoredProfile {
+        magic: PROFILE_MAGIC,
+        profile_id: profile_id as u8,
         _pad: [0u8; 3],
     };
 
@@ -210,11 +218,11 @@ pub async fn save_name_preference(flash: &mut Flash, is_dreamcast: bool) -> Resu
         .await
         .map_err(|_| ())?;
 
-    // SAFETY: StoredNamePref is repr(C, align(4)). Pointer is valid for struct size.
+    // SAFETY: StoredProfile is repr(C, align(4)). Pointer is valid for struct size.
     let data = unsafe {
         core::slice::from_raw_parts(
             (&raw const stored).cast::<u8>(),
-            core::mem::size_of::<StoredNamePref>(),
+            core::mem::size_of::<StoredProfile>(),
         )
     };
 

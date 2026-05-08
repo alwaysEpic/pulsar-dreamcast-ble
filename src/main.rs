@@ -11,7 +11,6 @@ use pulsar_dreamcast_ble::maple::host::MapleResult;
 use pulsar_dreamcast_ble::maple::{ControllerState, MapleBus, MapleHost};
 use pulsar_dreamcast_ble::{ble, board, CONTROLLER_STATE};
 
-#[cfg(feature = "board-xiao")]
 use embassy_time::Instant;
 use nrf_softdevice::Softdevice;
 // Panic handler is registered via #[panic_handler] in pulsar_dreamcast_ble::panic_handler
@@ -89,17 +88,25 @@ async fn main(spawner: Spawner) {
         board::qspi_flash_deep_power_down();
     }
 
-    // Load name preference from flash (Xbox vs Dreamcast)
-    let is_dreamcast = ble::flash_bond::load_name_preference();
-    if is_dreamcast {
-        log!("Name: Dreamcast Wireless Controller");
-    } else {
-        log!("Name: Xbox Wireless Controller");
-    }
+    // Load active profile from flash; defaults to STD on first boot.
+    let profile_id = ble::flash_bond::load_profile();
+    let profile = profile_id.profile();
+    log!(
+        "PROFILE: {} (PID {:#06x})",
+        core::str::from_utf8(profile.vmu_label).unwrap_or("?"),
+        profile.pid
+    );
 
-    // Initialize SoftDevice with chosen name
-    ble::softdevice::set_name_mode(is_dreamcast);
-    let sd = ble::softdevice::init_softdevice(is_dreamcast);
+    // Initialize SoftDevice with chosen profile
+    ble::softdevice::set_profile(profile);
+    let sd = ble::softdevice::init_softdevice(profile);
+
+    // Enable radio notifications for VMU write scheduling
+    if pulsar_dreamcast_ble::maple::radio_notify::init() {
+        log!("RADIO: Notifications enabled");
+    } else {
+        log!("RADIO: Notification setup failed");
+    }
 
     // Create HID Gamepad GATT server
     let Ok(server) = ble::GamepadServer::new(sd) else {
@@ -109,7 +116,7 @@ async fn main(spawner: Spawner) {
     };
     static SERVER: StaticCell<ble::GamepadServer> = StaticCell::new();
     let server = SERVER.init(server);
-    let _ = server.init();
+    let _ = server.init(profile);
 
     // Spawn the SoftDevice runner task
     if let Ok(token) = softdevice_task(sd) {
@@ -205,6 +212,47 @@ async fn main(spawner: Spawner) {
         loop {
             if get_connection_state() == ConnectionState::Connected {
                 break;
+            }
+
+            // Goodbye splash from disconnected state. Wake the bus, try to
+            // write BYE to the VMU (may silently fail if no controller is
+            // plugged in), hold briefly so the user sees it, then sleep.
+            // Runs on both boards so the flow is testable on the dev kit;
+            // XIAO actually enters System Off, DK halts via WFI.
+            if pulsar_dreamcast_ble::GOODBYE_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
+                log!("MAIN: Phase 1 goodbye, rendering BYE");
+                bus.set_output_mode();
+                Timer::after(Duration::from_millis(20)).await;
+                let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"BYE");
+                pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
+                log!("MAIN: VMU enumerate = {}", host.enumerate_vmu(&mut bus));
+                let mut wrote = false;
+                for _ in 0..5 {
+                    if host.write_vmu_lcd(&mut bus, &send_buf) {
+                        log!("MAIN: BYE write OK");
+                        wrote = true;
+                        break;
+                    }
+                    Timer::after(Duration::from_millis(50)).await;
+                }
+                if !wrote {
+                    log!("MAIN: BYE write failed (no controller?)");
+                }
+                Timer::after(Duration::from_millis(1000)).await;
+                #[cfg(feature = "board-xiao")]
+                {
+                    log!("MAIN: calling enter_system_off");
+                    unsafe {
+                        board::enter_system_off();
+                    }
+                }
+                #[cfg(not(feature = "board-xiao"))]
+                {
+                    log!("MAIN: DK halting (no System Off on this board)");
+                    loop {
+                        cortex_m::asm::wfi();
+                    }
+                }
             }
 
             #[cfg(feature = "board-xiao")]
@@ -319,14 +367,113 @@ async fn main(spawner: Spawner) {
         }
 
         // --- Phase 3: Poll loop (active gaming) ---
+        let mut vmu_delay: u16 = 180; // ~3s delay before VMU attempt
+        let mut vmu_enumerated = false;
+        let mut vmu_frame_dirty = true;
+        let mut vmu_framebuf =
+            pulsar_dreamcast_ble::vmu::build_profile_splash(profile.vmu_glyph, profile.vmu_label);
+        let mut vmu_anim_step: u8 = 0;
+        let mut vmu_anim_counter: u16 = 0;
+        let mut vmu_idle_wait: u16 = 0;
+        // ~16ms per poll, splash holds 30s before transitioning to the pulsar.
+        let mut vmu_splash_polls: u16 = 30 * 60;
+        const VMU_ANIM_INTERVAL: u16 = 10; // Advance animation every 10 polls (~160ms, ~6fps)
+        const VMU_IDLE_FALLBACK: u16 = 30; // Write anyway after 30 polls (~480ms) without radio idle
+        #[cfg_attr(not(feature = "board-xiao"), allow(unused_mut))]
+        let mut vmu_battery_percent: u8 = 100;
         let mut last_state: Option<ControllerState> = None;
         let mut fail_count: u16 = 0;
         #[cfg(feature = "board-xiao")]
         let mut last_activity = Instant::now();
 
+        // Goodbye state machine. Activated when GOODBYE_PENDING is set (button
+        // task signals at the 7s hold mark, *during* the hold). We render BYE
+        // through the existing dirty-flag path so it gets the same radio-idle
+        // waiting and retry behavior as the regular pulsar/splash writes.
+        // Once the write lands, we hold for ≥1s before triggering System Off
+        // (XIAO) or halting via WFI (DK) so the user actually sees BYE.
+        #[derive(Clone, Copy)]
+        enum GoodbyeState {
+            Render,        // need to swap framebuffer to BYE
+            Wait(Instant), // BYE in framebuffer, waiting for write or timeout
+            Hold(Instant), // BYE on LCD, holding before sleep
+        }
+        // Maximum time to wait for the dirty flag to clear before giving up
+        // and proceeding to Hold anyway. write_vmu_lcd() can return false
+        // (no Ack) even when the LCD bytes landed — typically because BLE
+        // radio interference corrupted the controller's reply. Without this
+        // fallback, the goodbye state machine would loop in Wait forever and
+        // never reach enter_system_off().
+        const GOODBYE_WAIT_TIMEOUT_MS: u64 = 500;
+        let mut goodbye_state: Option<GoodbyeState> = None;
+
         loop {
+            {
+                let pending = pulsar_dreamcast_ble::GOODBYE_PENDING
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                if pending && goodbye_state.is_none() {
+                    log!("MAIN: Goodbye, rendering BYE");
+                    goodbye_state = Some(GoodbyeState::Render);
+                }
+                match goodbye_state {
+                    Some(GoodbyeState::Render) => {
+                        vmu_framebuf = pulsar_dreamcast_ble::vmu::build_message_splash(b"BYE");
+                        vmu_frame_dirty = true;
+                        goodbye_state = Some(GoodbyeState::Wait(Instant::now()));
+                    }
+                    Some(GoodbyeState::Wait(wait_start)) => {
+                        if !vmu_frame_dirty
+                            || wait_start.elapsed()
+                                >= Duration::from_millis(GOODBYE_WAIT_TIMEOUT_MS)
+                        {
+                            // Either the standard write path cleared the
+                            // dirty flag (BYE actually landed on the LCD),
+                            // or we've waited long enough that we should
+                            // proceed regardless. write_vmu_lcd() can return
+                            // false even when the bytes landed — its Ack
+                            // gets corrupted by BLE radio events during
+                            // notify activity. Without this timeout the
+                            // state machine could loop here forever.
+                            log!("MAIN: BYE rendered, holding then System Off");
+                            goodbye_state = Some(GoodbyeState::Hold(Instant::now()));
+                        }
+                    }
+                    Some(GoodbyeState::Hold(start)) => {
+                        if start.elapsed() >= Duration::from_millis(1000) {
+                            #[cfg(feature = "board-xiao")]
+                            {
+                                log!("MAIN: calling enter_system_off");
+                                unsafe {
+                                    board::enter_system_off();
+                                }
+                            }
+                            #[cfg(not(feature = "board-xiao"))]
+                            {
+                                log!("MAIN: DK halting (no System Off)");
+                                loop {
+                                    cortex_m::asm::wfi();
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+
             // Check for BLE disconnect
-            if get_connection_state() != ConnectionState::Connected {
+            let conn_state = get_connection_state();
+            if conn_state != ConnectionState::Connected {
+                // If the disconnect is because we just entered sync mode, write
+                // a SYNC splash to the VMU so it persists through Phase 1.
+                if conn_state == ConnectionState::SyncMode {
+                    log!("MAIN: Sync mode entered, writing SYNC splash");
+                    let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"SYNC");
+                    pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
+                    if !vmu_enumerated {
+                        let _ = host.enumerate_vmu(&mut bus);
+                    }
+                    let _ = host.write_vmu_lcd(&mut bus, &send_buf);
+                }
                 log!("MAIN: BLE disconnected, disabling boost");
                 #[cfg(feature = "board-xiao")]
                 unsafe {
@@ -356,6 +503,61 @@ async fn main(spawner: Spawner) {
                     #[cfg(feature = "board-xiao")]
                     {
                         last_activity = Instant::now();
+                    }
+                }
+
+                // VMU content: profile splash for the first 30s of every boot,
+                // then the rotating pulsar (with battery overlay) for the rest.
+                // Skipped entirely while goodbye is active so the BYE frame
+                // doesn't get overwritten before it lands.
+                let vmu_busy = goodbye_state.is_some();
+                if vmu_busy {
+                    // Goodbye in flight — leave vmu_framebuf alone.
+                } else if vmu_delay > 0 {
+                    vmu_delay -= 1;
+                } else if vmu_splash_polls > 0 {
+                    vmu_splash_polls -= 1;
+                    if vmu_splash_polls == 0 {
+                        // Transition out of splash: prime the animation so the
+                        // first pulsar frame renders on the next interval.
+                        vmu_anim_counter = VMU_ANIM_INTERVAL;
+                    }
+                } else {
+                    vmu_anim_counter += 1;
+                    if vmu_anim_counter >= VMU_ANIM_INTERVAL {
+                        vmu_framebuf =
+                            pulsar_dreamcast_ble::vmu::build_animated_frame(vmu_anim_step);
+                        vmu_anim_step =
+                            (vmu_anim_step + 1) % pulsar_dreamcast_ble::vmu::ROTATION_FRAMES;
+                        vmu_anim_counter = 0;
+                        vmu_frame_dirty = true;
+                    }
+                }
+
+                // VMU write: send current framebuffer when radio is idle.
+                // Battery overlay is composited here so every frame gets it
+                // regardless of content source (animation, dongle, game icon).
+                // Falls back to writing anyway if radio idle is never signaled.
+                if vmu_frame_dirty {
+                    let radio_ok = pulsar_dreamcast_ble::maple::radio_notify::is_radio_idle();
+                    if radio_ok || vmu_idle_wait >= VMU_IDLE_FALLBACK {
+                        if !vmu_enumerated {
+                            let _ = host.enumerate_vmu(&mut bus);
+                            vmu_enumerated = true;
+                        }
+                        let mut send_buf = vmu_framebuf;
+                        pulsar_dreamcast_ble::vmu::composite_battery(
+                            &mut send_buf,
+                            vmu_battery_percent,
+                            true,
+                        );
+                        pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
+                        if host.write_vmu_lcd(&mut bus, &send_buf) {
+                            vmu_frame_dirty = false;
+                        }
+                        vmu_idle_wait = 0;
+                    } else {
+                        vmu_idle_wait += 1;
                     }
                 }
             } else {
@@ -447,6 +649,7 @@ async fn main(spawner: Spawner) {
                 if last_battery_read.elapsed() >= BATTERY_READ_INTERVAL {
                     let (mv, percent) = battery_reader.read(charging).await;
                     BATTERY_LEVEL.signal(if charging { 0xFF } else { percent });
+                    vmu_battery_percent = if charging { 100 } else { percent };
                     last_battery_read = Instant::now();
 
                     if !charging && mv < LOW_BATTERY_CUTOFF_MV {

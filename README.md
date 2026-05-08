@@ -12,6 +12,8 @@ Use your Dreamcast controller wirelessly with any Bluetooth device. Pulsar speak
 
 - All Dreamcast inputs: A/B/X/Y, Start, D-pad, analog stick, analog triggers
 - Works with any BLE HID host (PC, iOS, Android, Switch, Dreamcast via iBlueControlMod)
+- Two switchable button profiles (STD/EXT) for broad host compatibility
+- VMU LCD display: profile splash, rotating pulsar with battery indicator, mode splashes
 - 60Hz controller polling with continuous BLE reporting
 - Pairing persists across power cycles (flash-based bonding)
 - Battery powered (~7-8 hrs on 500mAh, ~14-16 hrs on 1000mAh) with sleep/wake support
@@ -78,10 +80,16 @@ If you need RTT debug logging, flash via SWD instead. The SoftDevice must be fla
 3. Pair and you're done — bonding is saved automatically
 
 **Sync button:**
-- Hold 3 seconds → clear bond and start pairing
-- Triple-press → toggle device name (Xbox / Dreamcast)
+- Short press → wake / request reconnect
+- Hold 3s → clear bond and start pairing
+- Hold 10s → sleep (`BYE` splash, then powers off)
+- Triple-press → switch profile (STD ⇄ EXT, different button layouts)
 
-See the [user guide](docs/users_guide.md) for more details.
+The VMU LCD shows the active profile on connect, a rotating pulsar with battery indicator while in use, and splashes for pairing (`SYNC`) and sleeping (`BYE`).
+
+<p align="center"><img src="docs/images/pulsar.jpeg" width="280" alt="Rotating pulsar animation on the VMU LCD"></p>
+
+See the [user guide](docs/users_guide.md) for all screens, profile choice, and troubleshooting.
 
 ### Enclosure
 

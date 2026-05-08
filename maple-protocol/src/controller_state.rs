@@ -154,6 +154,17 @@ const TRIGGER_CHANGE_THRESHOLD: i16 = 2;
 /// Stick change threshold for `state_changed` detection.
 const STICK_CHANGE_THRESHOLD: i16 = 2;
 
+/// Trigger noise floor — values at or below this are treated as "at rest"
+/// for `state_changed`. Idle drift in this range won't generate a state
+/// change, which prevents waking sleeping BLE hosts via phantom reports.
+const TRIGGER_NOISE_FLOOR: u8 = 5;
+
+/// Stick deadzone radius (matches the deadzone applied in `to_gamepad_report`).
+/// `state_changed` treats axis pairs that are both inside the deadzone as
+/// unchanged — the post-deadzone HID output is identical, so emitting a
+/// notify would wake the host without any user intent.
+const STICK_DEADZONE: u16 = 5;
+
 impl ControllerState {
     /// Convert to Xbox One S BLE HID gamepad report.
     ///
@@ -206,17 +217,16 @@ impl ControllerState {
         // Convert Dreamcast stick (u8, 0-255, center=128) to Xbox (u16, 0-65535, center=32768)
         // Scale: multiply by 257 (maps 0->0, 128->32896~=32768, 255->65535)
         // Apply deadzone around center
-        const DEADZONE: u16 = 5;
         let raw_x = self.stick_y; // Dreamcast Y -> HID X
         let raw_y = self.stick_x; // Dreamcast X -> HID Y
         let left_x: u16 =
-            if (i16::from(raw_x) - i16::from(DC_STICK_CENTER)).unsigned_abs() < DEADZONE {
+            if (i16::from(raw_x) - i16::from(DC_STICK_CENTER)).unsigned_abs() < STICK_DEADZONE {
                 XBOX_STICK_CENTER
             } else {
                 u16::from(raw_x) * STICK_SCALE_FACTOR
             };
         let left_y: u16 =
-            if (i16::from(raw_y) - i16::from(DC_STICK_CENTER)).unsigned_abs() < DEADZONE {
+            if (i16::from(raw_y) - i16::from(DC_STICK_CENTER)).unsigned_abs() < STICK_DEADZONE {
                 XBOX_STICK_CENTER
             } else {
                 u16::from(raw_y) * STICK_SCALE_FACTOR
@@ -301,29 +311,54 @@ impl ControllerState {
 
     /// Returns true if the controller state has changed meaningfully.
     ///
-    /// Buttons use exact comparison, while triggers and sticks use
-    /// thresholds to avoid noise-triggered updates.
+    /// Buttons use exact comparison. Triggers and sticks apply both a
+    /// magnitude threshold (filters out polling noise) AND a "rest zone"
+    /// gate: idle drift around 0 (triggers) or center (sticks) does not
+    /// count as a change, since the post-deadzone HID output would be
+    /// byte-identical anyway. This prevents phantom BLE notifies that
+    /// would wake a sleeping host with no actual user input.
     #[must_use]
     pub fn state_changed(&self, other: &Self) -> bool {
         if self.buttons.to_raw() != other.buttons.to_raw() {
             return true;
         }
 
-        if (i16::from(self.trigger_l) - i16::from(other.trigger_l)).abs() > TRIGGER_CHANGE_THRESHOLD
-            || (i16::from(self.trigger_r) - i16::from(other.trigger_r)).abs()
-                > TRIGGER_CHANGE_THRESHOLD
+        if trigger_changed(self.trigger_l, other.trigger_l)
+            || trigger_changed(self.trigger_r, other.trigger_r)
         {
             return true;
         }
 
-        if (i16::from(self.stick_x) - i16::from(other.stick_x)).abs() > STICK_CHANGE_THRESHOLD
-            || (i16::from(self.stick_y) - i16::from(other.stick_y)).abs() > STICK_CHANGE_THRESHOLD
+        if stick_axis_changed(self.stick_x, other.stick_x)
+            || stick_axis_changed(self.stick_y, other.stick_y)
         {
             return true;
         }
 
         false
     }
+}
+
+/// Trigger change detection: ignore drift when both values are at the noise
+/// floor (the HID output would be 0 for both). Otherwise apply the standard
+/// threshold.
+fn trigger_changed(a: u8, b: u8) -> bool {
+    if a <= TRIGGER_NOISE_FLOOR && b <= TRIGGER_NOISE_FLOOR {
+        return false;
+    }
+    (i16::from(a) - i16::from(b)).abs() > TRIGGER_CHANGE_THRESHOLD
+}
+
+/// Stick axis change detection: ignore drift when both values are within
+/// the deadzone (the HID output is clamped to center for both, so the wire
+/// payload is byte-identical).
+fn stick_axis_changed(a: u8, b: u8) -> bool {
+    let a_in_dz = (i16::from(a) - i16::from(DC_STICK_CENTER)).unsigned_abs() < STICK_DEADZONE;
+    let b_in_dz = (i16::from(b) - i16::from(DC_STICK_CENTER)).unsigned_abs() < STICK_DEADZONE;
+    if a_in_dz && b_in_dz {
+        return false;
+    }
+    (i16::from(a) - i16::from(b)).abs() > STICK_CHANGE_THRESHOLD
 }
 
 #[cfg(test)]
@@ -583,7 +618,7 @@ mod tests {
             ..Default::default()
         };
         let b = ControllerState {
-            stick_x: 135, // diff=7 > threshold 2
+            stick_x: 135, // diff=7 > threshold 2, out of deadzone
             ..Default::default()
         };
         assert!(a.state_changed(&b));
@@ -593,5 +628,51 @@ mod tests {
             ..Default::default()
         };
         assert!(!a.state_changed(&c));
+    }
+
+    #[test]
+    fn state_changed_stick_drift_within_deadzone() {
+        // Both values inside the ±5 deadzone — post-clamp HID output is
+        // identical, so this should NOT count as a change even though the
+        // raw diff (6) exceeds STICK_CHANGE_THRESHOLD (2).
+        let a = ControllerState {
+            stick_x: 125,
+            ..Default::default()
+        };
+        let b = ControllerState {
+            stick_x: 131,
+            ..Default::default()
+        };
+        assert!(!a.state_changed(&b));
+    }
+
+    #[test]
+    fn state_changed_stick_drift_crossing_deadzone() {
+        // One inside deadzone, one outside — output WOULD differ, so this
+        // should still count as a change.
+        let a = ControllerState {
+            stick_x: 128, // center
+            ..Default::default()
+        };
+        let b = ControllerState {
+            stick_x: 140, // outside deadzone
+            ..Default::default()
+        };
+        assert!(a.state_changed(&b));
+    }
+
+    #[test]
+    fn state_changed_trigger_drift_below_noise_floor() {
+        // Both triggers below the noise floor — idle, post-clamp HID output
+        // is 0 for both, no change.
+        let a = ControllerState {
+            trigger_l: 0,
+            ..Default::default()
+        };
+        let b = ControllerState {
+            trigger_l: 4, // diff=4 > threshold but both at rest
+            ..Default::default()
+        };
+        assert!(!a.state_changed(&b));
     }
 }

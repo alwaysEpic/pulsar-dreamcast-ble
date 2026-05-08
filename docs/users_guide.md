@@ -46,23 +46,46 @@ The Dreamcast controller has one analog stick, which maps to the left stick. The
 
 ## Sync Button
 
-The sync button on the adapter has three functions:
+| Action | Result |
+|---|---|
+| Short press | Wake / request reconnect |
+| Hold 3s | Pairing mode (60s) — clears the current bond |
+| Hold 10s | Sleep — shows `BYE`, releases into deep sleep |
+| Triple-press | Switch profile (STD ⇄ EXT) and reboot |
 
-### Pair with a New Device (Hold 3 seconds)
-Hold the sync button for 3 seconds. The LED will blink while you hold it. When released, the adapter disconnects from the current host and enters **pairing mode** for 60 seconds. This clears any existing pairing, so you'll need to pair again from your host device.
+After holding 3s and pairing fresh, the **old** host still has us in its Bluetooth list. Forget the adapter there before it'll let you pair again — same as any single-bond controller (Xbox, etc.).
 
-**Important:** After syncing to a new device, the old host may still show the adapter in its Bluetooth settings. You must manually **"Forget This Device"** on the old host before it can pair with the adapter again. This is normal for single-bond Bluetooth devices (same behavior as Xbox controllers).
+### Profiles
 
-### Manual Sleep (Hold 10 seconds)
-Keep holding past the 3-second sync point. The LED blink rate will double to indicate sleep is approaching. At 10 seconds, the adapter enters deep sleep immediately. This is useful for conserving battery or allowing the battery to charge on USB without the controller drawing power.
+Two button layouts, switchable with a triple-press. Use **STD** by default. Switch to **EXT** if buttons feel wrong on your host.
 
-### Toggle Device Name (Triple-press)
-Press the sync button three times quickly (within 2 seconds). The LED will flash 5 times to confirm. The adapter toggles between two names:
+| Profile | Best for | Bluetooth name |
+|---|---|---|
+| **STD** (default) | iBlueControlMod, BlueRetro, most BLE gamepad receivers, kernel HID quirk paths | Xbox Wireless Controller |
+| **EXT** | Steam Input, Linux (xpadneo), Android generic HID | Dreamcast Wireless Controller |
 
-- **Xbox Wireless Controller** (default) -- compatible with iBlueControlMod and most BLE gamepad receivers
-- **Dreamcast Wireless Controller** -- for hosts that don't require the Xbox name
+After switching, forget the adapter on your host and pair again so it picks up the new HID layout. The profile is saved to flash.
 
-The name preference is saved and persists across power cycles. The adapter resets automatically to apply the new name.
+## VMU Display
+
+The adapter draws on the VMU LCD while connected — a profile splash on every connect, then a rotating pulsar with battery indicator. Mode transitions get their own splash.
+
+<table>
+  <tr>
+    <td align="center"><img src="images/std.jpeg" width="220" alt="STD profile splash"><br>STD profile (boot)</td>
+    <td align="center"><img src="images/ext.jpeg" width="220" alt="EXT profile splash"><br>EXT profile (boot)</td>
+    <td align="center"><img src="images/pulsar.jpeg" width="220" alt="Rotating pulsar"><br>In-session</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="images/sync.jpeg" width="220" alt="SYNC splash"><br>Pairing mode</td>
+    <td align="center"><img src="images/bye.jpeg" width="220" alt="BYE splash"><br>Sleeping</td>
+    <td></td>
+  </tr>
+</table>
+
+The profile splash holds for ~30 seconds after connect, then transitions to the rotating pulsar with battery indicator.
+
+> **Battery note:** the VMU updates ~6 times per second to animate the pulsar, plus extra writes on splash transitions. This costs roughly 5–10% of battery life vs. running with no LCD activity. Worth it for the visual feedback, but worth knowing.
 
 ## Battery & Charging
 
@@ -97,7 +120,7 @@ When asleep, the adapter draws minimal power (~5 microamps). The battery charges
 | Fast blink (blue) | Pairing mode active (60s) |
 | Blink while holding | Sync button held, pending action |
 | Fast blink while holding | Past sync point, approaching sleep |
-| 5 quick flashes | Name toggle confirmed |
+| 5 quick flashes | Profile switch confirmed (will reboot) |
 | Off | Sleeping or idle (no BLE connection) |
 
 ## Troubleshooting
@@ -125,5 +148,5 @@ When asleep, the adapter draws minimal power (~5 microamps). The battery charges
 - The adapter sleeps after 60 seconds without a Bluetooth connection, 60 seconds if Bluetooth connects but no controller is detected, or after 10 minutes of no controller input. Keep interacting with the controller to prevent the inactivity timeout.
 
 **Inputs feel wrong or mapped incorrectly**
-- The adapter maps Dreamcast buttons to Xbox equivalents. Some hosts may remap these further. Check your host's controller settings.
-- If using iBlueControlMod, make sure the device name is set to "Xbox Wireless Controller" (the default). Triple-press sync to toggle if needed.
+- Try the other profile: triple-press sync to switch between STD and EXT. After switching, forget the adapter on your host and pair fresh — most hosts cache the HID layout per-bond.
+- Some hosts remap buttons in their own settings (Steam Input, accessibility shortcuts). Check there too.

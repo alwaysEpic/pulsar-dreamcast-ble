@@ -79,7 +79,10 @@ impl GamepadReport {
         Self::default()
     }
 
-    /// Convert to 16-byte array for BLE transmission.
+    /// Convert to 16-byte array using the contiguous (xpadneo-patched) button layout.
+    ///
+    /// Buttons 1-15 are packed as a single contiguous bitfield in bytes 13-14.
+    /// Compatible with Steam Input, Linux desktop, Android generic HID parsers.
     ///
     /// Trigger packing: 10 data bits in low bits of `u16`, 6 zero padding in high bits.
     /// Byte 8 = `trigger[7:0]`, Byte 9 = `000000 | trigger[9:8]`
@@ -118,6 +121,80 @@ impl GamepadReport {
             // Buttons 9-15 + 1-bit padding (byte 14)
             ((self.buttons >> 8) & 0x7F) as u8,
             // AC Back (byte 15, bit 0) - unused, always 0
+            0x00,
+        ]
+    }
+
+    /// Convert to 16-byte array using the original Microsoft Xbox One S BT Classic
+    /// button layout (PID 0x02E0). Buttons 1-10 are placed at specific bit positions
+    /// with reserved gaps in between, matching the descriptor `BlueRetro` and other
+    /// retro adapters key off via VID/PID.
+    ///
+    /// Byte 13 (face buttons + bumpers):
+    ///   bit 0=A, 1=B, 2=reserved, 3=X, 4=Y, 5=reserved, 6=LB, 7=RB
+    /// Byte 14 (system buttons + stick clicks):
+    ///   bits 0-1=reserved, 2=View, 3=Menu, 4=reserved (Xbox is on Report 2),
+    ///   5=L3, 6=R3, 7=reserved
+    ///
+    /// Sticks, triggers, hat, and byte 15 are identical to `to_bytes`.
+    #[must_use]
+    pub fn to_bytes_ms(self) -> [u8; 16] {
+        let lx = self.left_x.to_le_bytes();
+        let ly = self.left_y.to_le_bytes();
+        let lt = (self.left_trigger & TRIGGER_10BIT_MASK).to_le_bytes();
+        let rt = (self.right_trigger & TRIGGER_10BIT_MASK).to_le_bytes();
+
+        let b = self.buttons;
+        let mut byte13 = 0u8;
+        if b & buttons::A != 0 {
+            byte13 |= 1 << 0;
+        }
+        if b & buttons::B != 0 {
+            byte13 |= 1 << 1;
+        }
+        if b & buttons::X != 0 {
+            byte13 |= 1 << 3;
+        }
+        if b & buttons::Y != 0 {
+            byte13 |= 1 << 4;
+        }
+        if b & buttons::LB != 0 {
+            byte13 |= 1 << 6;
+        }
+        if b & buttons::RB != 0 {
+            byte13 |= 1 << 7;
+        }
+
+        let mut byte14 = 0u8;
+        if b & buttons::BACK != 0 {
+            byte14 |= 1 << 2;
+        }
+        if b & buttons::START != 0 {
+            byte14 |= 1 << 3;
+        }
+        if b & buttons::L3 != 0 {
+            byte14 |= 1 << 5;
+        }
+        if b & buttons::R3 != 0 {
+            byte14 |= 1 << 6;
+        }
+
+        [
+            lx[0],
+            lx[1],
+            ly[0],
+            ly[1],
+            RIGHT_STICK_CENTER_LE[0],
+            RIGHT_STICK_CENTER_LE[1],
+            RIGHT_STICK_CENTER_LE[0],
+            RIGHT_STICK_CENTER_LE[1],
+            lt[0],
+            lt[1],
+            rt[0],
+            rt[1],
+            self.hat & 0x0F,
+            byte13,
+            byte14,
             0x00,
         ]
     }
@@ -211,6 +288,72 @@ mod tests {
             let bytes = report.to_bytes();
             assert_eq!(bytes[12], hat_val & 0x0F);
         }
+    }
+
+    #[test]
+    fn to_bytes_ms_default_matches_to_bytes() {
+        let report = GamepadReport::default();
+        let ms = report.to_bytes_ms();
+        let std = report.to_bytes();
+        // Sticks/triggers/hat/byte15 are identical between layouts.
+        for i in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15] {
+            assert_eq!(ms[i], std[i], "byte {i} differs");
+        }
+        assert_eq!(ms[13], 0);
+        assert_eq!(ms[14], 0);
+    }
+
+    #[test]
+    fn to_bytes_ms_face_buttons() {
+        // A B X Y mapped to byte 13 bits 0,1,3,4 (gaps at 2 and 5).
+        let cases = [
+            (buttons::A, 13, 1 << 0),
+            (buttons::B, 13, 1 << 1),
+            (buttons::X, 13, 1 << 3),
+            (buttons::Y, 13, 1 << 4),
+            (buttons::LB, 13, 1 << 6),
+            (buttons::RB, 13, 1 << 7),
+            (buttons::BACK, 14, 1 << 2),
+            (buttons::START, 14, 1 << 3),
+            (buttons::L3, 14, 1 << 5),
+            (buttons::R3, 14, 1 << 6),
+        ];
+        for (mask, byte_idx, expected) in cases {
+            let report = GamepadReport {
+                buttons: mask,
+                ..Default::default()
+            };
+            let bytes = report.to_bytes_ms();
+            assert_eq!(
+                bytes[byte_idx], expected,
+                "mask {mask:#x} should set byte {byte_idx} to {expected:#x}"
+            );
+            // The other button byte must be untouched.
+            let other = if byte_idx == 13 { 14 } else { 13 };
+            assert_eq!(bytes[other], 0);
+        }
+    }
+
+    #[test]
+    fn to_bytes_ms_all_buttons() {
+        let report = GamepadReport {
+            buttons: buttons::A
+                | buttons::B
+                | buttons::X
+                | buttons::Y
+                | buttons::LB
+                | buttons::RB
+                | buttons::BACK
+                | buttons::START
+                | buttons::L3
+                | buttons::R3,
+            ..Default::default()
+        };
+        let bytes = report.to_bytes_ms();
+        // byte 13: A(0) B(1) _(2) X(3) Y(4) _(5) LB(6) RB(7) = 0xDB
+        assert_eq!(bytes[13], 0b1101_1011);
+        // byte 14: _(0) _(1) BACK(2) START(3) _(4) L3(5) R3(6) _(7) = 0x6C
+        assert_eq!(bytes[14], 0b0110_1100);
     }
 
     #[test]
