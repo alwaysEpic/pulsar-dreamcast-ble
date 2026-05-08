@@ -209,22 +209,6 @@ async fn main(spawner: Spawner) {
         log!("MAIN: Waiting for BLE connection...");
         bus.set_low_power();
         status.off();
-        // Wake-on-controller-input: poll the Maple bus periodically while
-        // disconnected. If any face button / trigger / stick deflection is
-        // detected, fire WAKE_REQUEST so the BLE task starts advertising and
-        // the host can reconnect. Matches Xbox/PS controller behavior.
-        //
-        // Two intervals: base when a controller is responding, longer backoff
-        // when the bus keeps timing out (no controller plugged in). With
-        // button-mashing the worst-case latency is the base interval since
-        // any one of the mash presses lands in a poll window.
-        const WAKE_POLL_BASE_MS: u64 = 1500;
-        const WAKE_POLL_BACKOFF_MS: u64 = 5000;
-        const TIMEOUT_BACKOFF_THRESHOLD: u8 = 3;
-        const TRIGGER_WAKE_THRESHOLD: u8 = 20;
-        const STICK_WAKE_DEFLECTION: i16 = 30;
-        let mut last_wake_poll = Instant::now();
-        let mut consecutive_poll_failures: u8 = 0;
         loop {
             if get_connection_state() == ConnectionState::Connected {
                 break;
@@ -269,38 +253,6 @@ async fn main(spawner: Spawner) {
                         cortex_m::asm::wfi();
                     }
                 }
-            }
-
-            // Wake-on-controller-input poll. Briefly wake the bus, read state,
-            // fire WAKE_REQUEST if anything's pressed, then back to low power.
-            // Adaptive interval: backs off to 5s after repeated bus timeouts
-            // (no controller plugged in) to save power.
-            let poll_interval_ms = if consecutive_poll_failures >= TIMEOUT_BACKOFF_THRESHOLD {
-                WAKE_POLL_BACKOFF_MS
-            } else {
-                WAKE_POLL_BASE_MS
-            };
-            if last_wake_poll.elapsed() >= Duration::from_millis(poll_interval_ms) {
-                bus.set_output_mode();
-                Timer::after(Duration::from_millis(2)).await;
-                if let MapleResult::Ok(state) = host.get_condition(&mut bus) {
-                    consecutive_poll_failures = 0;
-                    let stick_dx = i16::from(state.stick_x) - 128;
-                    let stick_dy = i16::from(state.stick_y) - 128;
-                    let any_input = state.buttons.any_pressed()
-                        || state.trigger_l > TRIGGER_WAKE_THRESHOLD
-                        || state.trigger_r > TRIGGER_WAKE_THRESHOLD
-                        || stick_dx.abs() > STICK_WAKE_DEFLECTION
-                        || stick_dy.abs() > STICK_WAKE_DEFLECTION;
-                    if any_input {
-                        log!("MAIN: Controller input while disconnected, requesting wake");
-                        pulsar_dreamcast_ble::WAKE_REQUEST.signal(());
-                    }
-                } else {
-                    consecutive_poll_failures = consecutive_poll_failures.saturating_add(1);
-                }
-                bus.set_low_power();
-                last_wake_poll = Instant::now();
             }
 
             #[cfg(feature = "board-xiao")]
