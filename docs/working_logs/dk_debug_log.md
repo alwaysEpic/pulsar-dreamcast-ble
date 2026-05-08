@@ -9,6 +9,190 @@ Running log of tests, assumptions, and results for Maple Bus bring-up on the nRF
 
 ---
 
+## Session: 2026-05-07 (BLE profile system: RETRO/DESK split)
+
+### Context
+v0.1.1 bug report on the public repo: START, X, Y buttons mis-mapped when paired to a Dreamcast through BlueRetro. Reproduced independently on Steam Deck — Steam UI sees buttons correctly, but launching an emulator (which uses the kernel's Xbox One S HID quirk path instead of Steam Input) re-shifts the bits and Start reads as RB.
+
+Root cause: our descriptor uses the xpadneo-patched contiguous Buttons 1-15 layout, but we advertise as Microsoft VID 0x045E / PID 0x02E0 (Xbox One S BT Classic). Hosts that key off PID and parse with the legacy "gappy" Microsoft layout see X press → reserved bit (silent), Y press → Xbox X, Start press → RB.
+
+### What Changed
+
+Branched off `vmu_visuals` to `ble-profiles`. Introduced a runtime-selectable profile system, two profiles, and a triple-press toggle.
+
+**New: `src/ble/profile.rs`**
+- `Profile` struct bundles GAP name, scan response, manufacturer/model, VID/PID, HID descriptor, byte-layout serializer, VMU glyph + label
+- `ProfileId` enum (`Retro = 0`, `Desk = 1`) with `next()` cycling
+- `PROFILE_RETRO`: PID 0x02E0, original MS gappy layout, `to_bytes_ms` serializer, OG Xbox X glyph
+- `PROFILE_DESK`: PID 0x0B20 (1708 BLE post-FW 5.11), contiguous layout, `to_bytes` serializer, DC swirl glyph
+- Compile-time guards on scan-response sizes and HID descriptor sizes (≤ 512 B)
+
+**Refactored: `src/ble/softdevice.rs`**
+- Replaced `is_dreamcast` bool plumbing with `&'static Profile`
+- Removed dual `NAME_*` / `SCAN_DATA_*` statics + `IS_DREAMCAST_NAME` atomic
+- Added `set_profile()` / `get_profile()` over `AtomicPtr<Profile>`, defaulting to `&PROFILE_RETRO`
+
+**Refactored: `src/ble/hid.rs`**
+- Renamed `HID_REPORT_DESCRIPTOR` → `HID_REPORT_DESCRIPTOR_DESK`
+- Added `HID_REPORT_DESCRIPTOR_RETRO` — original MS gappy button section (Buttons 1-10 with explicit constant gaps at byte 13 bits 2/5 and byte 14 bits 0-1/4/7), no AC Back declaration
+- `GamepadServer::init(profile)` reads manufacturer/model/HID descriptor/PnP from the profile
+- `send_report` calls the profile's serializer instead of `to_bytes` directly
+- Also folded in two pre-existing descriptor-compliance fixes from working tree:
+  - `Logical Maximum (65535)` switched from 4-byte form `0x27 FF FF 00 00` to 2-byte `0x26 FF FF` (matches real Xbox One S)
+  - Report ID 0x02 (Guide) flattened — removed nested `Collection (Application)` (invalid HID)
+
+**Added: `to_bytes_ms()` in `maple-protocol/src/xbox_hid.rs`**
+- Remaps logical contiguous button bits to gappy MS positions
+- Byte 13: A(0) B(1) _(2) X(3) Y(4) _(5) LB(6) RB(7)
+- Byte 14: _(0,1) View(2) Menu(3) _(4) L3(5) R3(6) _(7)
+- 3 new unit tests verify the bit remapping (all 27 maple-protocol tests pass on host)
+
+**Refactored: `src/ble/flash_bond.rs`**
+- Removed `load_name_preference` / `save_name_preference` (and `StoredNamePref`)
+- Added `load_profile() -> ProfileId` / `save_profile(flash, ProfileId)` using new `StoredProfile` struct + `PROFILE_MAGIC = 0xB10F_C0DE`
+- Reuses the same flash address (0xFD000); legacy `NAME_MAGIC` is ignored — fresh install or post-upgrade defaults to RETRO
+- One-time forced re-pair for users upgrading from the old name-toggle build (descriptor changed → host cache invalidated either way)
+
+**Refactored: `src/button.rs` + `src/ble/task.rs` + `src/lib.rs`**
+- Replaced `NAME_TOGGLE: Signal<bool>` with `PROFILE_CHANGE: Signal<ProfileId>`
+- Triple-press handler now toggles profile (via `ProfileId::next()`) and signals the new id
+- BLE task consumer saves profile to flash and `sys_reset()`s — same path as before
+
+**Added: VMU profile splash (`src/vmu.rs`)**
+- 16x16 monochrome glyphs: `GLYPH_RETRO` (4-point Xbox X silhouette), `GLYPH_DESK` (DC swirl)
+- 5x7 bitmap font for the 7 letters needed (R, E, T, O, D, S, K)
+- `build_profile_splash(glyph, label)` composites glyph centered horizontally with label below
+- Main poll loop shows splash for the first 30s of every boot, then transitions to the rotating pulsar
+- Compile-time guard verifies glyph + label fit vertically within the 32-row LCD
+
+### Bit-Layout Sanity Check (RETRO profile, post-fix)
+
+| User presses | Firmware sets bit  | Wire byte/bit              | BlueRetro reads as |
+| ------------ | ------------------ | -------------------------- | ------------------ |
+| A            | logical 0          | byte 13 bit 0              | A ✓                |
+| B            | logical 1          | byte 13 bit 1              | B ✓                |
+| X            | logical 2          | byte 13 bit 3              | X ✓                |
+| Y            | logical 3          | byte 13 bit 4              | Y ✓                |
+| Start        | logical 7          | byte 14 bit 3              | Menu ✓             |
+| LB/RB        | logical 4/5        | byte 13 bit 6/7            | LB/RB ✓            |
+| View         | logical 6          | byte 14 bit 2              | View ✓             |
+
+### Verification
+- `scripts/ci.sh` — all checks passed (fmt, maple-protocol tests 27/27, clippy on both crates, XIAO+RTT release, XIAO production release, DK release)
+- Functional test on hardware: pending — flashing to nRF52840 DK first, then XIAO.
+
+### Open Items
+- Hardware verification: confirm BlueRetro accepts RETRO profile and X/Y/Start map correctly on a Dreamcast
+- Hardware verification: confirm DESK profile still works with Steam Deck / Steam Input
+- VMU glyph art: hand-drawn pixel work — may want to iterate after seeing rendered output on the actual LCD
+- Triple-press cycles through 2 profiles only; if a third profile is added later, switch to a boot-time hold gesture (industry-standard pattern from 8BitDo / Brook Wingman)
+
+---
+
+## Session: 2026-05-08 (wake/sleep behavior + power tuning)
+
+### Context
+Initial profile-system testing revealed three connected issues with the
+disconnected/idle behavior:
+
+1. Steam Deck was being woken from sleep by our controller advertising for
+   reconnect — annoying when the user *wanted* the Deck to stay asleep.
+2. Controller would not wake the Deck on demand after disconnect (initial
+   silent-after-disconnect approach).
+3. The Deck's "Disconnect" button caused a flapping reconnect because we
+   immediately re-advertised, which the Deck saw as a wake event and
+   reconnected to.
+
+The user wants Xbox/PS-style behavior: any controller button press (face
+button, trigger, stick, etc.) should wake the host. Idle drift should not.
+
+### What Changed
+
+**HID hygiene (no more idle wake events):**
+- `controller_state.rs`: `state_changed` now applies the same deadzone the
+  output side uses. If both prev and current stick values are within ±5 of
+  center, treated as unchanged (post-clamp HID output is identical anyway).
+  Triggers below the noise floor (≤5) likewise treated as no-change.
+  3 new unit tests cover the drift-aware behavior.
+- `ble/hid.rs`: wire-level dedup. Cache the last-sent 16-byte report; skip
+  `report_notify` if the new bytes match. `reset_report_cache()` exported
+  and called from `transition_after_disconnect` so the first report after
+  reconnect always goes out.
+
+**Disconnect-reason classification:**
+- `Connection::disconnect_reason()` exposes the HCI status. Earlier debug-log
+  note saying it didn't was stale.
+- New `DisconnectOutcome` enum: `SyncRequested | HostIntentional | Lost`.
+  `handle_connection` returns this instead of a `bool`.
+- HCI codes 0x13 (`REMOTE_USER_TERMINATED_CONNECTION`), 0x14
+  (`...LOW_RESOURCES`), 0x15 (`...POWER_OFF`) → `HostIntentional` →
+  go silent until explicit wake gesture.
+- Anything else (timeout, error) → `Lost` → 10s reconnect burst.
+
+**Wake gestures (Xbox/PS pattern):**
+- New `WAKE_REQUEST: Signal<()>` in `lib.rs`.
+- Sync-button short-press fires `WAKE_REQUEST`.
+- BLE task in disconnected state: 10s fast-advertising burst on boot, then
+  silent until `WAKE_REQUEST` or `SYNC_MODE` arrives. After total
+  `SLEEP_TIMEOUT_MS` of disconnect, System Off (XIAO) / Idle (DK).
+- New `had_connection: bool` flag — boot does Phase A automatically; after
+  the first successful connection, only explicit gestures advertise.
+- Stale `WAKE_REQUEST` drained before phase B so a wake fired during phase A
+  doesn't immediately re-trigger.
+
+**Controller-input wake (the real Xbox/PS behavior):**
+- Phase 1 wait loop now polls Maple periodically. Any face button press,
+  trigger > 20, or stick deflection > ±30 fires `WAKE_REQUEST`.
+- Adaptive interval: 1.5s base, 5s backoff after 3 consecutive bus timeouts
+  (no controller plugged in).
+- Bus is woken from low-power for each poll, restored after.
+- Estimated avg current: ~0.06 mA when controller plugged in, ~0.018 mA when
+  not. On 500mAh: ~5-7% reduction in disconnected idle time worst case.
+
+**Goodbye splash + System Off:**
+- Button task signals `GOODBYE_PENDING` at the 7s hold mark (during the
+  hold, not after release). Main task — Phase 1 *or* Phase 3 — picks it up.
+- Phase 3: state machine `Render → Wait → Hold(deadline)` using the existing
+  dirty-flag write path so BYE gets the same radio-idle waiting / retry as
+  the regular pulsar writes. Holds ≥1s after the write lands, then sleeps.
+- Phase 1: wakes the bus, retries the VMU write up to 5×, holds 1s, sleeps.
+- Goodbye flow ungated from `board-xiao` so the dev kit can also exercise
+  the path; DK halts via `cortex_m::asm::wfi()` after BYE since it has no
+  System Off.
+
+**VMU sync/goodbye splashes:**
+- Added Y/N/C/B letters to the 5×7 font (X already existed).
+- New `draw_text_2x` + `text_width_2x` for 10×14 scaled rendering.
+- New `build_message_splash(text)` for centered single-line 2× text.
+- VMU LCD persistence: write once, the LCD keeps showing it without us
+  refreshing — so the SYNC splash written before Phase 3 exit persists
+  through Phase 1 without needing Phase 1 VMU write loop.
+
+**Naming cleanup:**
+- `RETRO`/`DESK` → `STD`/`EXT` (RETRO was confusing — its descriptor is
+  actually older than DESK's, but the labels were chosen by target use case
+  not chronology). `STD` is the legacy Microsoft layout most parsers
+  hardcode against; `EXT` is the newer xpadneo-patched layout.
+
+### Verification
+- `scripts/ci.sh` — fmt, 30 tests pass, clippy on both crates, all three
+  release builds (xiao+rtt, xiao production, dk).
+- Hardware verification: in progress on DK. Sync-button wake confirmed
+  working; flash-on-reset wakes the Deck (proves BLE wake path works on
+  this hardware). Goodbye + System Off path confirmed displaying BYE on DK
+  (halts via WFI).
+
+### Open Items
+- Controller-input wake: not yet hardware-tested. Should fire `WAKE_REQUEST`
+  within 1.5s of any face button / trigger / stick movement.
+- Battery measurement: estimates above are theoretical; need FNB58 or PPK2
+  to confirm.
+- Directed-advertising for reconnect (`NonscannableDirectedHighDuty { peer }`)
+  not implemented yet — could be a follow-up if undirected reconnect proves
+  unreliable on some hosts.
+
+---
+
 ## Current State
 
 **Date:** 2026-02-17

@@ -68,8 +68,22 @@ pub static CONTROLLER_STATE: Signal<CriticalSectionRawMutex, maple::ControllerSt
 /// Signal to trigger sync/pairing mode (clears bonds).
 pub static SYNC_MODE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// Signal to toggle device name and reset. Carries new `is_dreamcast` value.
-pub static NAME_TOGGLE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+/// Signal to switch active BLE profile and reset. Carries the new `ProfileId`.
+pub static PROFILE_CHANGE: Signal<CriticalSectionRawMutex, ble::ProfileId> = Signal::new();
+
+/// Set by the button task on a 10-second hold to request a graceful System Off.
+/// The main task picks this up, writes a "BYE" splash to the VMU, briefly
+/// holds, then enters System Off. Avoids sleeping mid-write so the goodbye
+/// frame actually lands on the LCD.
+pub static GOODBYE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Signaled by the button task on any short sync-button press. The BLE task
+/// uses this as the explicit "wake from silent reconnect-wait" trigger,
+/// matching how Xbox / PlayStation controllers use their dedicated wake
+/// buttons. Without this signal, the BLE task stays silent after the initial
+/// reconnect window so a sleeping host isn't woken by ongoing advertising.
+pub static WAKE_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Battery level percentage (0-100) for BLE reporting.
 /// Signals 0xFF when charging (tells BLE task to report "charging" state).

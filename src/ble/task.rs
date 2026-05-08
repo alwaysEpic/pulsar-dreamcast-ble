@@ -14,7 +14,7 @@ use crate::ble::{
     GamepadServer,
 };
 use crate::maple::ControllerState;
-use crate::{CONTROLLER_STATE, NAME_TOGGLE, SYNC_MODE};
+use crate::{CONTROLLER_STATE, PROFILE_CHANGE, SYNC_MODE, WAKE_REQUEST};
 
 #[cfg(feature = "board-xiao")]
 use crate::BATTERY_LEVEL;
@@ -38,16 +38,24 @@ pub async fn ble_task(
     // Sync mode timeout: 60 seconds
     const SYNC_TIMEOUT_MS: u64 = 60_000;
 
+    // Tracks whether we've completed at least one successful connection during
+    // this power session. Boot does an initial reconnect burst; every later
+    // disconnect is treated as user-intentional and stays silent until an
+    // explicit WAKE_REQUEST or SYNC_MODE arrives. Without this, the Deck's
+    // "Disconnect" button would just immediately re-pair, and that's exactly
+    // the loop the user complained about.
+    let mut had_connection = false;
+
     loop {
-        // Check for name toggle request (non-blocking)
-        if NAME_TOGGLE.signaled() {
-            let new_pref = NAME_TOGGLE.wait().await;
+        // Check for profile switch request (non-blocking)
+        if PROFILE_CHANGE.signaled() {
+            let next = PROFILE_CHANGE.wait().await;
             log!(
-                "NAME: Toggling to {}",
-                if new_pref { "Dreamcast" } else { "Xbox" }
+                "PROFILE: Switching to {}",
+                core::str::from_utf8(next.profile().vmu_label).unwrap_or("?")
             );
-            let _ = crate::ble::flash_bond::save_name_preference(&mut flash, new_pref).await;
-            // Reset to apply new name (set at SoftDevice init)
+            let _ = crate::ble::flash_bond::save_profile(&mut flash, next).await;
+            // Reset to bring up the SoftDevice with the new profile's descriptor.
             cortex_m::peripheral::SCB::sys_reset();
         }
 
@@ -55,47 +63,82 @@ pub async fn ble_task(
 
         match state {
             ConnectionState::Reconnecting | ConnectionState::Idle => {
-                // Try to reconnect to bonded device (not discoverable)
+                // Reconnect strategy (matches Xbox / PS controller behavior):
+                //  1. One fast-advertising burst (10s, configured in softdevice
+                //     advertising config) to catch a brief disconnect or a host
+                //     that's still awake.
+                //  2. If that times out without a connection, go silent. Don't
+                //     keep advertising — it'd repeatedly wake a sleeping host.
+                //  3. Wait for an explicit wake signal (sync-button short press
+                //     -> WAKE_REQUEST, or 3s hold -> SYNC_MODE).
+                //  4. After SLEEP_TIMEOUT_MS total disconnected time, sleep
+                //     (XIAO) or fall to Idle (DK).
+                let total_start = Instant::now();
                 let conn = if bonder.has_bond() {
-                    // Have a bonded device - advertise in reconnect mode (not discoverable)
-                    let start = Instant::now();
-
+                    // On boot, do one initial reconnect burst. After any
+                    // successful connection in this session, a disconnect is
+                    // treated as user-intentional — we go straight to silent
+                    // wait until SYNC_MODE or WAKE_REQUEST arrives.
+                    let mut wake_pending = !had_connection;
                     loop {
-                        // Use fast advertising (20ms) for first 5s, then slow (100ms)
-                        let mode = if start.elapsed().as_millis() < 5000 {
-                            AdvertiseMode::ReconnectFast
-                        } else {
-                            AdvertiseMode::Reconnect
-                        };
-                        let adv_future = advertise(sd, server, bonder, mode);
-                        let sync_future = SYNC_MODE.wait();
+                        if wake_pending {
+                            // Phase A: active reconnect window
+                            let adv_future =
+                                advertise(sd, server, bonder, AdvertiseMode::ReconnectFast);
+                            let sync_future = SYNC_MODE.wait();
+                            match embassy_futures::select::select(adv_future, sync_future).await {
+                                embassy_futures::select::Either::First(Ok(c)) => break Some(c),
+                                embassy_futures::select::Either::First(Err(_)) => {
+                                    // Phase A timed out without a connection.
+                                    // Fall through to the timeout check and
+                                    // then Phase B (silent wait). We don't
+                                    // clear `wake_pending` because Phase B's
+                                    // wake-handler is what re-arms it when the
+                                    // user explicitly asks to retry.
+                                    log!("BLE: Reconnect window elapsed, going silent");
+                                }
+                                embassy_futures::select::Either::Second(()) => {
+                                    log!("BLE: Sync mode requested");
+                                    bonder.clear();
+                                    let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
+                                    set_connection_state(ConnectionState::SyncMode);
+                                    break None;
+                                }
+                            }
+                        }
 
-                        match embassy_futures::select::select(adv_future, sync_future).await {
-                            embassy_futures::select::Either::First(result) => {
-                                if let Ok(c) = result {
-                                    break Some(c);
+                        // Total-disconnect timeout: bail to System Off (XIAO) or
+                        // Idle (DK).
+                        if total_start.elapsed().as_millis() >= crate::SLEEP_TIMEOUT_MS {
+                            #[cfg(feature = "board-xiao")]
+                            {
+                                log!("BLE: Reconnect timeout, entering System Off");
+                                unsafe {
+                                    crate::board::enter_system_off();
                                 }
-                                // Check timeout in Reconnecting state
-                                if get_connection_state() == ConnectionState::Reconnecting
-                                    && start.elapsed().as_millis() >= crate::SLEEP_TIMEOUT_MS
-                                {
-                                    #[cfg(feature = "board-xiao")]
-                                    {
-                                        log!("BLE: Reconnect timeout, entering System Off");
-                                        unsafe {
-                                            crate::board::enter_system_off();
-                                        }
-                                    }
-                                    #[cfg(not(feature = "board-xiao"))]
-                                    {
-                                        log!("BLE: Reconnect timeout, entering idle");
-                                        set_connection_state(ConnectionState::Idle);
-                                    }
-                                }
-                                Timer::after(Duration::from_millis(500)).await;
+                            }
+                            #[cfg(not(feature = "board-xiao"))]
+                            {
+                                log!("BLE: Reconnect timeout, entering idle");
+                                set_connection_state(ConnectionState::Idle);
+                                break None;
+                            }
+                        }
+
+                        // Phase B: silent, waiting for an explicit wake gesture.
+                        // Drain any stale WAKE_REQUEST so we don't immediately
+                        // re-trigger from a wake that happened during phase A.
+                        if WAKE_REQUEST.signaled() {
+                            WAKE_REQUEST.wait().await;
+                        }
+                        let wake_future = WAKE_REQUEST.wait();
+                        let sync_future = SYNC_MODE.wait();
+                        match embassy_futures::select::select(wake_future, sync_future).await {
+                            embassy_futures::select::Either::First(()) => {
+                                log!("BLE: Wake requested, advertising");
+                                wake_pending = true;
                             }
                             embassy_futures::select::Either::Second(()) => {
-                                // Sync mode triggered
                                 log!("BLE: Sync mode requested");
                                 bonder.clear();
                                 let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
@@ -113,13 +156,29 @@ pub async fn ble_task(
 
                 if let Some(conn) = conn {
                     set_connection_state(ConnectionState::Connected);
-                    let sync = handle_connection(sd, server, bonder, &mut flash, conn).await;
-                    if sync {
-                        bonder.clear();
-                        let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
-                        set_connection_state(ConnectionState::SyncMode);
-                    } else {
-                        transition_after_disconnect(bonder);
+                    let outcome = handle_connection(sd, server, bonder, &mut flash, conn).await;
+                    match outcome {
+                        DisconnectOutcome::SyncRequested => {
+                            bonder.clear();
+                            let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
+                            set_connection_state(ConnectionState::SyncMode);
+                        }
+                        DisconnectOutcome::HostIntentional => {
+                            // User wants the disconnect to stick (clicked
+                            // Disconnect, Deck went to sleep, etc.). Skip the
+                            // auto-reconnect burst — wait for an explicit
+                            // wake gesture instead.
+                            log!("BLE: Host-intentional disconnect, going silent");
+                            had_connection = true;
+                            transition_after_disconnect(bonder);
+                        }
+                        DisconnectOutcome::Lost => {
+                            // Accidental — try to reconnect once. Leave
+                            // had_connection unchanged so the next iteration
+                            // runs Phase A.
+                            log!("BLE: Connection lost, attempting reconnect");
+                            transition_after_disconnect(bonder);
+                        }
                     }
                 }
             }
@@ -167,13 +226,22 @@ pub async fn ble_task(
 
                 if let Some(conn) = conn {
                     set_connection_state(ConnectionState::Connected);
-                    let sync = handle_connection(sd, server, bonder, &mut flash, conn).await;
-                    if sync {
-                        bonder.clear();
-                        let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
-                        set_connection_state(ConnectionState::SyncMode);
-                    } else {
-                        transition_after_disconnect(bonder);
+                    let outcome = handle_connection(sd, server, bonder, &mut flash, conn).await;
+                    match outcome {
+                        DisconnectOutcome::SyncRequested => {
+                            bonder.clear();
+                            let _ = crate::ble::flash_bond::clear_bond(&mut flash).await;
+                            set_connection_state(ConnectionState::SyncMode);
+                        }
+                        DisconnectOutcome::HostIntentional => {
+                            log!("BLE: Host-intentional disconnect, going silent");
+                            had_connection = true;
+                            transition_after_disconnect(bonder);
+                        }
+                        DisconnectOutcome::Lost => {
+                            log!("BLE: Connection lost, attempting reconnect");
+                            transition_after_disconnect(bonder);
+                        }
                     }
                 }
             }
@@ -186,8 +254,23 @@ pub async fn ble_task(
     }
 }
 
+/// Why a session ended. Drives the "auto-reconnect or stay silent" decision
+/// in the BLE task loop.
+enum DisconnectOutcome {
+    /// User invoked sync mode while connected — clear bond + advertise discoverable.
+    SyncRequested,
+    /// Host explicitly terminated (HCI 0x13 / 0x14 / 0x15) — user wants the
+    /// disconnect to stick. Don't auto-advertise; wait for a wake gesture.
+    HostIntentional,
+    /// Connection was lost (timeout, range, error) — accidental, OK to retry.
+    Lost,
+}
+
 /// Update connection state after a disconnection.
 fn transition_after_disconnect(bonder: &Bonder) {
+    // Drop the wire-level dedup cache — a new connection has no prior state
+    // to compare against, so the first HID report must always go out.
+    crate::ble::hid::reset_report_cache();
     if bonder.has_bond() {
         set_connection_state(ConnectionState::Reconnecting);
     } else {
@@ -196,7 +279,7 @@ fn transition_after_disconnect(bonder: &Bonder) {
 }
 
 /// Handle an active BLE connection.
-/// Returns `true` if disconnected due to sync mode request.
+/// Returns the reason the session ended.
 #[allow(clippy::too_many_lines)]
 async fn handle_connection(
     _sd: &'static Softdevice,
@@ -204,14 +287,14 @@ async fn handle_connection(
     bonder: &'static Bonder,
     flash: &mut nrf_softdevice::Flash,
     conn: nrf_softdevice::ble::Connection,
-) -> bool {
+) -> DisconnectOutcome {
     log!("BLE: Connected!");
 
     // If sync was requested before we got here, honor it immediately
     if SYNC_MODE.signaled() {
         SYNC_MODE.wait().await;
         log!("BLE: Sync requested during connection setup");
-        return true;
+        return DisconnectOutcome::SyncRequested;
     }
 
     bonder.load_sys_attrs(&conn);
@@ -300,15 +383,15 @@ async fn handle_connection(
                 break;
             }
         }
-        // Keep future alive, checking for name toggle requests
+        // Keep future alive, checking for profile switch requests
         loop {
-            if NAME_TOGGLE.signaled() {
-                let new_pref = NAME_TOGGLE.wait().await;
+            if PROFILE_CHANGE.signaled() {
+                let next = PROFILE_CHANGE.wait().await;
                 log!(
-                    "NAME: Toggling to {}",
-                    if new_pref { "Dreamcast" } else { "Xbox" }
+                    "PROFILE: Switching to {}",
+                    core::str::from_utf8(next.profile().vmu_label).unwrap_or("?")
                 );
-                let _ = crate::ble::flash_bond::save_name_preference(flash, new_pref).await;
+                let _ = crate::ble::flash_bond::save_profile(flash, next).await;
                 cortex_m::peripheral::SCB::sys_reset();
             }
             Timer::after(Duration::from_millis(100)).await;
@@ -391,17 +474,31 @@ async fn handle_connection(
         let _ = conn.disconnect();
         // Give the host time to process the disconnect
         Timer::after(Duration::from_millis(1000)).await;
-    } else {
-        bonder.save_sys_attrs(&conn);
-        if let Some((master_id, enc_info, peer_id)) = bonder.get_bond_data() {
-            let sys_attrs = bonder.get_sys_attrs();
-            let _ = crate::ble::flash_bond::save_bond(
-                flash, &master_id, &enc_info, &peer_id, &sys_attrs,
-            )
-            .await;
-        }
-        Timer::after(Duration::from_millis(500)).await;
+        return DisconnectOutcome::SyncRequested;
     }
 
-    sync_requested
+    bonder.save_sys_attrs(&conn);
+    if let Some((master_id, enc_info, peer_id)) = bonder.get_bond_data() {
+        let sys_attrs = bonder.get_sys_attrs();
+        let _ =
+            crate::ble::flash_bond::save_bond(flash, &master_id, &enc_info, &peer_id, &sys_attrs)
+                .await;
+    }
+    Timer::after(Duration::from_millis(500)).await;
+
+    // Read the HCI disconnect reason from the (now-disconnected) Connection
+    // and classify. Host-initiated termination (0x13 user, 0x14 low resources,
+    // 0x15 power off) means the user wants the disconnect to stick. Anything
+    // else (timeout, error) is treated as accidental — eligible for auto retry.
+    use nrf_softdevice::ble::HciStatus;
+    let reason = conn.disconnect_reason();
+    log!("BLE: Disconnect reason = {:?}", reason);
+    match reason {
+        Some(HciStatus::REMOTE_USER_TERMINATED_CONNECTION)
+        | Some(HciStatus::REMOTE_DEV_TERMINATION_DUE_TO_LOW_RESOURCES)
+        | Some(HciStatus::REMOTE_DEV_TERMINATION_DUE_TO_POWER_OFF) => {
+            DisconnectOutcome::HostIntentional
+        }
+        _ => DisconnectOutcome::Lost,
+    }
 }

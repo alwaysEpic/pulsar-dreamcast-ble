@@ -8,13 +8,15 @@
 
 pub mod flash_bond;
 pub mod hid;
+pub mod profile;
 pub mod security;
 pub mod softdevice;
 pub mod task;
 
 pub use hid::GamepadServer;
+pub use profile::{Profile, ProfileId, PROFILE_EXT, PROFILE_STD};
 pub use security::Bonder;
 pub use softdevice::{
-    advertise, get_connection_state, init_softdevice, set_connection_state, set_name_mode,
+    advertise, get_connection_state, init_softdevice, set_connection_state, set_profile,
     AdvertiseMode, ConnectionState,
 };

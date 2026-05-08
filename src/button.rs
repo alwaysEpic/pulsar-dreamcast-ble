@@ -8,7 +8,7 @@ use embassy_nrf::gpio::{Input, Output};
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::ble::{get_connection_state, ConnectionState};
-use crate::{NAME_TOGGLE, SYNC_MODE};
+use crate::{PROFILE_CHANGE, SYNC_MODE};
 
 const HOLD_SYNC_MS: u64 = 2000;
 const HOLD_SLEEP_MS: u64 = 7000;
@@ -21,6 +21,8 @@ enum HoldResult {
     ShortPress,
     /// Held 3s — sync mode triggered.
     SyncMode,
+    /// Held 10s — goodbye splash + System Off in progress.
+    Goodbye,
 }
 
 /// Wait while button is held, blinking LED and checking for sync (3s) / sleep (10s).
@@ -55,16 +57,23 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
         }
 
         if elapsed >= HOLD_SLEEP_MS {
-            log!("SYNC: 10s hold — waiting for release, then System Off");
+            log!("SYNC: 10s hold — sleep committed, rendering goodbye");
             // Solid LED to confirm sleep is committed
             led.set_low();
+
+            // Set the flag immediately (during the hold, not after release).
+            // The main task — whether it's in Phase 1 (waiting for BLE) or
+            // Phase 3 (connected) — picks this up and handles the BYE splash
+            // + System Off transition. Both boards see this flag; on XIAO the
+            // main task will actually sleep, on DK it halts after BYE so the
+            // goodbye flow is testable on the dev kit too.
+            crate::GOODBYE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+
+            // Wait for release (LED stays solid as visual confirmation).
             while button.is_low() {
                 Timer::after(Duration::from_millis(50)).await;
             }
-            #[cfg(feature = "board-xiao")]
-            unsafe {
-                crate::board::enter_system_off();
-            }
+            return HoldResult::Goodbye;
         }
 
         if !past_sync_threshold && elapsed >= HOLD_SYNC_MS {
@@ -85,13 +94,14 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
     }
 }
 
-/// Handle triple-press detection and name toggle.
+/// Handle triple-press detection and profile toggle.
 async fn handle_triple_press(led: &mut Output<'static>) {
-    let current = crate::ble::flash_bond::load_name_preference();
-    let new_pref = !current;
+    let current = crate::ble::flash_bond::load_profile();
+    let next = current.next();
     log!(
-        "NAME: Triple-press! Switching to {}",
-        if new_pref { "Dreamcast" } else { "Xbox" }
+        "PROFILE: Triple-press! Switching {} -> {}",
+        core::str::from_utf8(current.profile().vmu_label).unwrap_or("?"),
+        core::str::from_utf8(next.profile().vmu_label).unwrap_or("?"),
     );
 
     // LED confirmation: 5 rapid blinks
@@ -102,14 +112,14 @@ async fn handle_triple_press(led: &mut Output<'static>) {
         Timer::after(Duration::from_millis(50)).await;
     }
 
-    NAME_TOGGLE.signal(new_pref);
+    PROFILE_CHANGE.signal(next);
 }
 
 /// Sync button monitoring task.
 ///
 /// - Hold 3 seconds: enter pairing/sync mode
 /// - Hold 10 seconds: enter System Off (manual sleep)
-/// - Triple-press within 2 seconds: toggle device name (Xbox <-> Dreamcast) and reset
+/// - Triple-press within 2 seconds: toggle BLE profile (STD <-> EXT) and reset
 ///
 /// LED behavior based on `ConnectionState`:
 /// - `Idle`/`Reconnecting`: OFF
@@ -162,10 +172,17 @@ pub async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) 
 
         // Button pressed — detect hold gesture
         match handle_button_hold(&button, &mut led).await {
-            HoldResult::SyncMode => {
+            HoldResult::SyncMode | HoldResult::Goodbye => {
                 press_count = 0;
             }
             HoldResult::ShortPress => {
+                // Every short press also signals wake, matching the Xbox / PS
+                // pattern where the wake button is also the home button.
+                // While disconnected this brings the BLE task back from its
+                // silent reconnect-wait. While connected it's a no-op.
+                log!("BUTTON: Short press, requesting wake");
+                crate::WAKE_REQUEST.signal(());
+
                 if press_count == 0 {
                     first_press_time = Instant::now();
                 }

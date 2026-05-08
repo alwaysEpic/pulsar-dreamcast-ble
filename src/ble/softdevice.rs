@@ -4,11 +4,12 @@
 //! `SoftDevice` initialization and BLE advertising.
 
 use crate::log;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use nrf_softdevice::ble::{peripheral, Connection};
 use nrf_softdevice::{raw, Softdevice};
 
 use crate::ble::hid::GamepadServer;
+use crate::ble::profile::{Profile, PROFILE_STD};
 use crate::ble::security::Bonder;
 
 /// Connection state machine states.
@@ -51,19 +52,12 @@ pub fn set_connection_state(state: ConnectionState) {
     CONNECTION_STATE.store(state as u8, Ordering::Relaxed);
 }
 
-/// Device name for Xbox compatibility (24 chars).
-static NAME_XBOX: &[u8] = b"Xbox Wireless Controller\0";
-/// Device name for Dreamcast branding (29 chars).
-static NAME_DREAMCAST: &[u8] = b"Dreamcast Wireless Controller\0";
-
 /// `SoftDevice` configuration for BLE peripheral mode.
 #[allow(clippy::cast_possible_truncation)] // SoftDevice FFI constants are small values
-fn softdevice_config(is_dreamcast: bool) -> nrf_softdevice::Config {
-    let (name, name_len) = if is_dreamcast {
-        (NAME_DREAMCAST.as_ptr(), (NAME_DREAMCAST.len() - 1) as u16)
-    } else {
-        (NAME_XBOX.as_ptr(), (NAME_XBOX.len() - 1) as u16)
-    };
+fn softdevice_config(profile: &Profile) -> nrf_softdevice::Config {
+    let name = profile.gap_name.as_ptr();
+    // Subtract trailing NUL — SoftDevice expects unterminated length.
+    let name_len = (profile.gap_name.len() - 1) as u16;
 
     nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
@@ -104,14 +98,14 @@ fn softdevice_config(is_dreamcast: bool) -> nrf_softdevice::Config {
 
 /// Initialize the `SoftDevice` and return a mutable reference to it.
 ///
-/// `is_dreamcast`: if true, advertises as "Dreamcast Wireless Controller";
-/// otherwise "Xbox Wireless Controller" (compatible with iBlueControlMod).
+/// `profile`: active profile selected at boot. Determines GAP name, scan
+/// response, manufacturer/model, VID/PID, and HID descriptor.
 ///
 /// # Safety
 /// This must be called exactly once at program start, before any BLE operations.
 #[must_use]
-pub fn init_softdevice(is_dreamcast: bool) -> &'static mut Softdevice {
-    let config = softdevice_config(is_dreamcast);
+pub fn init_softdevice(profile: &Profile) -> &'static mut Softdevice {
+    let config = softdevice_config(profile);
     Softdevice::enable(&config)
 }
 
@@ -158,39 +152,26 @@ static ADV_DATA_RECONNECT: [u8; 13] = [
     0x0F, 0x18,        // Battery Service (0x180F)
 ];
 
-// Compile-time guards: scan response size must be 1 (length) + 1 (type) + name chars.
-const _: () = assert!(SCAN_DATA_XBOX.len() == NAME_XBOX.len() - 1 + 2); // -1 for NUL, +2 for AD header
-const _: () = assert!(SCAN_DATA_DREAMCAST.len() == NAME_DREAMCAST.len() - 1 + 2);
+/// Active profile pointer, set at init and read during advertising.
+/// Defaults to `PROFILE_STD` so calls before `set_profile` still resolve.
+static ACTIVE_PROFILE: AtomicPtr<Profile> =
+    AtomicPtr::new(&PROFILE_STD as *const Profile as *mut Profile);
 
-/// Scan response with device name (Xbox Wireless Controller).
-#[rustfmt::skip]
-static SCAN_DATA_XBOX: [u8; 26] = [
-    // Complete Local Name
-    0x19,              // Length: 25 bytes follow (1 type + 24 name chars)
-    0x09,              // AD Type: Complete Local Name
-    b'X', b'b', b'o', b'x', b' ',
-    b'W', b'i', b'r', b'e', b'l', b'e', b's', b's', b' ',
-    b'C', b'o', b'n', b't', b'r', b'o', b'l', b'l', b'e', b'r',
-];
+/// Set the active profile (called once at init before advertising starts).
+pub fn set_profile(profile: &'static Profile) {
+    ACTIVE_PROFILE.store(
+        core::ptr::from_ref::<Profile>(profile).cast_mut(),
+        Ordering::Relaxed,
+    );
+}
 
-/// Scan response with device name (Dreamcast Wireless Controller).
-#[rustfmt::skip]
-static SCAN_DATA_DREAMCAST: [u8; 31] = [
-    // Complete Local Name
-    0x1E,              // Length: 30 bytes follow (1 type + 29 name chars)
-    0x09,              // AD Type: Complete Local Name
-    b'D', b'r', b'e', b'a', b'm', b'c', b'a', b's', b't', b' ',
-    b'W', b'i', b'r', b'e', b'l', b'e', b's', b's', b' ',
-    b'C', b'o', b'n', b't', b'r', b'o', b'l', b'l', b'e', b'r',
-];
-
-/// Whether we're advertising as Dreamcast (set at init, read during advertising).
-static IS_DREAMCAST_NAME: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Set the name mode (called once at init before advertising starts).
-pub fn set_name_mode(is_dreamcast: bool) {
-    IS_DREAMCAST_NAME.store(is_dreamcast, core::sync::atomic::Ordering::Relaxed);
+/// Get the active profile.
+#[must_use]
+pub fn get_profile() -> &'static Profile {
+    let ptr = ACTIVE_PROFILE.load(Ordering::Relaxed);
+    // SAFETY: ACTIVE_PROFILE is initialized to a valid 'static reference and
+    // only ever reassigned via set_profile() which takes a 'static reference.
+    unsafe { &*ptr }
 }
 
 /// Advertising mode determines visibility and connection behavior.
@@ -265,11 +246,7 @@ pub async fn advertise(
         }
     };
 
-    let scan_data: &[u8] = if IS_DREAMCAST_NAME.load(core::sync::atomic::Ordering::Relaxed) {
-        &SCAN_DATA_DREAMCAST
-    } else {
-        &SCAN_DATA_XBOX
-    };
+    let scan_data: &[u8] = get_profile().scan_response;
 
     let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
         adv_data,
