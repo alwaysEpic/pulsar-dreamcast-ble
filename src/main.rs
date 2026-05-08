@@ -395,9 +395,16 @@ async fn main(spawner: Spawner) {
         #[derive(Clone, Copy)]
         enum GoodbyeState {
             Render,        // need to swap framebuffer to BYE
-            Wait,          // BYE in framebuffer, waiting for write to land
+            Wait(Instant), // BYE in framebuffer, waiting for write or timeout
             Hold(Instant), // BYE on LCD, holding before sleep
         }
+        // Maximum time to wait for the dirty flag to clear before giving up
+        // and proceeding to Hold anyway. write_vmu_lcd() can return false
+        // (no Ack) even when the LCD bytes landed — typically because BLE
+        // radio interference corrupted the controller's reply. Without this
+        // fallback, the goodbye state machine would loop in Wait forever and
+        // never reach enter_system_off().
+        const GOODBYE_WAIT_TIMEOUT_MS: u64 = 500;
         let mut goodbye_state: Option<GoodbyeState> = None;
 
         loop {
@@ -412,13 +419,22 @@ async fn main(spawner: Spawner) {
                     Some(GoodbyeState::Render) => {
                         vmu_framebuf = pulsar_dreamcast_ble::vmu::build_message_splash(b"BYE");
                         vmu_frame_dirty = true;
-                        goodbye_state = Some(GoodbyeState::Wait);
+                        goodbye_state = Some(GoodbyeState::Wait(Instant::now()));
                     }
-                    Some(GoodbyeState::Wait) => {
-                        if !vmu_frame_dirty {
-                            // The standard write path cleared the dirty flag,
-                            // which means BYE has actually landed on the LCD.
-                            log!("MAIN: BYE landed, holding then System Off");
+                    Some(GoodbyeState::Wait(wait_start)) => {
+                        if !vmu_frame_dirty
+                            || wait_start.elapsed()
+                                >= Duration::from_millis(GOODBYE_WAIT_TIMEOUT_MS)
+                        {
+                            // Either the standard write path cleared the
+                            // dirty flag (BYE actually landed on the LCD),
+                            // or we've waited long enough that we should
+                            // proceed regardless. write_vmu_lcd() can return
+                            // false even when the bytes landed — its Ack
+                            // gets corrupted by BLE radio events during
+                            // notify activity. Without this timeout the
+                            // state machine could loop here forever.
+                            log!("MAIN: BYE rendered, holding then System Off");
                             goodbye_state = Some(GoodbyeState::Hold(Instant::now()));
                         }
                     }

@@ -427,6 +427,23 @@ pub unsafe fn qspi_flash_deep_power_down() {
 pub unsafe fn enter_system_off() -> ! {
     use crate::log;
 
+    // If the user is still holding the wake button (P1.15) — e.g. via the
+    // 7s+ goodbye flow — wait for them to release before tearing anything
+    // down. Two reasons:
+    //   1. We re-arm P1.15 with SENSE LOW further down. If the button is
+    //      still held at that point, SENSE latches immediately and
+    //      sd_power_system_off() silently refuses to sleep — the symptom is
+    //      "10s hold shows BYE but never shuts off."
+    //   2. Keeping boost on through the spin means the VMU BYE splash stays
+    //      visible until the user lets go, so the release is the natural
+    //      "device goes off" moment instead of a dead zone where the screen
+    //      is blank but the device is still nominally awake.
+    // Embassy left P1.15 as input+pullup, so reading P1.IN works directly.
+    const P1_IN: *const u32 = 0x5000_0810 as *const u32;
+    while core::ptr::read_volatile(P1_IN) & (1 << 15) == 0 {
+        cortex_m::asm::nop();
+    }
+
     // Turn off all LEDs (active low: HIGH = off)
     // P0 OUTSET register: set P0.26 (R), P0.30 (G), P0.06 (B)
     const P0_OUTSET: *mut u32 = 0x5000_0508 as *mut u32;
@@ -467,8 +484,17 @@ pub unsafe fn enter_system_off() -> ! {
 
     // P1.15: Wake button — input with pull-up + SENSE LOW
     // 0x0003_000C = INPUT=connected, PULL=pullup(11), SENSE=low(11)
+    // Safe to enable SENSE here because the spin-wait at the top of this
+    // function guaranteed the button is released (HIGH).
     const WAKE_INPUT_SENSE: u32 = 0x0003_000C;
     core::ptr::write_volatile(P1_PIN_CNF_BASE.add(15), WAKE_INPUT_SENSE);
+
+    // Defensive: clear any LATCH bits before sleeping. sd_power_system_off()
+    // silently refuses to enter System Off if any are pending.
+    const P0_LATCH: *mut u32 = 0x5000_0520 as *mut u32;
+    const P1_LATCH: *mut u32 = 0x5000_0820 as *mut u32;
+    core::ptr::write_volatile(P0_LATCH, 0xFFFF_FFFF);
+    core::ptr::write_volatile(P1_LATCH, 0xFFFF_FFFF);
 
     nrf_softdevice::raw::sd_power_system_off();
 
