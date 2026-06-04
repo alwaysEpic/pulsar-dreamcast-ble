@@ -56,7 +56,18 @@ Harness authored; offline mapping logic validated against BlueRetro's real mask.
 Next: let CI run the QEMU job. If STD passes there, the descriptor parse is fine
 and the hardware bug is elsewhere (BLE/GATT/fingerprint); if it fails, we've
 reproduced #2 and can iterate the STD descriptor toward the real Xbox shape.
-EXT (generic-HID path) is a follow-up, better covered by `hid-tools`/`uhid`.
+
+### Follow-up — broadened mask coverage
+Added three more tests against the same harness (no new fixtures needed — they
+reuse the STD descriptor + BlueRetro's own generators):
+- `test_pulsar_std_dpad_mapping` — hat switch → D-pad (`hat_to_ld_btns`).
+- `test_pulsar_std_axes_scaling` — sticks/triggers (`xbox_axes`); permanently
+  pins the 4-byte `Logical Maximum` and checks Rx/Ry + Z/Rz land on the right
+  axes. Catches the signed-`-1` stick regression that flip-flopped before.
+- `test_pulsar_ext_buttons_probe` — `xfail`-tolerant probe of the EXT profile on
+  BlueRetro's generic-HID path (`hid_btns_mask`), whose A,B,C,X,Y order collides
+  with our contiguous A,B,X,Y. Documents EXT's expected incompatibility there.
+EXT's real target (Steam/kernel/xpadneo) remains a future `hid-tools`/`uhid` job.
 
 ---
 

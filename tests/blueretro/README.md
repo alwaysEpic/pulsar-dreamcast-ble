@@ -58,10 +58,26 @@ docker run --rm -it -v "$PWD:/br" -v "/path/to/pulsar:/pulsar" \
     pytest tests/pytest_pulsar_dreamcast.py'
 ```
 
+## Tests
+
+- `test_pulsar_std_buttons_mapping` — every face/shoulder/system button (the issue).
+- `test_pulsar_std_dpad_mapping` — hat switch → D-pad directions (`hat_to_ld_btns`).
+- `test_pulsar_std_axes_scaling` — sticks (unsigned 0-65535, center 32768) and
+  triggers (0-1023); guards the signed-`Logical Maximum` stick regression and
+  confirms our Rx/Ry + Z/Rz usages land on the expected axes.
+- `test_pulsar_ext_buttons_probe` — `xfail`-tolerant characterization of the EXT
+  profile (contiguous layout, Steam/PC target) on BlueRetro. XFAIL = mis-maps as
+  expected; XPASS = it happens to work, revisit.
+
+All STD assertions are at the `generic_input` stage (descriptor-parse correctness,
+system-independent). A red STD test means issue #2 is reproduced — the harness
+working as intended; it goes green once the descriptor is fixed.
+
 ## Scope / TODO
 
-- Covers the **STD** profile button mapping (the issue). Stick/trigger scaling
-  and the **EXT** profile (generic-HID path, better tested via `hid-tools`/`uhid`)
-  are follow-ups.
 - BlueRetro is pinned by commit in the workflow; bump deliberately and re-verify
   against the matching container tag.
+- The EXT profile's real target (Steam Deck / kernel / xpadneo) is a *different*
+  parser, better covered by a `hid-tools`/`uhid` virtual-device layer (future).
+- No `dc.py` exists upstream, so DC *wired output* isn't modelled — we assert at
+  `generic_input`, which is where mapping correctness is decided.
