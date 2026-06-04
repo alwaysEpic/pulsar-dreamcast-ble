@@ -9,6 +9,57 @@ Running log of tests, assumptions, and results for Maple Bus bring-up on the nRF
 
 ---
 
+## Session: 2026-06-04 (BlueRetro QEMU regression harness for issue #2)
+
+### Context
+Issue #2 is still open: `START`/`X`/`Y` mis-map on a Dreamcast through BlueRetro.
+v0.2.1 fixed the sticks (signed `Logical Maximum` `0x26 FF FF` → 4-byte `0x27`),
+but buttons remain wrong on BlueRetro's default mapping. Goal this session: a way
+to test descriptor/report changes against BlueRetro **without flashing hardware**.
+
+### Finding — BlueRetro ships a host-runnable harness
+BlueRetro builds a `qemu` firmware config and runs it under `qemu-system-xtensa`;
+`tests/injector.py` drives it over a websocket (`send_hid_desc`, `send_to_bridge`)
+and reads back every pipeline stage (`wireless_input` → `generic_input` →
+`mapped_input` → `wired_output`). Their `tests/pytest_xbox_ble_controller.py` +
+`device_data/xbox.py` are ground truth for the real Xbox One S BLE controller.
+
+Key data from `device_data/xbox.py` (`xbox_ble` enum = wire bit positions):
+A=0, B=1, **X=3, Y=4**, LB=6, RB=7, View=10, **Menu=11**, Guide=12, L3=13, R3=14,
+Share=16 — i.e. the **gappy** layout. Our STD serializer `to_bytes_ms` already
+places buttons at exactly those bits, and offline replay of our STD reports
+through BlueRetro's own `xbox_ble_btns_mask` maps every button cleanly
+(A→RB_DOWN, X→RB_LEFT, Start→MM, …). So our STD **wire bytes** are correct.
+
+The suspect is the **descriptor shape**: our STD descriptor declares buttons as a
+gappy Usage sequence (`Button 1-2`, gap, `Button 3-4`, …) + Rx/Ry right stick +
+Generic-Desktop Z/Rz triggers, whereas the real Xbox descriptor BlueRetro
+fingerprints declares **contiguous `Button 1-15`** + Z/Rz right stick + Simulation
+Brake/Accelerator triggers. If BlueRetro doesn't recognize ours as the Xbox BLE
+controller it won't apply the gappy mask. The harness will confirm/refute this.
+
+### What Changed (branch `feat/blueretro-test-harness`, off `main`)
+- **Moved** `HID_REPORT_DESCRIPTOR_STD/_EXT` from `src/ble/hid.rs` into
+  `maple-protocol/src/xbox_hid.rs` (host-buildable); `hid.rs` re-exports them.
+- **`maple-protocol/tests/blueretro_fixtures.rs`** — emits `tests/blueretro/
+  fixtures.json` (descriptors + per-button `to_bytes_ms`/`to_bytes` reports) and
+  fails on drift. Regenerate: `(cd maple-protocol && UPDATE_FIXTURES=1 cargo test
+  --test blueretro_fixtures)`. Runs inside the existing maple-protocol CI test job.
+- **`tests/blueretro/pytest_pulsar_dreamcast.py`** — feeds our STD descriptor +
+  reports to BlueRetro under QEMU, asserts each button → correct generic button.
+- **`.github/workflows/blueretro-pytest.yml`** — pinned BlueRetro checkout
+  (`e1a9831`), builds the qemu config, runs only our test.
+- **`tests/blueretro/README.md`** — how it works + local Docker invocation.
+
+### Status
+Harness authored; offline mapping logic validated against BlueRetro's real mask.
+Next: let CI run the QEMU job. If STD passes there, the descriptor parse is fine
+and the hardware bug is elsewhere (BLE/GATT/fingerprint); if it fails, we've
+reproduced #2 and can iterate the STD descriptor toward the real Xbox shape.
+EXT (generic-HID path) is a follow-up, better covered by `hid-tools`/`uhid`.
+
+---
+
 ## Session: 2026-05-07 (BLE profile system: RETRO/DESK split)
 
 ### Context

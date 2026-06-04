@@ -1,0 +1,88 @@
+name: BlueRetro mapping
+
+# Reproduces issue #2 in software: feeds our STD HID descriptor + serialized
+# reports to real BlueRetro firmware running under QEMU and asserts every
+# button maps to the right Dreamcast function — no nRF hardware required.
+#
+# The fixtures (descriptor + report bytes) are generated from the Rust source
+# by maple-protocol/tests/blueretro_fixtures.rs and committed to the repo, so
+# this job needs no Rust toolchain. If they drift from the source, the
+# `Test (maple-protocol)` job in ci.yml fails first.
+
+on:
+  push:
+    paths:
+      - 'maple-protocol/src/xbox_hid.rs'
+      - 'tests/blueretro/**'
+      - '.github/workflows/blueretro-pytest.yml'
+  pull_request:
+    paths:
+      - 'maple-protocol/src/xbox_hid.rs'
+      - 'tests/blueretro/**'
+      - '.github/workflows/blueretro-pytest.yml'
+  workflow_dispatch:
+
+env:
+  # Pin BlueRetro so a change to their test infra can't silently break us.
+  # Bump deliberately and re-verify against the matching container tag.
+  BLUERETRO_REF: e1a9831a875f5313a923160a1379a7ebbfaa2b11
+
+jobs:
+  mapping:
+    name: STD profile mapping under QEMU
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/darthcloud/idf-blueretro:v5.5.0_2024-12-02_gcovr
+    steps:
+      - name: Checkout pulsar-dreamcast-ble
+        uses: actions/checkout@v4
+        with:
+          path: pulsar
+
+      - name: Checkout BlueRetro (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: darthcloud/BlueRetro
+          ref: ${{ env.BLUERETRO_REF }}
+          submodules: recursive
+          fetch-depth: 0
+          path: blueretro
+
+      - name: Build BlueRetro firmware (qemu config)
+        shell: bash
+        working-directory: blueretro
+        run: |
+          . "$IDF_PATH/export.sh"
+          git config --global --add safe.directory '*'
+          echo "pulsar harness qemu" > version.txt
+          cp configs/dbg/qemu sdkconfig
+          idf.py build
+
+      - name: Stage Pulsar harness into BlueRetro tests
+        shell: bash
+        run: |
+          cp pulsar/tests/blueretro/pytest_pulsar_dreamcast.py blueretro/tests/
+          cp pulsar/tests/blueretro/fixtures.json             blueretro/tests/
+
+      - name: Run QEMU + pytest
+        shell: bash
+        working-directory: blueretro
+        run: |
+          . "$IDF_PATH/export.sh"
+          pip install --quiet websocket-client pytest numpy
+          (cd build && esptool.py --chip esp32 merge_bin --fill-flash-size 4MB -o flash_image.bin @flash_args)
+          qemu-system-xtensa -machine esp32 \
+            -drive file=build/flash_image.bin,if=mtd,format=raw \
+            -serial file:serial_log.txt -serial file:gcov_data.gcfn \
+            -display none \
+            -nic user,model=open_eth,id=lo0,hostfwd=tcp:127.0.0.1:8001-:80 \
+            -daemonize
+          pytest tests/pytest_pulsar_dreamcast.py
+
+      - name: Upload QEMU serial log
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v4
+        with:
+          name: blueretro-serial-log
+          path: blueretro/serial_log.txt
+          if-no-files-found: warn
