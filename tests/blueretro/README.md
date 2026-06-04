@@ -60,6 +60,9 @@ docker run --rm -it -v "$PWD:/br" -v "/path/to/pulsar:/pulsar" \
 
 ## Tests
 
+- `test_harness_control_reference_xbox` — **baseline.** Runs the button assertions
+  against BlueRetro's own reference Xbox descriptor (imported from their suite).
+  Must be green; if it's red the harness is wired wrong, not our descriptor.
 - `test_pulsar_std_buttons_mapping` — every face/shoulder/system button (the issue).
 - `test_pulsar_std_dpad_mapping` — hat switch → D-pad directions (`hat_to_ld_btns`).
 - `test_pulsar_std_axes_scaling` — sticks (unsigned 0-65535, center 32768) and

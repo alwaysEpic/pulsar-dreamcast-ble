@@ -60,14 +60,12 @@ def _expected_generic(wire):
     return generic
 
 
-@pytest.mark.parametrize('blueretro', [[system.DC, dev_mode.PAD, bt_conn_type.BT_LE]], indirect=True)
-def test_pulsar_std_buttons_mapping(blueretro):
-    ''' Each physical button on the STD profile must decode to the right
-        BlueRetro-generic button (the bug in issue #2). '''
-    rsp = blueretro.send_name(DEVICE_NAME_STD)
-    assert rsp['type_update']['device_id'] == 0
-
-    blueretro.send_hid_desc(bytes.fromhex(FIXTURES['descriptors']['std']))
+def _check_buttons(blueretro, descriptor):
+    ''' Send `descriptor`, then our STD (gappy) report bytes for each button, and
+        return a list of mapping failures. Shared by the control and the STD test
+        so the *only* difference between them is the descriptor under test. '''
+    blueretro.send_name(DEVICE_NAME_STD)
+    blueretro.send_hid_desc(descriptor)
 
     for _ in range(2):
         blueretro.send_to_bridge(0x01, FIXTURES['neutral']['std'])
@@ -88,7 +86,29 @@ def test_pulsar_std_buttons_mapping(blueretro):
         if got != expected:
             failures.append(
                 f"{name}: wire=0x{wire:06x} expected generic=0x{expected:08x} got=0x{got:08x}")
+    return failures
 
+
+@pytest.mark.parametrize('blueretro', [[system.DC, dev_mode.PAD, bt_conn_type.BT_LE]], indirect=True)
+def test_harness_control_reference_xbox(blueretro):
+    ''' Control / baseline. Runs the exact assertion path below against
+        BlueRetro's OWN reference Xbox One S BLE descriptor (imported from their
+        suite). This MUST be green: it proves the harness is wired correctly and
+        our assertions are sound, so a red STD test is a real finding about our
+        descriptor — not a harness bug. If this is red, fix the harness first. '''
+    xbox_ref = pytest.importorskip('pytest_xbox_ble_controller')
+    failures = _check_buttons(blueretro, xbox_ref.HID_DESC)
+    assert not failures, (
+        "CONTROL FAILED — harness wiring/assertions are wrong, not our descriptor:\n  "
+        + "\n  ".join(failures))
+
+
+@pytest.mark.parametrize('blueretro', [[system.DC, dev_mode.PAD, bt_conn_type.BT_LE]], indirect=True)
+def test_pulsar_std_buttons_mapping(blueretro):
+    ''' Each physical button on the STD profile must decode to the right
+        BlueRetro-generic button (the bug in issue #2). Only meaningful if the
+        control above is green. '''
+    failures = _check_buttons(blueretro, bytes.fromhex(FIXTURES['descriptors']['std']))
     assert not failures, "STD profile mis-maps buttons on BlueRetro:\n  " + "\n  ".join(failures)
 
 
