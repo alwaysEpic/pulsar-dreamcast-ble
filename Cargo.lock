@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "maple-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "heapless 0.8.0",
 ]
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-dreamcast-ble"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
