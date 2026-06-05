@@ -437,21 +437,23 @@ pub const HID_REPORT_DESCRIPTOR_EXT: &[u8] = &[
     0xC0,              // End Collection
 ];
 
-/// HID Report Descriptor — STD profile (original Microsoft Xbox One S BT Classic).
+/// HID Report Descriptor — STD profile (real Xbox One S BLE controller).
 ///
-/// Matches the byte layout used by real Xbox One S controllers identifying as
-/// PID 0x02E0 (Bluetooth Classic, pre-FW 5.11). Compatible with `BlueRetro` and
-/// other retro adapters that key off VID/PID and parse with the legacy layout.
+/// Report ID 0x01 is byte-identical to the descriptor a genuine Xbox One S/Series
+/// BLE controller advertises: Z/Rz right stick, Simulation-Controls Brake/Accel
+/// triggers, and a contiguous `Button 1-15` block + Consumer Record. `BlueRetro`
+/// and other retro adapters fingerprint this descriptor and then apply their own
+/// hardcoded Xbox bit map — so the gappy wire bytes from `GamepadReport::to_bytes_ms`
+/// (A=0, B=1, X=3, Y=4, LB=6, RB=7, View=10, Menu=11, L3=13, R3=14) decode correctly
+/// even though the descriptor declares the buttons contiguously.
 ///
-/// Differs from `HID_REPORT_DESCRIPTOR_EXT` only in the button section of
-/// Report ID 0x01. Buttons 1-10 are placed at specific bit positions with
-/// reserved gaps in between, matching `GamepadReport::to_bytes_ms` output:
+/// This is the *opposite* trade-off from `HID_REPORT_DESCRIPTOR_EXT`: EXT uses the
+/// xpadneo convention (Rx/Ry + Generic-Desktop Z/Rz, contiguous wire via `to_bytes`)
+/// for generic hosts (Steam/Linux/Android); STD mimics the real Xbox so adapters
+/// that key off the Xbox descriptor (BlueRetro) map every button correctly.
 ///
-/// Byte 13 (face buttons + bumpers):
-///   bit 0=A, 1=B, 2=reserved, 3=X, 4=Y, 5=reserved, 6=LB, 7=RB
-/// Byte 14 (system buttons + stick clicks):
-///   bits 0-1=reserved, 2=View, 3=Menu, 4=reserved, 5=L3, 6=R3, 7=reserved
-/// Byte 15: full padding (no AC Back declaration in legacy layout).
+/// Diverging from this layout breaks BlueRetro recognition: it then generic-HID
+/// parses the buttons by Usage number and X/Y/Start shift (see issue #2).
 #[rustfmt::skip]
 pub const HID_REPORT_DESCRIPTOR_STD: &[u8] = &[
     0x05, 0x01,        // Usage Page (Generic Desktop)
@@ -474,10 +476,11 @@ pub const HID_REPORT_DESCRIPTOR_STD: &[u8] = &[
     0xC0,              //   End Collection
 
     // Right Stick (Physical collection, unsigned 16-bit)
+    // Z/Rz — matches the real Xbox One S BLE descriptor that BlueRetro fingerprints.
     0x09, 0x01,        //   Usage (Pointer)
     0xA1, 0x00,        //   Collection (Physical)
-    0x09, 0x33,        //     Usage (Rx)
-    0x09, 0x34,        //     Usage (Ry)
+    0x09, 0x32,        //     Usage (Z)
+    0x09, 0x35,        //     Usage (Rz)
     0x15, 0x00,        //     Logical Minimum (0)
     0x27, 0xFF, 0xFF, 0x00, 0x00, //  Logical Maximum (65535)
     0x95, 0x02,        //     Report Count (2)
@@ -485,9 +488,9 @@ pub const HID_REPORT_DESCRIPTOR_STD: &[u8] = &[
     0x81, 0x02,        //     Input (Data, Variable, Absolute)
     0xC0,              //   End Collection
 
-    // Left Trigger (Generic Desktop Z, 10-bit + 6 padding)
-    0x05, 0x01,        //   Usage Page (Generic Desktop)
-    0x09, 0x32,        //   Usage (Z)
+    // Left Trigger (Simulation Controls Brake, 10-bit + 6 padding)
+    0x05, 0x02,        //   Usage Page (Simulation Controls)
+    0x09, 0xC5,        //   Usage (Brake)
     0x15, 0x00,        //   Logical Minimum (0)
     0x26, 0xFF, 0x03,  //   Logical Maximum (1023)
     0x95, 0x01,        //   Report Count (1)
@@ -499,8 +502,9 @@ pub const HID_REPORT_DESCRIPTOR_STD: &[u8] = &[
     0x95, 0x01,        //   Report Count (1)
     0x81, 0x03,        //   Input (Constant) - padding
 
-    // Right Trigger (Generic Desktop Rz, 10-bit + 6 padding)
-    0x09, 0x35,        //   Usage (Rz)
+    // Right Trigger (Simulation Controls Accelerator, 10-bit + 6 padding)
+    0x05, 0x02,        //   Usage Page (Simulation Controls)
+    0x09, 0xC4,        //   Usage (Accelerator)
     0x15, 0x00,
     0x26, 0xFF, 0x03,  //   Logical Maximum (1023)
     0x95, 0x01,
@@ -532,63 +536,40 @@ pub const HID_REPORT_DESCRIPTOR_STD: &[u8] = &[
     0x65, 0x00,
     0x81, 0x03,        //   Input (Constant) - padding
 
-    // Buttons - original Xbox One S BT Classic gappy layout
+    // Buttons 1-15 — contiguous declaration matching the real Xbox One S BLE
+    // descriptor. The wire bytes stay gappy (GamepadReport::to_bytes_ms); once
+    // BlueRetro fingerprints this as an Xbox controller it applies its own
+    // hardcoded bit map, so X/Y/Start land correctly despite the contiguous
+    // declaration (proven by the harness control test).
     0x05, 0x09,        //   Usage Page (Button)
+    0x19, 0x01,        //   Usage Minimum (Button 1)
+    0x29, 0x0F,        //   Usage Maximum (Button 15)
     0x15, 0x00,        //   Logical Minimum (0)
     0x25, 0x01,        //   Logical Maximum (1)
     0x75, 0x01,        //   Report Size (1)
-
-    // Buttons 1-2 (A, B) at byte 13 bits 0-1
-    0x19, 0x01,        //   Usage Minimum (Button 1)
-    0x29, 0x02,        //   Usage Maximum (Button 2)
-    0x95, 0x02,        //   Report Count (2)
+    0x95, 0x0F,        //   Report Count (15)
     0x81, 0x02,        //   Input (Data, Variable, Absolute)
-    // 1-bit gap (byte 13 bit 2)
-    0x95, 0x01,
+    // 1-bit padding (byte 14 bit 7)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x00,        //   Logical Maximum (0)
+    0x75, 0x01,        //   Report Size (1)
+    0x95, 0x01,        //   Report Count (1)
     0x81, 0x03,        //   Input (Constant) - padding
 
-    // Buttons 3-4 (X, Y) at byte 13 bits 3-4
-    0x19, 0x03,        //   Usage Minimum (Button 3)
-    0x29, 0x04,        //   Usage Maximum (Button 4)
-    0x95, 0x02,
-    0x81, 0x02,
-    // 1-bit gap (byte 13 bit 5)
-    0x95, 0x01,
-    0x81, 0x03,
-
-    // Buttons 5-6 (LB, RB) at byte 13 bits 6-7
-    0x19, 0x05,        //   Usage Minimum (Button 5)
-    0x29, 0x06,        //   Usage Maximum (Button 6)
-    0x95, 0x02,
-    0x81, 0x02,
-
-    // 2-bit gap (byte 14 bits 0-1)
-    0x95, 0x02,
-    0x81, 0x03,
-
-    // Buttons 7-8 (View, Menu) at byte 14 bits 2-3
-    0x19, 0x07,        //   Usage Minimum (Button 7)
-    0x29, 0x08,        //   Usage Maximum (Button 8)
-    0x95, 0x02,
-    0x81, 0x02,
-
-    // 1-bit gap (byte 14 bit 4 — reserved, Xbox button is on Report 2)
-    0x95, 0x01,
-    0x81, 0x03,
-
-    // Buttons 9-10 (L3, R3) at byte 14 bits 5-6
-    0x19, 0x09,        //   Usage Minimum (Button 9)
-    0x29, 0x0A,        //   Usage Maximum (Button 10)
-    0x95, 0x02,
-    0x81, 0x02,
-
-    // 1-bit padding (byte 14 bit 7)
-    0x95, 0x01,
-    0x81, 0x03,
-
-    // Byte 15: full padding (no AC Back in legacy layout)
-    0x95, 0x08,
-    0x81, 0x03,
+    // Byte 15 bit 0: Consumer Record (Share) — 1 bit + 7-bit padding.
+    // Matches the real Xbox descriptor; we never set it (Dreamcast has none).
+    0x05, 0x0C,        //   Usage Page (Consumer)
+    0x0A, 0xB2, 0x00,  //   Usage (Record)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x01,        //   Logical Maximum (1)
+    0x95, 0x01,        //   Report Count (1)
+    0x75, 0x01,        //   Report Size (1)
+    0x81, 0x02,        //   Input (Data, Variable, Absolute)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x00,        //   Logical Maximum (0)
+    0x75, 0x07,        //   Report Size (7)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x03,        //   Input (Constant) - padding
 
     // === Report ID 0x02: Xbox/Guide Button ===
     0x85, 0x02,        //   Report ID (2)

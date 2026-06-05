@@ -9,6 +9,36 @@ Running log of tests, assumptions, and results for Maple Bus bring-up on the nRF
 
 ---
 
+## Session: 2026-06-05 (Fix STD descriptor — issue #2 root cause confirmed)
+
+### Harness verdict (first QEMU run)
+Control PASSED, STD buttons FAILED, hat/axes PASSED, EXT XFAIL. Control-green +
+STD-red isolates it to our STD descriptor, not the harness. The STD failure
+decoded exactly: BlueRetro does **not** recognize our STD descriptor as Xbox, so
+it falls back to **generic-HID** parsing and assigns buttons by HID Usage number
+into its order `A,B,C,X,Y,Z,LB,RB,L,R` — so everything from the 3rd button shifts
+(X→C→RT, Y→X, LB→Y, RB→Z, View→LB, Menu→RB, L3→L, R3→R). A/B align by coincidence.
+That is issue #2.
+
+### Fix
+Made `HID_REPORT_DESCRIPTOR_STD` Report ID 1 **byte-identical to the real Xbox
+One S BLE descriptor** (the exact bytes the harness control passed with):
+- right stick Rx/Ry → **Z/Rz**
+- triggers Generic-Desktop Z/Rz → **Simulation-Controls Brake/Accelerator**
+- buttons gappy Usage ranges → **contiguous `Button 1-15`** + Consumer Record (byte 15)
+
+Serializer unchanged: `to_bytes_ms` still emits the gappy wire layout a real Xbox
+sends. Once BlueRetro fingerprints the Xbox descriptor it applies its own hardcoded
+bit map, so the gappy wire decodes correctly (control proved this). Kept our
+Report 2 (Guide) / 3 (rumble) / 4 (battery). EXT untouched (xpadneo convention for
+Steam/PC — the STD/EXT split is what lets us serve both audiences).
+
+### Status
+`ci.sh` green; STD Report 1 verified byte-identical to BlueRetro's reference.
+Pushed; QEMU harness re-run will confirm STD flips green.
+
+---
+
 ## Session: 2026-06-04 (BlueRetro QEMU regression harness for issue #2)
 
 ### Context
