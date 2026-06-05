@@ -125,10 +125,15 @@ impl GamepadReport {
         ]
     }
 
-    /// Convert to 16-byte array using the original Microsoft Xbox One S BT Classic
-    /// button layout (PID 0x02E0). Buttons 1-10 are placed at specific bit positions
-    /// with reserved gaps in between, matching the descriptor `BlueRetro` and other
-    /// retro adapters key off via VID/PID.
+    /// Convert to a 16-byte report using the gappy bit layout a real Microsoft
+    /// Xbox One S controller transmits: buttons sit at fixed bit positions with
+    /// reserved gaps between them (A=bit0, B=1, X=3, Y=4, ...). This wire layout is
+    /// deliberately NOT contiguous. `HID_REPORT_DESCRIPTOR_STD` advertises a real
+    /// Xbox One S BLE descriptor, which `BlueRetro` fingerprints by descriptor
+    /// *shape* (not VID/PID) and then decodes with its own hard-coded Xbox bitmap —
+    /// so these gappy bits land on the right Dreamcast functions. Do NOT "align"
+    /// these positions to the descriptor's contiguous `Button 1-15` declaration:
+    /// that is exactly what broke issue #2.
     ///
     /// Byte 13 (face buttons + bumpers):
     ///   bit 0=A, 1=B, 2=reserved, 3=X, 4=Y, 5=reserved, 6=LB, 7=RB

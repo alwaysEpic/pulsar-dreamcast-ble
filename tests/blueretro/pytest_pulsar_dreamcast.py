@@ -96,7 +96,15 @@ def test_harness_control_reference_xbox(blueretro):
         suite). This MUST be green: it proves the harness is wired correctly and
         our assertions are sound, so a red STD test is a real finding about our
         descriptor — not a harness bug. If this is red, fix the harness first. '''
-    xbox_ref = pytest.importorskip('pytest_xbox_ble_controller')
+    # Hard import (not importorskip): this control is the harness gate, so a
+    # missing/renamed reference module must FAIL the job, not silently skip it.
+    try:
+        import pytest_xbox_ble_controller as xbox_ref
+    except ImportError as exc:
+        pytest.fail(
+            "CONTROL BROKEN — BlueRetro reference module 'pytest_xbox_ble_controller' "
+            f"could not be imported ({exc}); the harness gate is gone, fix it before "
+            "trusting any STD result.")
     failures = _check_buttons(blueretro, xbox_ref.HID_DESC)
     assert not failures, (
         "CONTROL FAILED — harness wiring/assertions are wrong, not our descriptor:\n  "
