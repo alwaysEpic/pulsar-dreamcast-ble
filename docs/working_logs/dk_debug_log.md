@@ -33,9 +33,15 @@ bit map, so the gappy wire decodes correctly (control proved this). Kept our
 Report 2 (Guide) / 3 (rumble) / 4 (battery). EXT untouched (xpadneo convention for
 Steam/PC — the STD/EXT split is what lets us serve both audiences).
 
-### Status
-`ci.sh` green; STD Report 1 verified byte-identical to BlueRetro's reference.
-Pushed; QEMU harness re-run will confirm STD flips green.
+### Status — CONFIRMED
+QEMU harness re-run (run 27018830267): **4 passed, 1 xfailed**.
+`test_pulsar_std_buttons_mapping` flipped FAILED → PASSED while the control
+stayed green — BlueRetro now fingerprints STD as a genuine Xbox controller and
+maps every button correctly. Fix verified in software with no hardware.
+
+Remaining last-mile: flash and have a real Dreamcast + BlueRetro confirm (the
+harness validates BlueRetro's parse, which is exactly what #2 was about, but the
+full nRF BLE/GATT stack on hardware is the final check).
 
 ---
 
