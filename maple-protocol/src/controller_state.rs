@@ -9,7 +9,7 @@
 pub const CONTROLLER_FUNCTION: u32 = 0x0000_0001;
 
 /// Represents the state of a standard Dreamcast controller.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ControllerState {
     /// Digital button states (active LOW in protocol, but we store as active HIGH here).
     pub buttons: ButtonState,
@@ -25,6 +25,24 @@ pub struct ControllerState {
 
     /// Analog stick Y axis (0-255, 128 = center, 0 = up, 255 = down).
     pub stick_y: u8,
+}
+
+/// Neutral controller state: no buttons, triggers released, sticks centered.
+///
+/// NOT the all-zero state — raw stick `0` is left + up (the upper-left
+/// corner); the neutral position is center (`128` -> `32768`). The poll loop
+/// signals this on controller disconnect so the host sees a centered stick
+/// rather than a stuck corner (issue #6).
+impl Default for ControllerState {
+    fn default() -> Self {
+        Self {
+            buttons: ButtonState::default(),
+            trigger_l: 0,
+            trigger_r: 0,
+            stick_x: DC_STICK_CENTER,
+            stick_y: DC_STICK_CENTER,
+        }
+    }
 }
 
 /// Digital button states from a Dreamcast controller.
@@ -674,5 +692,41 @@ mod tests {
             ..Default::default()
         };
         assert!(!a.state_changed(&b));
+    }
+
+    // --- Issue #6: the neutral / disconnect state must center the stick ---
+    // On controller disconnect (cable unplug) main.rs signals
+    // `ControllerState::default()`. An all-zero state is NOT neutral: raw 0
+    // means stick hard left + up (center is 128 -> 32768), so the host would
+    // see the stick jammed into the upper-left corner. These guard that the
+    // default state is a genuinely neutral controller.
+
+    #[test]
+    fn default_state_raw_sticks_are_centered() {
+        let s = ControllerState::default();
+        assert_eq!(
+            s.stick_x, 128,
+            "default stick_x must be centered (128), not 0"
+        );
+        assert_eq!(
+            s.stick_y, 128,
+            "default stick_y must be centered (128), not 0"
+        );
+        assert!(s.stick_centered(0), "default state must report as centered");
+    }
+
+    #[test]
+    fn default_state_reports_centered_stick() {
+        // Regression for issue #6: disconnect must map to a centered left stick
+        // (32768, 32768), not the upper-left corner (0, 0).
+        let report = ControllerState::default().to_gamepad_report();
+        assert_eq!(
+            report.left_x, 32768,
+            "disconnect stick X must be centered, not upper-left"
+        );
+        assert_eq!(
+            report.left_y, 32768,
+            "disconnect stick Y must be centered, not upper-left"
+        );
     }
 }
