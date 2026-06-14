@@ -27,8 +27,10 @@ embassy_nrf::bind_interrupts!(struct SaadcIrqs {
     SAADC => embassy_nrf::saadc::InterruptHandler;
 });
 
-/// Maple Bus polling interval (~60Hz).
-const POLL_INTERVAL_MS: u64 = 16;
+/// Delay between Maple Bus polls. This is NOT the poll rate: the loop period
+/// is this delay plus `get_condition` (~9ms measured, POLLPHASE 2026-06-10),
+/// so 8ms yields ~17ms/poll ≈ 60Hz — matching the Dreamcast-side Maple rate.
+const POLL_INTERVAL_MS: u64 = 8;
 
 /// Consecutive poll failures before declaring controller lost.
 const CONTROLLER_LOST_THRESHOLD: u16 = 30;
@@ -101,12 +103,27 @@ async fn main(spawner: Spawner) {
     ble::softdevice::set_profile(profile);
     let sd = ble::softdevice::init_softdevice(profile);
 
-    // Enable radio notifications for VMU write scheduling
-    if pulsar_dreamcast_ble::maple::radio_notify::init() {
-        log!("RADIO: Notifications enabled");
-    } else {
-        log!("RADIO: Notification setup failed");
+    // Power-fail canary for the VMU-write SD-assert investigation: the VMU
+    // draws its dock power from the shared 5V rail and its LCD/buzzer
+    // activity may dip the supply during writes (debug log 2026-06-11). The
+    // power-fail comparator fires a SOC event (logged in softdevice_task)
+    // when VDD drops below 2.5V — any POFWARN correlated with a VMU write
+    // is direct evidence for the rail-dip theory.
+    unsafe {
+        use nrf_softdevice_s140 as sd_raw;
+        let _ = sd_raw::sd_power_pof_threshold_set(
+            sd_raw::NRF_POWER_THRESHOLDS_NRF_POWER_THRESHOLD_V25 as u8,
+        );
+        let _ = sd_raw::sd_power_pof_enable(1);
     }
+
+    // Radio notifications are deliberately NOT enabled. Every VMU-write gate
+    // built on them produced SoftDevice assertion panics whenever writes were
+    // active (debug log 2026-06-10, five rounds: alternating-flag ON_BOTH,
+    // INT_ON_INACTIVE, gap-classified ON_BOTH — all asserted; no-write runs
+    // were clean). VMU writes are fire-and-forget and unanchored instead;
+    // collided frames are dropped by the VMU's CRC. See maple/radio_notify.rs
+    // for the preserved implementation and the full post-mortem.
 
     // Create HID Gamepad GATT server
     let Ok(server) = ble::GamepadServer::new(sd) else {
@@ -220,23 +237,26 @@ async fn main(spawner: Spawner) {
             // Runs on both boards so the flow is testable on the dev kit;
             // XIAO actually enters System Off, DK halts via WFI.
             if pulsar_dreamcast_ble::GOODBYE_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
-                log!("MAIN: Phase 1 goodbye, rendering BYE");
-                bus.set_output_mode();
-                Timer::after(Duration::from_millis(20)).await;
-                let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"BYE");
-                pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
-                log!("MAIN: VMU enumerate = {}", host.enumerate_vmu(&mut bus));
-                let mut wrote = false;
-                for _ in 0..5 {
-                    if host.write_vmu_lcd(&mut bus, &send_buf) {
-                        log!("MAIN: BYE write OK");
-                        wrote = true;
-                        break;
+                log!("MAIN: Phase 1 goodbye");
+                #[cfg(feature = "vmu")]
+                {
+                    bus.set_output_mode();
+                    Timer::after(Duration::from_millis(20)).await;
+                    let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"BYE");
+                    pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
+                    log!("MAIN: VMU enumerate = {}", host.enumerate_vmu(&mut bus));
+                    let mut wrote = false;
+                    for _ in 0..5 {
+                        if host.write_vmu_lcd(&mut bus, &send_buf) {
+                            log!("MAIN: BYE write OK");
+                            wrote = true;
+                            break;
+                        }
+                        Timer::after(Duration::from_millis(50)).await;
                     }
-                    Timer::after(Duration::from_millis(50)).await;
-                }
-                if !wrote {
-                    log!("MAIN: BYE write failed (no controller?)");
+                    if !wrote {
+                        log!("MAIN: BYE write failed (no controller?)");
+                    }
                 }
                 Timer::after(Duration::from_millis(1000)).await;
                 #[cfg(feature = "board-xiao")]
@@ -374,11 +394,12 @@ async fn main(spawner: Spawner) {
             pulsar_dreamcast_ble::vmu::build_profile_splash(profile.vmu_glyph, profile.vmu_label);
         let mut vmu_anim_step: u8 = 0;
         let mut vmu_anim_counter: u16 = 0;
-        let mut vmu_idle_wait: u16 = 0;
-        // ~16ms per poll, splash holds 30s before transitioning to the pulsar.
+        // ~17ms per poll, splash holds ~30s before transitioning to the pulsar.
         let mut vmu_splash_polls: u16 = 30 * 60;
-        const VMU_ANIM_INTERVAL: u16 = 10; // Advance animation every 10 polls (~160ms, ~6fps)
-        const VMU_IDLE_FALLBACK: u16 = 30; // Write anyway after 30 polls (~480ms) without radio idle
+        // Advance the animation every 20 polls (~340ms, ~3fps). Each frame is
+        // a ~1.7ms hardware-timed DMA TX the CPU awaits through — ~0.5ms of
+        // average poll period, no bus corruption possible.
+        const VMU_ANIM_INTERVAL: u16 = 20;
         #[cfg_attr(not(feature = "board-xiao"), allow(unused_mut))]
         let mut vmu_battery_percent: u8 = 100;
         let mut last_state: Option<ControllerState> = None;
@@ -467,12 +488,15 @@ async fn main(spawner: Spawner) {
                 // a SYNC splash to the VMU so it persists through Phase 1.
                 if conn_state == ConnectionState::SyncMode {
                     log!("MAIN: Sync mode entered, writing SYNC splash");
-                    let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"SYNC");
-                    pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
-                    if !vmu_enumerated {
-                        let _ = host.enumerate_vmu(&mut bus);
+                    #[cfg(feature = "vmu")]
+                    {
+                        let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"SYNC");
+                        pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
+                        if !vmu_enumerated {
+                            let _ = host.enumerate_vmu(&mut bus);
+                        }
+                        let _ = host.write_vmu_lcd(&mut bus, &send_buf);
                     }
-                    let _ = host.write_vmu_lcd(&mut bus, &send_buf);
                 }
                 log!("MAIN: BLE disconnected, disabling boost");
                 #[cfg(feature = "board-xiao")]
@@ -484,7 +508,12 @@ async fn main(spawner: Spawner) {
                 break;
             }
 
-            if let MapleResult::Ok(state) = host.get_condition(&mut bus) {
+            #[cfg(feature = "poll-timing")]
+            let _pt_gc = pulsar_dreamcast_ble::poll_timing::start();
+            let gc_result = host.get_condition(&mut bus);
+            #[cfg(feature = "poll-timing")]
+            pulsar_dreamcast_ble::poll_timing::record_gc(_pt_gc);
+            if let MapleResult::Ok(state) = gc_result {
                 if fail_count >= CONTROLLER_LOST_THRESHOLD {
                     log!("MAPLE: Controller reconnected");
                 }
@@ -507,9 +536,18 @@ async fn main(spawner: Spawner) {
                 }
 
                 // VMU content: profile splash for the first 30s of every boot,
-                // then the rotating pulsar (with battery overlay) for the rest.
+                // then the rotating pulsar (with battery overlay) at ~6fps.
                 // Skipped entirely while goodbye is active so the BYE frame
                 // doesn't get overwritten before it lands.
+                //
+                // History note: the animation was removed on 2026-06-11 when
+                // VMU writes were believed to cause SoftDevice asserts. The
+                // real cause was the diagnostic instrumentation masking
+                // interrupts (see poll_timing module docs); the writes were
+                // innocent. With the PWM/EasyDMA TX (~1.7ms hardware-timed
+                // wire frames, CPU awaits during playback) the animation
+                // costs ~0.5ms of average poll period and cannot corrupt the
+                // bus or perturb the controller.
                 let vmu_busy = goodbye_state.is_some();
                 if vmu_busy {
                     // Goodbye in flight — leave vmu_framebuf alone.
@@ -534,31 +572,48 @@ async fn main(spawner: Spawner) {
                     }
                 }
 
-                // VMU write: send current framebuffer when radio is idle.
-                // Battery overlay is composited here so every frame gets it
-                // regardless of content source (animation, dongle, game icon).
-                // Falls back to writing anyway if radio idle is never signaled.
+                // VMU write: fire-and-forget, unanchored. Radio notifications
+                // are NOT used: every gate built on them (alternating-flag,
+                // INT_ON_INACTIVE, gap-classified ON_BOTH) produced SoftDevice
+                // assertion panics whenever writes were active, while no-write
+                // runs were clean (debug log 2026-06-10, five rounds). The
+                // unanchored cost is known and bounded: ~64% of frames collide
+                // with a connection event and are dropped by the VMU's CRC
+                // (the LCD keeps the previous frame), so the 6fps animation
+                // renders at ~2fps effective. Battery overlay is composited
+                // here so every frame gets it regardless of content source.
                 if vmu_frame_dirty {
-                    let radio_ok = pulsar_dreamcast_ble::maple::radio_notify::is_radio_idle();
-                    if radio_ok || vmu_idle_wait >= VMU_IDLE_FALLBACK {
-                        if !vmu_enumerated {
-                            let _ = host.enumerate_vmu(&mut bus);
-                            vmu_enumerated = true;
-                        }
-                        let mut send_buf = vmu_framebuf;
-                        pulsar_dreamcast_ble::vmu::composite_battery(
-                            &mut send_buf,
-                            vmu_battery_percent,
-                            true,
-                        );
-                        pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
-                        if host.write_vmu_lcd(&mut bus, &send_buf) {
-                            vmu_frame_dirty = false;
-                        }
-                        vmu_idle_wait = 0;
-                    } else {
-                        vmu_idle_wait += 1;
+                    if !vmu_enumerated {
+                        #[cfg(feature = "vmu")]
+                        let _ = host.enumerate_vmu(&mut bus);
+                        vmu_enumerated = true;
                     }
+                    let mut send_buf = vmu_framebuf;
+                    pulsar_dreamcast_ble::vmu::composite_battery(
+                        &mut send_buf,
+                        vmu_battery_percent,
+                        true,
+                    );
+                    pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
+                    // Flush pending tasks (HID notify, SoftDevice runner)
+                    // before the TX starts; the DMA playback then awaits, so
+                    // the executor also runs DURING the TX.
+                    embassy_futures::yield_now().await;
+                    #[cfg(feature = "poll-timing")]
+                    let _pt_vmu = pulsar_dreamcast_ble::poll_timing::start();
+                    // Hardware-timed PWM/EasyDMA TX (~1.7ms on the wire, CPU
+                    // awaits so the executor keeps running). Fire-and-forget:
+                    // no ACK read — a corrupted frame is dropped by the VMU's
+                    // CRC and replaced by the next refresh. NOTE: with the
+                    // await inside, the poll-timing vmu span is wall time
+                    // including whatever other tasks ran, not pure TX cost.
+                    #[cfg(feature = "vmu")]
+                    host.write_vmu_lcd_dma(&mut bus, &send_buf).await;
+                    #[cfg(not(feature = "vmu"))]
+                    let _ = &send_buf;
+                    #[cfg(feature = "poll-timing")]
+                    pulsar_dreamcast_ble::poll_timing::record_vmu(_pt_vmu, true);
+                    vmu_frame_dirty = false;
                 }
             } else {
                 fail_count = fail_count.saturating_add(1);
@@ -669,13 +724,24 @@ async fn main(spawner: Spawner) {
                 }
             }
 
+            #[cfg(feature = "poll-timing")]
+            pulsar_dreamcast_ble::poll_timing::tick_and_log();
+
             Timer::after(Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
     }
 }
 
 /// `SoftDevice` runner task - must run continuously.
+/// Logs SOC events: `POFWARN` here plus a wall-clock correlation with VMU
+/// writes is the test of the rail-dip theory for the SD asserts.
 #[embassy_executor::task]
 async fn softdevice_task(sd: &'static Softdevice) {
-    sd.run().await;
+    sd.run_with_callback(|evt| match evt {
+        nrf_softdevice::SocEvent::PowerFailureWarning => {
+            log!("PWR: POFWARN — supply dipped below 2.5V");
+        }
+        other => log!("SOC: event {}", other as u32),
+    })
+    .await;
 }

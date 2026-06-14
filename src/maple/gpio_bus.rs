@@ -60,6 +60,20 @@ const MIN_FRAME_BYTES: usize = 4;
 /// waveforms. TX and RX never overlap, so sharing is safe.
 pub(crate) static mut SAMPLE_BUFFER: [u32; SAMPLE_BUFFER_LEN] = [0; SAMPLE_BUFFER_LEN];
 
+/// View of `SAMPLE_BUFFER` as a PWM waveform halfword buffer for DMA TX.
+///
+/// SAFETY: single-core, and TX waveform building/playback never overlaps RX
+/// bulk sampling — the same exclusivity argument as `wait_and_sample`. The
+/// buffer is in RAM, as EasyDMA requires.
+pub(crate) fn tx_waveform_buf() -> &'static mut [u16] {
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(SAMPLE_BUFFER).cast::<u16>(),
+            SAMPLE_BUFFER_LEN * 2,
+        )
+    }
+}
+
 const PIN_A_MASK: u32 = 1 << crate::board::PIN_A_BIT;
 const PIN_B_MASK: u32 = 1 << crate::board::PIN_B_BIT;
 
@@ -209,6 +223,15 @@ impl MapleBus {
     pub fn set_idle(&mut self) {
         self.sdcka.set_high();
         self.sdckb.set_low();
+    }
+
+    /// Drive both lines high — the end-pattern's final state. Used to match
+    /// GPIO OUT levels to the waveform tail for a glitch-free PWM→GPIO
+    /// handoff after a DMA TX (`pwm_tx`).
+    #[inline]
+    pub fn set_both_high(&mut self) {
+        self.sdcka.set_high();
+        self.sdckb.set_high();
     }
 
     /// Send the start/sync pattern.
@@ -426,10 +449,35 @@ impl MapleBus {
             }
 
             if a && b_transitions >= MIN_START_TRANSITIONS {
-                // Valid start pattern - sample immediately
+                // Valid start pattern - sample immediately.
+                //
+                // The sample loop is inline asm, not `for s in samples`: the
+                // compiled loop's cycle count IS the sample rate, and every
+                // decode threshold (GAP_THRESHOLD, end-of-response quiet run)
+                // is calibrated in sample counts at ~7.9 Msamples/s. Under
+                // fat LTO any unrelated code change can move a Rust loop to
+                // a non-word-aligned address, which costs +1 fetch cycle per
+                // iteration on Cortex-M4 (-12.6% sample rate, doubled read
+                // retries — debug log 2026-06-11). Registers are pinned so
+                // the encoding is byte-identical (14 bytes) in every build,
+                // and `.p2align 2` pins the branch target word-aligned.
                 compiler_fence(Ordering::SeqCst);
-                for sample in samples.iter_mut() {
-                    *sample = read_p0_in();
+                unsafe {
+                    core::arch::asm!(
+                        ".p2align 2",
+                        "2:",
+                        "ldr.w r0, [r12]",      // sample P0 IN
+                        "str r0, [r2, r1]",
+                        "adds r1, #4",
+                        "cmp.w r1, {end}",
+                        "bne 2b",
+                        end = const SAMPLE_BUFFER_LEN * 4,
+                        in("r12") P0_BASE + GPIO_IN_OFFSET,
+                        in("r2") samples.as_mut_ptr(),
+                        inout("r1") 0u32 => _,
+                        out("r0") _,
+                        options(nostack),
+                    );
                 }
                 compiler_fence(Ordering::SeqCst);
                 return (true, wait_cycles, b_transitions, SAMPLE_BUFFER_LEN);
@@ -452,6 +500,18 @@ impl MapleBus {
         start_sample: usize,
     ) -> (Vec<u8, 960>, u32, u32, u32) {
         const GAP_THRESHOLD: usize = 50;
+        // A sustained run with no edge on either line, longer than any
+        // inter-chunk gap (~900 samples at the measured ~7 M samples/s), marks
+        // the end of the response. Stop decoding there instead of scanning the
+        // rest of the 24k-sample buffer — that trailing scan was the dominant
+        // cost of get_condition (issue #5, POLLPHASE `dec` ≈ 10 ms of ~14).
+        //
+        // Quiet is detected by *absence of edges*, not by line state: after the
+        // response the bus floats with BOTH lines pulled high, so the driven
+        // idle state (A high, B low) that `GAP_THRESHOLD` matches never occurs
+        // and an A-high/B-low check would never fire (the first version of this
+        // cut made exactly that mistake and scanned the full buffer anyway).
+        const END_IDLE_THRESHOLD: usize = 3000;
 
         let mut bits: Vec<u8, 960> = Vec::new();
         let mut a_falls: u32 = 0;
@@ -467,11 +527,26 @@ impl MapleBus {
         let mut last_a = (samples[init_idx] & PIN_A_MASK) != 0;
         let mut last_b = (samples[init_idx] & PIN_B_MASK) != 0;
         let mut idle_count: usize = 0;
+        let mut quiet_count: usize = 0;
         let mut seen_first_a_fall = false;
 
         for &sample in &samples[start_idx..count] {
             let a = (sample & PIN_A_MASK) != 0;
             let b = (sample & PIN_B_MASK) != 0;
+
+            // End of response: once some bits are decoded, a long edge-free run
+            // (beyond any inter-chunk gap) means the packet is done. Stop rather
+            // than scan trailing samples. A too-early cut just fails the
+            // frame-length/CRC check below and triggers a retry — it can never
+            // produce a corrupt packet, which is what makes this safe to tune.
+            if a == last_a && b == last_b {
+                quiet_count += 1;
+                if a_falls > 0 && quiet_count > END_IDLE_THRESHOLD {
+                    break;
+                }
+            } else {
+                quiet_count = 0;
+            }
 
             // Gap detection: idle = A HIGH, B LOW
             if a && !b {
@@ -541,7 +616,13 @@ impl MapleBus {
 
     /// Read a complete response packet using bulk sampling.
     pub fn read_packet_bulk(&mut self, timeout_cycles: u32) -> Option<MaplePacket> {
+        // poll-timing spans are taken here, around whole calls — never inside
+        // wait_and_sample, whose wait/capture loops are timing-critical.
+        #[cfg(feature = "poll-timing")]
+        let _pt_read = crate::poll_timing::start();
         let (success, _wait_cycles, _b_trans, count) = self.wait_and_sample(timeout_cycles);
+        #[cfg(feature = "poll-timing")]
+        crate::poll_timing::record_read(_pt_read);
 
         if !success {
             // No start pattern detected
@@ -556,6 +637,8 @@ impl MapleBus {
                 .unwrap_unchecked()
         };
 
+        #[cfg(feature = "poll-timing")]
+        let _pt_dec = crate::poll_timing::start();
         let edges = self.find_first_edges(samples, count, 40);
         let first_edge_idx = edges.first().map_or(0, |(idx, _, _)| *idx);
         let skip_samples = if first_edge_idx > 100 {
@@ -566,6 +649,8 @@ impl MapleBus {
 
         let (bits, _a_falls, _b_falls, _gaps) =
             self.decode_bulk_samples(samples, count, skip_samples);
+        #[cfg(feature = "poll-timing")]
+        crate::poll_timing::record_decode(_pt_dec);
 
         if bits.len() < MIN_DECODE_BITS {
             return None;

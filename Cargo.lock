@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-dreamcast-ble"
-version = "0.2.2"
+version = "0.2.6"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",

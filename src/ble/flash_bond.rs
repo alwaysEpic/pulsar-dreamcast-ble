@@ -23,8 +23,28 @@ const NAME_FLASH_ADDR: u32 = 0x000F_D000;
 /// Flash page size
 const PAGE_SIZE: u32 = 4096;
 
-/// Magic number to identify valid bonding data
-const BOND_MAGIC: u32 = 0xB00D_DA7A;
+/// Magic number to identify valid bonding data (V2 schema: integrity-checked,
+/// magic written last). Distinct from the V1 magic (`0xB00D_DA7A`) so any V1
+/// record — including ones corrupted by a panic mid-save, which V1 could not
+/// detect — is discarded on upgrade and the user re-pairs once.
+///
+/// V1's torn-write hole: `save_bond` wrote the whole record front-to-back,
+/// magic first, and `is_valid` checked only the magic. An interrupted save
+/// (e.g. the 2026-06-10/11 SoftDevice assert reboot loops, which saved the
+/// bond on every reconnect cycle) left valid-magic records with garbage
+/// LTK/identity that were then fed to the SoftDevice on every boot.
+const BOND_MAGIC: u32 = 0xB00D_DB02;
+
+/// FNV-1a over the record body (everything after `magic` and `crc`), used to
+/// reject torn or bit-rotted bond records at load.
+fn bond_crc(body: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811C_9DC5;
+    for &b in body {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
 
 /// Magic number to identify valid profile preference data (V2 schema).
 /// Distinct from the legacy `NAME_MAGIC` so old prefs are ignored — fresh
@@ -36,6 +56,8 @@ const PROFILE_MAGIC: u32 = 0xB10F_C0DE;
 #[derive(Clone, Copy)]
 pub struct StoredBond {
     magic: u32,
+    /// FNV-1a over the body (all fields below this one).
+    crc: u32,
     /// MasterId.ediv
     ediv: u16,
     /// Padding for alignment
@@ -64,11 +86,28 @@ pub struct StoredBond {
     sys_attrs: [u8; 64],
 }
 
+/// Size of the header (magic + crc) preceding the integrity-checked body.
+const BOND_HEADER_LEN: usize = 8;
+
 impl StoredBond {
-    /// Check if the stored data is valid
+    /// Byte view of the body — every field after the magic/crc header.
+    fn body_bytes(&self) -> &[u8] {
+        // SAFETY: repr(C, align(4)) struct viewed as raw bytes; the header
+        // offset is within the struct and the length is exact.
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(self).cast::<u8>().add(BOND_HEADER_LEN),
+                core::mem::size_of::<Self>() - BOND_HEADER_LEN,
+            )
+        }
+    }
+
+    /// Check if the stored data is valid: magic AND body integrity. A torn
+    /// save can never pass — the header (with the magic) is written after
+    /// the body, and the crc rejects any partial body.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.magic == BOND_MAGIC
+        self.magic == BOND_MAGIC && self.crc == bond_crc(self.body_bytes())
     }
 }
 
@@ -139,6 +178,7 @@ pub async fn save_bond(
     // Prepare the data structure
     let mut stored = StoredBond {
         magic: BOND_MAGIC,
+        crc: 0,
         ediv: master_id.ediv,
         _pad1: 0,
         rand: master_id.rand,
@@ -157,6 +197,7 @@ pub async fn save_bond(
     };
     let copy_len = sys_attrs.len().min(64);
     stored.sys_attrs[..copy_len].copy_from_slice(&sys_attrs[..copy_len]);
+    stored.crc = bond_crc(stored.body_bytes());
 
     // Erase the flash page first
     flash
@@ -173,7 +214,22 @@ pub async fn save_bond(
         )
     };
 
-    flash.write(BOND_FLASH_ADDR, data).await.map_err(|_| ())?;
+    // Body first, header (crc + magic) last: a save interrupted at ANY point
+    // leaves either an erased page (magic = 0xFFFF_FFFF) or a header-less
+    // body — both rejected at load. The V1 layout wrote the magic first,
+    // which let panic-interrupted saves produce valid-looking garbage bonds
+    // that were re-fed to the SoftDevice on every boot.
+    flash
+        .write(
+            BOND_FLASH_ADDR + BOND_HEADER_LEN as u32,
+            &data[BOND_HEADER_LEN..],
+        )
+        .await
+        .map_err(|_| ())?;
+    flash
+        .write(BOND_FLASH_ADDR, &data[..BOND_HEADER_LEN])
+        .await
+        .map_err(|_| ())?;
 
     Ok(())
 }

@@ -29,17 +29,27 @@ echo ""
 echo "=== Clippy (maple-protocol) ==="
 (cd maple-protocol && cargo clippy -- -W clippy::all -W clippy::pedantic) && pass "clippy (maple-protocol)" || fail "clippy (maple-protocol)"
 
-echo ""
-echo "=== Build: XIAO release (with RTT) ==="
-cargo build --release --no-default-features --features board-xiao,rtt && pass "build (xiao+rtt)" || fail "build (xiao+rtt)"
+ELF="target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble"
 
-echo ""
-echo "=== Build: XIAO release (production, no RTT) ==="
-cargo build --release --no-default-features --features board-xiao && pass "build (xiao)" || fail "build (xiao)"
+# Build each release variant and verify its timing invariants (pinned RX
+# sampling loop, hardware-timed TX). The vmu variants are in the matrix
+# because the 2026-06-12 TX-codegen regression existed ONLY in vmu builds —
+# every shipped feature combination must be built and checked.
+build_and_check() {
+    local label="$1" features="$2"
+    echo ""
+    echo "=== Build: $label ==="
+    cargo build --release --no-default-features --features "$features" \
+        && pass "build ($label)" || fail "build ($label)"
+    ./scripts/check_timing_invariants.sh "$ELF" "$label" \
+        && pass "timing invariants ($label)" || fail "timing invariants ($label)"
+}
 
-echo ""
-echo "=== Build: DK release ==="
-cargo build --release --no-default-features --features board-dk && pass "build (dk)" || fail "build (dk)"
+build_and_check "xiao+rtt" "board-xiao,rtt"
+build_and_check "xiao" "board-xiao"
+build_and_check "xiao+vmu" "board-xiao,vmu"
+build_and_check "dk" "board-dk"
+build_and_check "dk+vmu" "board-dk,vmu"
 
 echo ""
 echo -e "${GREEN}All checks passed!${NC}"

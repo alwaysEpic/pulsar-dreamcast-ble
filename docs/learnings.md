@@ -10,7 +10,7 @@ At 2Mbps, each bit lasts 500ns. Trying to detect edges and make decisions within
 
 **Solution:** Capture raw GPIO samples into a large static buffer as fast as possible, then decode offline. This separates "is the signal there?" from "can we decode it?" and makes debugging much easier.
 
-At 64MHz, the nRF52840 gets ~15 samples per bit period — plenty of resolution for post-processing.
+Bulk sampling runs at the measured ~7.9 Msamples/s, giving ~4 samples per 500ns bit period — enough oversampling to recover edges for post-processing.
 
 ## 2. Every Microsecond Counts in the Hot Path
 
@@ -26,7 +26,7 @@ Returning from a `wait_for_start()` function and then calling `bulk_sample()` in
 
 ## 4. Static Buffers, Not Stack Allocation
 
-Allocating a 96KB buffer on the stack (`[u32; 24576]`) takes measurable time. By the time the stack frame is set up, the controller's response is already in progress.
+Allocating the sample buffer on the stack (`[u32; 24576]` = 24,576 u32 samples = 96 KiB) takes measurable time. By the time the stack frame is set up, the controller's response is already in progress.
 
 **Solution:** Use `static mut` buffers — pre-allocated at link time, zero runtime cost.
 
@@ -95,7 +95,7 @@ A `Channel` (FIFO queue) was considered but rejected: analog stick jitter fills 
 1. **Only signal on change** — reduces the window where a button press can be overwritten by identical idle-state polls. Analog jitter no longer constantly overwrites the signal.
 2. **Wake BLE task immediately on state change** — use `select` between timer and signal instead of fixed 8ms sleep, so the BLE task reads new state within ~1ms instead of up to 8ms.
 
-**Future option if needed:** Button edge accumulation — track a bitmask of buttons pressed since the last BLE read, OR it into the signaled state. This catches press+release within one poll cycle, but adds complexity and only helps when the BLE task is delayed past 16ms (rare with optimizations #1 and #2). The Maple Bus poll at 60Hz (16ms) already means sub-16ms taps are missed at the hardware level, matching original Dreamcast behavior.
+**Future option if needed:** Button edge accumulation — track a bitmask of buttons pressed since the last BLE read, OR it into the signaled state. This catches press+release within one poll cycle, but adds complexity and only helps when the BLE task is delayed past 16ms (rare with optimizations #1 and #2). The Maple Bus poll at ~60 Hz (~16-17 ms loop) already means sub-16ms taps are missed at the hardware level, matching original Dreamcast behavior.
 
 ## 13. Voltage-Based Battery Percentage Is Good Enough
 

@@ -3,6 +3,10 @@ chip = "nRF52840_xxAA"
 
 [default.rtt]
 enabled = true
+# Save the full RTT session to a timestamped file on exit — soak sessions
+# overflow the terminal scrollback. One file per channel per session.
+log_enabled = true
+log_path = "./rtt_logs"
 
 [default.gdb]
 enabled = false

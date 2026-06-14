@@ -20,13 +20,13 @@ Tested with FNB58 USB power meter, active BLE connection with occasional control
 - **Active input draw:** ~67 mA
 - **Sleep drain:** Negligible (~2% overnight, likely self-discharge)
 
-Testing in progress — preliminary results suggest ~7-8 hours on 500mAh. Battery life estimates will be updated with more complete discharge data.
+Measured draw figures yield ~7-8 hours of active gaming on 500mAh, scaling to ~14-16 hours on 1000mAh.
 
 ### Estimated Battery Life by Capacity
 
 | Battery | Active Gaming | Sleep Standby |
 |---------|--------------|---------------|
-| 500 mAh | ~7-8 hours (preliminary) | Months |
+| 500 mAh | ~7-8 hours | Months |
 | 1000 mAh | ~14-16 hours (estimated) | Months |
 
 Note: The LiPo discharge curve is nonlinear. The battery spends a long time in the 3.7-3.9V plateau then drops quickly below 3.5V. Actual runtime may vary with controller usage intensity.
@@ -65,9 +65,9 @@ Realistic accuracy is +/-10-15% in the flat middle region (3.7-3.9V), better at 
 
 ## Optimizations Implemented
 
-### 1. Boost Gating on BLE Connection (saves ~60-80 mA idle)
+### 1. Boost Gating on BLE Connection (saves ~45 mA idle)
 
-The 5V boost converter + Dreamcast controller draws 60-80 mA and serves no purpose when there's no BLE host connected. The boot flow now:
+The 5V boost converter + Dreamcast controller draws ~45 mA and serves no purpose when there's no BLE host connected. The boot flow now:
 
 1. Boot → BLE advertise (boost OFF, no controller polling)
 2. BLE connects → enable boost → detect controller → start polling
@@ -115,6 +115,14 @@ If BLE connects but no controller is found within 60 seconds, the device enters 
 
 After 10 minutes with no BLE connection (controller disconnected, host gone), the device enters System Off. Wake via sync button press (GPIO SENSE).
 
+### 10. RTT Feature Gate (saves flash size + minor power)
+
+RTT debug logging is gated behind an `rtt` Cargo feature. DK builds always include it. XIAO production builds omit it — all `log!()` calls compile to nothing, reducing binary size and eliminating string formatting overhead. Development builds opt in with `--features board-xiao,rtt`.
+
+### 11. Flash-Based Panic Logging
+
+On panic, the firmware writes the panic message to a dedicated flash page (`0xFC000`) using raw NVMC register writes (no SoftDevice dependency), then resets. On the next boot with RTT enabled, the stored panic is printed and the page is cleared. This replaces the silent `panic-reset` behavior with something debuggable.
+
 ---
 
 ## Hardware: USB 5V Passthrough
@@ -138,19 +146,9 @@ Our draw is dominated by the 5V boost converter + Dreamcast controller (~45 mA).
 
 ---
 
-### 10. RTT Feature Gate (saves flash size + minor power)
-
-RTT debug logging is gated behind an `rtt` Cargo feature. DK builds always include it. XIAO production builds omit it — all `log!()` calls compile to nothing, reducing binary size and eliminating string formatting overhead. Development builds opt in with `--features board-xiao,rtt`.
-
-### 11. Flash-Based Panic Logging
-
-On panic, the firmware writes the panic message to a dedicated flash page (`0xFC000`) using raw NVMC register writes (no SoftDevice dependency), then resets. On the next boot with RTT enabled, the stored panic is printed and the page is cleared. This replaces the silent `panic-reset` behavior with something debuggable.
-
----
-
 ## Possible Next Steps
 
-- **Slave latency** — Setting BLE slave_latency to 2-4 could save ~200-300 µA during idle connected periods. Deferred due to compatibility risk with iBlueControlMod. Only effective if combined with skipping notifications when state is unchanged, which may break Xbox HID compatibility.
+- **Slave latency** — Setting BLE slave_latency to 2-4 could save ~200-300 µA during idle connected periods. Deferred due to BLE host-compatibility risk (e.g. with the iBlueControlMod Dreamcast BLE receiver adapter). Only effective if combined with skipping notifications when state is unchanged, which may break Xbox HID compatibility.
 - **Dedicated PCB** — Eliminates perfboard losses and enables SMD components: TPS61099x50 boost converter (~90% efficiency, 5µA quiescent vs 50µA on current Pololu), BAT54 Schottky diodes (~0.23V drop vs 0.3-0.4V), and integrated charging circuit.
 - **Fuel gauge IC** — MAX17048 (~$1.50, I2C) for +/-5% battery accuracy vs current +/-10-15%. Only practical on a custom PCB.
 - **TX power reduction** — Lowering BLE TX from 0dBm to -4dBm would save ~1mA with no perceptible range impact at gamepad distances. Deferred pending range testing through plastic enclosure.

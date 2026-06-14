@@ -5,6 +5,7 @@ pub mod controller_state;
 pub mod gpio_bus;
 pub mod host;
 pub mod packet;
+pub mod pwm_tx;
 pub mod radio_notify;
 pub mod timeslot_tx;
 

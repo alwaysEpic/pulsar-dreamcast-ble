@@ -108,7 +108,7 @@ impl MapleHost {
             payload: Vec::new(),
         };
 
-        bus.write_packet(&packet);
+        bus.write_packet(&packet); // bit-bang, not DMA — see pwm_tx::write_packet_dma
 
         // Read response using bulk sampling — no logging between TX and RX!
         // The controller responds within ~100µs; any rprintln here (~20ms via RTT)
@@ -150,7 +150,11 @@ impl MapleHost {
                 payload,
             };
 
-            bus.write_packet(&packet);
+            #[cfg(feature = "poll-timing")]
+            let _pt_tx = crate::poll_timing::start();
+            bus.write_packet(&packet); // bit-bang, not DMA — see pwm_tx::write_packet_dma
+            #[cfg(feature = "poll-timing")]
+            crate::poll_timing::record_tx(_pt_tx);
 
             let response = bus.read_packet_bulk(self.timeout_cycles);
 
@@ -158,6 +162,8 @@ impl MapleHost {
                 // Retry on timeout/error
                 continue;
             };
+            #[cfg(feature = "poll-timing")]
+            crate::poll_timing::record_tries(u32::from(_attempt) + 1);
 
             if pkt.command != commands::CONDITION_RESPONSE {
                 return MapleResult::UnexpectedResponse(pkt.command);
@@ -168,6 +174,8 @@ impl MapleHost {
             };
         }
 
+        #[cfg(feature = "poll-timing")]
+        crate::poll_timing::record_tries(u32::from(MAX_RETRIES));
         MapleResult::Timeout
     }
 
@@ -182,7 +190,7 @@ impl MapleHost {
             payload: Vec::new(),
         };
 
-        bus.write_packet(&packet);
+        bus.write_packet(&packet); // bit-bang, not DMA — see pwm_tx::write_packet_dma
 
         let response = bus.read_packet_bulk(self.timeout_cycles);
         matches!(response, Some(pkt) if pkt.command == commands::DEVICE_INFO_RESPONSE)
@@ -202,6 +210,46 @@ impl MapleHost {
 
         let response = bus.read_packet_bulk(self.timeout_cycles);
         matches!(response, Some(pkt) if pkt.command == 0x07)
+    }
+
+    /// Write a framebuffer to the VMU LCD via hardware-timed PWM/EasyDMA TX.
+    ///
+    /// Preferred write path: the waveform plays with hardware timing (immune
+    /// to SoftDevice interrupts — no corrupted frames, no controller
+    /// perturbation) and the CPU awaits, so the executor runs during the
+    /// ~1.7ms TX instead of being blocked by a 7.6ms bit-bang. Fire-and-
+    /// forget like [`Self::write_vmu_lcd_unacked`]; see `maple/pwm_tx.rs`.
+    #[cfg(feature = "vmu")]
+    pub async fn write_vmu_lcd_dma(&self, bus: &mut MapleBus, framebuffer: &[u8; 192]) {
+        super::pwm_tx::write_lcd_dma(
+            bus,
+            addressing::HOST,
+            0x01, // SUB_PERIPHERAL_1
+            framebuffer,
+        )
+        .await;
+    }
+
+    /// Write a framebuffer to the VMU LCD without reading the ACK.
+    ///
+    /// The ACK only enables retrying, but a corrupted frame is harmless: the
+    /// VMU's CRC check rejects it (the LCD keeps the previous frame) and a
+    /// fresh animation frame replaces it within ~160ms anyway. Skipping the
+    /// ACK capture shrinks the radio-sensitive span from ~10ms (TX + capture)
+    /// to just the ~6.3ms TX — the difference between fitting and not fitting
+    /// the quiet gap between BLE connection events — and removes the
+    /// retry-every-poll storm a failed ACK caused (issue #5 follow-up).
+    ///
+    /// The bus is released to input mode immediately after TX so the VMU can
+    /// drive its (unobserved) ACK without contention; the next controller
+    /// poll reclaims the bus afterwards.
+    pub fn write_vmu_lcd_unacked(&self, bus: &mut MapleBus, framebuffer: &[u8; 192]) {
+        bus.write_lcd(
+            addressing::HOST,
+            0x01, // SUB_PERIPHERAL_1
+            framebuffer,
+        );
+        bus.set_input_mode();
     }
 
     /// Write a framebuffer to the VMU LCD using the SoftDevice Radio Timeslot API.

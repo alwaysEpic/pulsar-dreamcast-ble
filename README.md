@@ -146,7 +146,7 @@ The project is split into two crates:
 - **`maple-protocol/`** — Pure protocol library: controller state parsing, packet construction, Xbox HID report generation. No hardware dependencies, fully host-testable.
 - **`src/`** — Firmware: Maple Bus GPIO bit-banging, BLE stack (Nordic SoftDevice S140), board support, button handling, power management.
 
-The GPIO implementation uses bulk sampling at ~12.5MHz to capture the 2Mbps Maple Bus protocol. This is an nRF52840-specific approach — other chips (e.g., RP2040 with PIO) could implement the same protocol differently. See [maple_bus_protocol.md](docs/maple_bus_protocol.md) for the full protocol reference.
+The GPIO implementation bulk-samples both data lines at ~7.9 MS/s (≈4 samples per 500 ns bit) to capture the 2 Mbps Maple Bus protocol, then decodes in software. This is an nRF52840-specific approach — other chips (e.g., RP2040 with PIO) could implement the same protocol differently. See [maple_bus_protocol.md](docs/maple_bus_protocol.md) for the full protocol reference.
 
 ### Running Checks
 

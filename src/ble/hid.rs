@@ -164,6 +164,22 @@ impl GamepadServer {
             return Ok(());
         }
 
+        // Debug-only: stamp a 7-bit sequence counter into byte 15 bits 1-7 (HID
+        // padding; bit 0 = Consumer Record, left untouched) so a host capture can
+        // detect reports dropped between here and the host. Injected *after* dedup,
+        // so the dedup/send-on-change behavior under test is unchanged.
+        #[cfg(feature = "seq-counter")]
+        let bytes = {
+            let mut b = bytes;
+            let n = SEQ_COUNTER.lock(|c| {
+                let v = c.get();
+                c.set(v.wrapping_add(1));
+                v
+            });
+            b[15] = (b[15] & 0x01) | ((n & 0x7F) << 1);
+            b
+        };
+
         self.hid.report_notify(conn, &bytes)
     }
 }
@@ -181,3 +197,11 @@ static LAST_REPORT: embassy_sync::blocking_mutex::Mutex<
 pub fn reset_report_cache() {
     LAST_REPORT.lock(|cell| cell.set(None));
 }
+
+/// Debug sequence counter stamped into report byte 15 (bits 1-7) when the
+/// `seq-counter` feature is on, so a host capture can detect dropped reports.
+#[cfg(feature = "seq-counter")]
+static SEQ_COUNTER: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::Cell<u8>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(0));

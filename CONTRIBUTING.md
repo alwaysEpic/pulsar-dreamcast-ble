@@ -31,11 +31,11 @@ Before submitting a PR, run the full check suite:
 ./scripts/ci.sh
 ```
 
-This runs formatting, maple-protocol unit tests, clippy lints, and release builds for both board targets. CI runs the same checks on every PR.
+This runs formatting, maple-protocol unit tests (including the BlueRetro mapping fixtures), clippy lints, and release builds across every shipped feature combination (`board-xiao`/`board-dk`, with and without `vmu`/`rtt`). Each build is then checked for timing invariants — the Maple sampling loop must stay word-aligned with its pinned encoding, and the hardware-timed TX path must be present (see the timing-invariant checks in `scripts/check_timing_invariants.sh`). CI runs the same checks on every PR.
 
 ## Submitting Changes
 
-1. Fork the repo and create a branch from `master`
+1. Fork the repo and create a branch from `main`
 2. Make your changes — keep commits focused and incremental
 3. Run `./scripts/ci.sh` and ensure it passes
 4. Open a pull request with a clear description of what and why
@@ -59,6 +59,8 @@ The `maple-protocol` crate is pure Rust with no embedded dependencies. Contribut
 ### Hardware Testing
 
 If you have hardware, testing with a real Dreamcast controller is incredibly valuable. Bug reports with details about your setup (board, controller model, host device) help a lot.
+
+For changes that touch the Maple Bus or poll loop, `scripts/bench_check.sh` is the release gate: it flashes a DK with timing instrumentation, waits for your BLE host to connect, and fails unless the input path is healthy on real silicon (median sampling read-min ≤ 3250µs and median controller-read retries ≤ 90 per 60 polls). It needs the physical bench plus a connected host, so it's a manual pre-release check rather than part of `ci.sh`. The script prints the healthy reference thresholds and saves the RTT log from any failing run for diagnosis.
 
 ### Adding Board Support
 

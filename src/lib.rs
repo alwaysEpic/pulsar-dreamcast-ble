@@ -13,10 +13,24 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
 /// RTT print macro — compiles to nothing when the `rtt` feature is disabled.
+///
+/// Formats into a stack buffer FIRST, then hands the finished string to RTT:
+/// `rprintln!` runs the entire `format_args` rendering inside rtt-target's
+/// critical section, and a ~120-char POLLTIME line with ten integer
+/// conversions is a 50-200µs interrupt blackout. At 2 log lines/sec that
+/// produced stochastic SoftDevice assertion panics (~1/min) in every
+/// instrumented build of 2026-06-10/11 — see poll_timing's module docs for
+/// the full post-mortem. With pre-formatting, the critical section shrinks
+/// to a memcpy of the rendered bytes. Lines over 256 chars are truncated.
 #[cfg(feature = "rtt")]
 #[macro_export]
 macro_rules! log {
-    ($($arg:tt)*) => { rtt_target::rprintln!($($arg)*) };
+    ($($arg:tt)*) => {{
+        use core::fmt::Write as _;
+        let mut _s: heapless::String<256> = heapless::String::new();
+        let _ = core::write!(_s, $($arg)*);
+        rtt_target::rprintln!("{}", _s.as_str());
+    }};
 }
 
 /// RTT print macro — compiles to nothing when the `rtt` feature is disabled.
@@ -47,6 +61,8 @@ pub mod board;
 pub mod button;
 pub mod maple;
 pub mod panic_handler;
+#[cfg(feature = "poll-timing")]
+pub mod poll_timing;
 pub mod vmu;
 
 /// BLE HID notification interval (~125Hz, matches Xbox One S).

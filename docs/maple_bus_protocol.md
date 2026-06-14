@@ -47,12 +47,14 @@ Consolidated from three sources:
 | Parameter | [mc.pp.se] | [wiki] | [gmanmodz] |
 |-----------|------------|--------|------------|
 | Phase duration | 0.5µs | ~160ns (host), ~250ns (peripheral) | - |
-| Bit period | 1.0µs | - | - |
-| Data rate | 2 Mbps | 2 Mbps (host), 0.5-1.3 Mbps (peripheral) | 1 MB/s |
+| Bit period | 0.5µs (500ns) | - | - |
+| Data rate | 2 Mbps | 2 Mbps (host), 0.5-1.3 Mbps (peripheral) | ~2 Mbps* |
 | Edge transition (between lines) | - | ~125ns min | - |
 | Edge transition (same line) | - | ~225ns min | - |
 
 **Key insight from [wiki]:** Peripherals transmit slower than the host (~250ns/phase vs ~160ns/phase).
+
+\* [gmanmodz] writes "1 MB/s", but the bus is 2 Mbps (500ns/bit, one bit per phase) — the source conflates megabits and megabytes. All rates here are normalized to Mbps.
 
 ### Response Timing
 
@@ -339,11 +341,13 @@ SDCKA → HIGH
 | Controller response delay | 4000-6400 | 60-100µs |
 | Data stable window | ~15 | ~240ns |
 
-At 64MHz we get ~15 samples per bit — enough resolution for reliable post-processing.
+Bulk sampling runs at the measured ~7.9 Msamples/s, giving ~4 samples per 500ns bit — enough resolution for reliable post-processing.
 
 ### Approach: Bulk Sampling
 
 Real-time edge detection at 2Mbps is fragile — any function call, branch, or interrupt can miss the ~240ns stable window. Instead, we capture raw GPIO samples into a 96KB static buffer as fast as possible, then decode offline:
+
+The snippet below is illustrative pseudocode; the production capture loop is hand-written inline asm with pinned registers and `.p2align 2` so the cycle count (and thus the sample rate) is fixed across builds.
 
 ```rust
 // Tight sampling loop — no decisions, just capture

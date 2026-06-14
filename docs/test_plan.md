@@ -21,7 +21,7 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 | Laptop with Bluetooth (macOS/Windows/Linux) | BLE host, RTT console |
 | Android phone with Bluetooth | BLE host, compatibility |
 | iOS device (iPhone/iPad) | BLE host, compatibility |
-| iBlueControlMod BLE receiver | Target receiver, compatibility |
+| iBlueControlMod BLE receiver (or BlueRetro) | Target receiver, compatibility |
 | nRF Connect app (iOS/Android) | BLE service inspection |
 | Gamepad Tester website (gpadtester.com) | HID input validation |
 | J-Link / SWD debugger | RTT logging, reflash |
@@ -120,7 +120,7 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 | Field | Value |
 |-------|-------|
 | **Steps** | 1. Connect DUT. 2. Rapidly press and release A button for 10 seconds as fast as possible. 3. Observe tester for missed presses or stuck states. |
-| **Expected** | Presses and releases alternate with no stuck state. At 60Hz Maple Bus polling (16ms), presses shorter than one poll cycle will be missed -- this is a known limitation matching the Dreamcast controller's native poll rate, not a bug. |
+| **Expected** | Presses and releases alternate with no stuck state. At ~60 Hz poll (~16-17 ms loop), presses shorter than one poll cycle will be missed -- this is a known limitation matching the Dreamcast controller's native poll rate, not a bug. |
 | **Pass/Fail** | No stuck buttons. No phantom presses after stopping. Missed rapid presses are acceptable. |
 | **Known Limitation** | Very rapid presses (~<16ms) may be missed due to 60Hz Maple Bus poll rate. This matches original Dreamcast hardware behavior. |
 | **Equipment** | DUT, Dreamcast controller, laptop, gpadtester.com |
@@ -216,7 +216,7 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 | Field | Value |
 |-------|-------|
 | **Steps** | 1. Connect DUT via nRF Connect. 2. Enable notifications on HID Report characteristic (0x2A4D). 3. Press buttons on Dreamcast controller. 4. Observe notification data. |
-| **Expected** | Notifications arrive at approximately 125Hz (8ms interval). Button presses change the appropriate bytes in the 16-byte report. |
+| **Expected** | Notifications arrive at ~60 Hz (host-capped; ~15 ms connection interval on macOS). Button presses change the appropriate bytes in the 16-byte report. |
 | **Pass/Fail** | Notifications are received. Data changes correspond to physical input. |
 | **Equipment** | DUT, Dreamcast controller, nRF Connect app |
 
@@ -467,7 +467,7 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 | Field | Value |
 |-------|-------|
 | **Steps** | 1. Connect DUT. 2. Continuously move analog stick in circles while pressing buttons randomly for 10 minutes. 3. Monitor RTT for errors. |
-| **Expected** | No buffer overflows, no missed reports, no crashes. Reports continue at ~125Hz. |
+| **Expected** | No buffer overflows, no missed reports, no crashes. Reports continue at ~60 Hz. |
 | **Pass/Fail** | 10 minutes continuous operation with no errors in RTT log. |
 | **Equipment** | DUT, Dreamcast controller, host, SWD debugger |
 
@@ -493,14 +493,14 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 
 ## 5. Compatibility Testing
 
-### COMPAT-01: iBlueControlMod Receiver
+### COMPAT-01: Dreamcast BLE Receiver (iBlueControlMod / BlueRetro)
 
 | Field | Value |
 |-------|-------|
-| **Steps** | 1. Ensure Xbox name mode. 2. Pair DUT with iBlueControlMod. 3. Connect to Dreamcast console. 4. Test all inputs in a game. |
-| **Expected** | iBlueControlMod recognizes device by name, parses HID descriptor correctly. All inputs map to correct Dreamcast functions. |
+| **Steps** | 1. Ensure Xbox name mode. 2. Pair DUT with the BLE receiver (iBlueControlMod or BlueRetro). 3. Connect to Dreamcast console. 4. Test all inputs in a game. |
+| **Expected** | The receiver recognizes the device by name, parses the HID descriptor correctly. All inputs map to correct Dreamcast functions. |
 | **Pass/Fail** | All inputs functional in a Dreamcast game through the receiver. |
-| **Equipment** | DUT, Dreamcast controller, iBlueControlMod, Dreamcast console, game disc |
+| **Equipment** | DUT, Dreamcast controller, BLE receiver (iBlueControlMod or BlueRetro), Dreamcast console, game disc |
 
 ### COMPAT-02: Windows 10/11
 
@@ -685,8 +685,8 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 
 | Field | Value |
 |-------|-------|
-| **Steps** | 1. Connect DUT. 2. Calculate theoretical latency: Maple Bus poll (16ms) + BLE notify interval (8ms) + connection interval (8.75-11.25ms). 3. Optionally: record screen at 240fps while pressing a button with a visible indicator (LED or on-screen), measure frames between physical press and screen update. |
-| **Expected** | Theoretical worst case: 16 + 8 + 11.25 = ~35ms one-way. With host processing and display, end-to-end < 60ms. |
+| **Steps** | 1. Connect DUT. 2. Calculate latency from the host-delivered rate: Maple Bus poll (~16 ms) + effective BLE delivery interval (~15 ms, host-capped — the firmware requests an 8 ms notify interval, but the host negotiates a ~15 ms connection interval on macOS, see LAT-02). 3. Optionally: record screen at 240fps while pressing a button with a visible indicator (LED or on-screen), measure frames between physical press and screen update. |
+| **Expected** | Worst case: ~16 + ~15 = ~31 ms one-way at the host-capped delivery rate. With host processing and display, end-to-end < 60ms. (A firmware-internal best case of ~16 + 8 = ~24 ms is the requested rate, not the delivered one.) |
 | **Pass/Fail** | Subjectively, input should feel responsive with no perceptible lag during gameplay. |
 | **Equipment** | DUT, Dreamcast controller, host, high-speed camera (optional) |
 
@@ -694,8 +694,8 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 
 | Field | Value |
 |-------|-------|
-| **Steps** | 1. Connect DUT. 2. Monitor RTT output timing for Maple Bus polls (every POLL_INTERVAL_MS = 16ms). 3. Enable HID report notifications in nRF Connect, observe notification rate. |
-| **Expected** | Maple Bus polls at ~60Hz. BLE notifications at ~125Hz. |
+| **Steps** | 1. Connect DUT. 2. Monitor RTT output timing for Maple Bus polls (POLL_INTERVAL_MS = 8, so ~17ms loop including get_condition; a poll-timing build logs POLLTIME `period`). 3. Enable HID report notifications in nRF Connect, observe notification rate. Or use `scripts/hid_capture.py` for effective delivery rate (see REG-03). |
+| **Expected** | Maple Bus polls at ~60Hz (POLLTIME period ~16.5ms). Effective BLE delivery is capped by the host connection interval (~65Hz on macOS at a 15ms interval). |
 | **Pass/Fail** | Poll rate within 10% of target. Notification rate within 10% of target. |
 | **Equipment** | DUT, SWD debugger, nRF Connect app |
 
@@ -741,85 +741,73 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 
 ---
 
-## Test Execution Tracking
+## 9. Automated Regression Tests
 
-| Test ID | Date | Result | Notes |
-|---------|------|--------|-------|
-| FUNC-01 | | | |
-| FUNC-02 | | | |
-| FUNC-03 | | | |
-| FUNC-04 | | | |
-| FUNC-05 | | | |
-| FUNC-06 | | | |
-| FUNC-07 | | | |
-| FUNC-08 | | | |
-| FUNC-09 | | | |
-| FUNC-10 | | | |
-| FUNC-11 | | | |
-| BLE-01 | | | |
-| BLE-02 | | | |
-| BLE-03 | | | |
-| BLE-04 | | | |
-| BLE-05 | | | |
-| BLE-06 | | | |
-| BLE-07 | | | |
-| BLE-08 | | | |
-| BLE-09 | | | |
-| BLE-10 | | | |
-| BLE-11 | | | |
-| BLE-12 | | | |
-| BLE-13 | | | |
-| BLE-14 | | | |
-| BLE-15 | | | |
-| BLE-16 | | | |
-| PWR-01 | | | |
-| PWR-02 | | | |
-| PWR-03 | | | |
-| PWR-04 | | | |
-| PWR-05 | | | |
-| PWR-06 | | | |
-| PWR-07 | | | |
-| PWR-08 | | | |
-| PWR-09 | | | |
-| PWR-10 | | | |
-| PWR-11 | | | |
-| PWR-12 | | | |
-| PWR-13 | | | |
-| PWR-14 | | | |
-| PWR-15 | | | |
-| PWR-16 | | | |
-| STRESS-01 | | | |
-| STRESS-02 | | | |
-| STRESS-03 | | | |
-| STRESS-04 | | | |
-| STRESS-05 | | | |
-| STRESS-06 | | | |
-| COMPAT-01 | | | |
-| COMPAT-02 | | | |
-| COMPAT-03 | | | |
-| COMPAT-04 | | | |
-| COMPAT-05 | | | |
-| COMPAT-06 | | | |
-| COMPAT-07 | | | |
-| COMPAT-08 | | | |
-| EDGE-01 | | | |
-| EDGE-02 | | | |
-| EDGE-03 | | | |
-| EDGE-04 | | | |
-| EDGE-05 | | | |
-| EDGE-06 | | | |
-| EDGE-07 | | | |
-| EDGE-08 | | | |
-| EDGE-09 | | | |
-| EDGE-10 | | | |
-| EDGE-11 | | | |
-| EDGE-12 | | | |
-| LAT-01 | | | |
-| LAT-02 | | | |
-| SAFE-01 | | | |
-| SAFE-02 | | | |
-| SAFE-03 | | | |
-| SAFE-04 | | | |
+These guard the issue-#5 input-quality work (hardware-timed TX + pinned RX sampling); the rationale lives in the firmware and commit history.
+
+### REG-01: Static timing invariants (CI, no hardware)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | Run `./scripts/ci.sh` (or let PR CI run it). For each shipped feature combination it builds the firmware and runs `scripts/check_timing_invariants.sh` on the ELF. |
+| **Expected** | Every build passes: the Maple sampling loop is present with its exact pinned encoding at a word-aligned address, and `pwm_tx::write_packet_dma` (hardware-timed TX) is present. |
+| **Why** | Under fat LTO, an unrelated change can re-roll the sampling loop's alignment or the TX codegen. This makes either failure red at build time. |
+| **Pass/Fail** | `ci.sh` reports PASS for all variants. |
+| **Equipment** | None (host build + llvm-objdump). |
+
+### REG-02: Hardware bench gate
+
+| Field | Value |
+|-------|-------|
+| **Steps** | With a DK on USB and the BLE host ready, run `./scripts/bench_check.sh` (add `--vmu` to also exercise the LCD write path). Connect the host when prompted; leave the stick still for the 45s measurement. |
+| **Expected** | PASS: median sampling read-min ≤ 3250µs (healthy ~3128) and median controller-read retries ≤ 90 per 60 polls (healthy ~70). Period is reported but not gated (it is derived from retries). |
+| **Why** | The only test that measures real Maple timing on real silicon with the SoftDevice active. A read-min-clean / tries-high failure points at the bus/controller (signal integrity), not firmware. |
+| **Pass/Fail** | Script prints PASS. |
+| **Equipment** | DK, debug probe, Dreamcast controller, paired BLE host. |
+
+### REG-03: Rotation-completeness acceptance (issue #5)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | Pair fresh, then `uv run scripts/hid_capture.py --seconds 10 --seq` while rotating the stick continuously at a fast, steady rate. |
+| **Expected** | ~65 Hz effective delivery, ~15ms median interval, single-digit skipped-direction events (acceptance reference: ~3 skips at ~3.5 rot/s). |
+| **Why** | End-to-end confirmation that fast rotations don't drop directions — the original issue-#5 symptom — through the real BLE link. |
+| **Pass/Fail** | Skips in the low single digits; no reversals you didn't make. Re-pair first if the median interval is ~30ms (stale host connection). |
+| **Equipment** | DUT, Dreamcast controller, host with Python + `uv`. |
+
+### Known Limitations of the Regression Tests
+
+Blind spots — what these gates do *not* catch. Worth keeping in mind when a test passes, and candidates for future improvement. The project's hardest bugs have tended to be measurement blind spots, so this section is here to help find the next one faster.
+
+**Cross-cutting (all of REG-01..03):**
+- *Whole-system, not firmware-isolated.* REG-02/03 measure firmware + bench + controller + host together. Only the sampling **read-min** is firmware-isolated; **tries** is also worsened by a bad bus or a busy/slow BLE link. So a green run needs a healthy bench to mean anything, and a red run does not by itself convict the firmware. The triage rule (encoded in REG-02's output): *read-min clean + tries high ⇒ suspect the bus/controller, not firmware.*
+- *No soak / no stochastic coverage.* Every gate is a short window with a median. The original SoftDevice-assert class (a ~1/min stochastic fault, load-dependent) would pass all of these green. Rare/intermittent regressions need a long soak ritual we don't have.
+- *We gate an instrumented build but ship an uninstrumented one.* REG-02 runs `rtt,poll-timing` on a DK; releases are `board-xiao`, no rtt. Different feature set ⇒ different codegen. REG-01 covers the shipped loop statically, but the dynamic tries/period numbers are never measured on the actual shipped binary.
+
+**REG-01 (static timing invariants):**
+- *Presence ≠ wired-in.* It confirms the `write_packet_dma` symbol exists, not that the poll path actually calls it. Reverting `host.rs` to bit-banged `write_packet` while leaving `write_packet_dma` compiled-but-unused would pass. (Improvement: assert the bit-bang `write_packet` is not reachable from `get_condition`.)
+- *Brittle to intentional refactors.* It matches the sampling loop's exact instruction encoding; a legitimate register reallocation would false-fail and need the pattern updated.
+- *Alignment is necessary, not sufficient,* and it only covers the sample burst — the wait-for-start-pattern loops are still plain Rust and unchecked.
+- *Depends on symbol survival / llvm-objdump.* If LTO ever fully inlines the symbol away, or the toolchain layout shifts, it false-fails.
+
+**REG-02 (bench gate):**
+- *Thresholds are calibrated to one bench / one controller / one host.* read-min ~3128, tries ~70 are this setup's baselines; a different controller, cable, or host may need re-baselining.
+- *Blind to TX regressions when the bench is also degraded* — both surface as elevated tries, indistinguishable from the numbers alone.
+- *Manual, host-dependent, not in CI* — easy to skip; relies on discipline.
+- *Parser couples to the `log!` POLLPHASE/POLLTIME format* — a format edit silently breaks parsing (there's a NODATA guard, but a still-parseable format change mapping to wrong fields would not be caught).
+- *Failure logs preserved:* failing runs save the RTT log to `rtt_logs/bench_check_fail_*.txt` rather than discarding it.
+
+**REG-03 (rotation acceptance):**
+- *Subjective and not reproducible* — depends on the human rotating steadily; skip counts vary with technique.
+- *Host-coupled* — a stale pairing (~30ms interval) tanks it regardless of firmware; the fresh-pair precondition can't be enforced by the script.
+- *macOS-specific* — the HID-coalescing interpretation and the acceptance numbers don't transfer to Linux/Windows hosts.
+- *Report, not a gate* — no automated pass/fail; a human judges "single digits."
+- *Feature-aware seq check:* on a build without the `seq-counter` feature (byte 15 constant), the seq-counter check reports the feature as absent and skips, rather than falsely reporting "NO transit loss."
+
+**REG-04 (BlueRetro QEMU harness, already in CI):**
+- *Pinned BlueRetro commit* can drift from real-hardware behavior over time (deliberate, for reproducibility — but re-verify on bumps).
+- *Paths-filtered triggers* — the QEMU job only runs on changes to `xbox_hid.rs` / harness files; a descriptor or serializer change elsewhere wouldn't fire it.
+- *QEMU ≠ real hardware,* and the fixtures-up-to-date check is regeneration-tautological — correctness rests on the QEMU mapping job.
 
 ---
 

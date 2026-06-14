@@ -11,3 +11,6 @@ vendor/
 *.hex
 *.uf2
 tools/
+__pycache__/
+*.pyc
+rtt_logs/
