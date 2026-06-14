@@ -219,7 +219,6 @@ impl MapleHost {
     /// perturbation) and the CPU awaits, so the executor runs during the
     /// ~1.7ms TX instead of being blocked by a 7.6ms bit-bang. Fire-and-
     /// forget like [`Self::write_vmu_lcd_unacked`]; see `maple/pwm_tx.rs`.
-    #[cfg(feature = "vmu")]
     pub async fn write_vmu_lcd_dma(&self, bus: &mut MapleBus, framebuffer: &[u8; 192]) {
         super::pwm_tx::write_lcd_dma(
             bus,

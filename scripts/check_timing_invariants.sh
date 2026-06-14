@@ -10,8 +10,11 @@
 #  1. The pinned RX sampling loop must be present with its exact 5-instruction
 #     encoding at a word-aligned address (a misaligned branch target costs
 #     +1 fetch cycle per iteration on Cortex-M4: 24,576 samples -> +384us).
-#  2. The hardware-timed TX path (pwm_tx::write_packet_dma) must be present —
-#     nobody quietly reverts command TX to a bit-banged (codegen-timed) path.
+#  2. The hardware-timed VMU LCD TX must stay on the PWM/EasyDMA path: its
+#     waveform builder (pwm_tx::WaveformBuilder) must be present in the binary —
+#     it disappears if the LCD write is reverted to bit-bang. (write_lcd_dma
+#     itself inlines away under LTO, so we key off the builder it calls. The
+#     controller command TX is intentionally bit-bang at this revision.)
 #
 # Usage: check_timing_invariants.sh <elf> <label>
 
@@ -62,8 +65,8 @@ if [ $((0x$ADDR % 4)) -ne 0 ]; then
 fi
 
 # --- Check 2: hardware-timed TX present -------------------------------------
-if ! grep -c 'write_packet_dma' "$DISASM" >/dev/null; then
-    echo "FAIL [$LABEL]: pwm_tx::write_packet_dma absent — command TX must stay hardware-timed"
+if ! grep -c 'WaveformBuilder' "$DISASM" >/dev/null; then
+    echo "FAIL [$LABEL]: pwm_tx::WaveformBuilder absent — VMU LCD TX must stay on the PWM/EasyDMA path"
     exit 1
 fi
 

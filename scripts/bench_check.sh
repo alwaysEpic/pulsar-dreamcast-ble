@@ -51,7 +51,9 @@ CONNECT_TIMEOUT=120       # seconds to wait for the host to connect
 FEATURES="board-dk,rtt,poll-timing"
 LABEL="dk+poll-timing"
 if [ "${1:-}" = "--vmu" ]; then
-    FEATURES="$FEATURES,vmu"
+    # Label-only marker: VMU is always compiled in (there is no `vmu` feature),
+    # so this flag does not change the build. It just records that you've docked
+    # the VMU to exercise the LCD write path on real hardware during this run.
     LABEL="dk+poll-timing+vmu"
 fi
 

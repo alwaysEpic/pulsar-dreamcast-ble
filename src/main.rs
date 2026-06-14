@@ -238,7 +238,6 @@ async fn main(spawner: Spawner) {
             // XIAO actually enters System Off, DK halts via WFI.
             if pulsar_dreamcast_ble::GOODBYE_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
                 log!("MAIN: Phase 1 goodbye");
-                #[cfg(feature = "vmu")]
                 {
                     bus.set_output_mode();
                     Timer::after(Duration::from_millis(20)).await;
@@ -488,7 +487,6 @@ async fn main(spawner: Spawner) {
                 // a SYNC splash to the VMU so it persists through Phase 1.
                 if conn_state == ConnectionState::SyncMode {
                     log!("MAIN: Sync mode entered, writing SYNC splash");
-                    #[cfg(feature = "vmu")]
                     {
                         let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"SYNC");
                         pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
@@ -584,7 +582,6 @@ async fn main(spawner: Spawner) {
                 // here so every frame gets it regardless of content source.
                 if vmu_frame_dirty {
                     if !vmu_enumerated {
-                        #[cfg(feature = "vmu")]
                         let _ = host.enumerate_vmu(&mut bus);
                         vmu_enumerated = true;
                     }
@@ -607,10 +604,7 @@ async fn main(spawner: Spawner) {
                     // CRC and replaced by the next refresh. NOTE: with the
                     // await inside, the poll-timing vmu span is wall time
                     // including whatever other tasks ran, not pure TX cost.
-                    #[cfg(feature = "vmu")]
                     host.write_vmu_lcd_dma(&mut bus, &send_buf).await;
-                    #[cfg(not(feature = "vmu"))]
-                    let _ = &send_buf;
                     #[cfg(feature = "poll-timing")]
                     pulsar_dreamcast_ble::poll_timing::record_vmu(_pt_vmu, true);
                     vmu_frame_dirty = false;
@@ -741,6 +735,9 @@ async fn softdevice_task(sd: &'static Softdevice) {
         nrf_softdevice::SocEvent::PowerFailureWarning => {
             log!("PWR: POFWARN — supply dipped below 2.5V");
         }
+        // `log!` compiles to nothing without `rtt`, so `other` reads as unused
+        // in production builds — it's only referenced for diagnostics.
+        #[allow(unused_variables)]
         other => log!("SOC: event {}", other as u32),
     })
     .await;

@@ -3,7 +3,7 @@ members = [".", "maple-protocol"]
 
 [package]
 name = "pulsar-dreamcast-ble"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["alwaysEpic"]
@@ -63,10 +63,8 @@ seq-counter = []
 #   cargo build --release --no-default-features --features board-dk,rtt,poll-timing
 poll-timing = ["rtt"]
 
-# VMU LCD display (boot splash + animated pulsar with battery overlay), off by
-# default because it needs the VMU docked in the controller. The display writes
-# use the hardware-timed PWM/EasyDMA TX (maple/pwm_tx.rs), the same engine the
-# controller poll now uses — interrupt- and codegen-immune, so the animation no
-# longer perturbs input the way the old bit-banged write did (issue #5; see
-# ADR-009 and docs/working_logs/dk_debug_log.md 2026-06-12). Enable: --features vmu.
-vmu = []
+# The VMU LCD display is always compiled in (there is no `vmu` feature). The
+# display write uses the hardware-timed PWM/EasyDMA TX (maple/pwm_tx.rs) —
+# interrupt- and codegen-immune and proven not to perturb controller input — so
+# there is nothing to gate. One artifact per board; an absent VMU simply leaves
+# the fire-and-forget write unanswered.

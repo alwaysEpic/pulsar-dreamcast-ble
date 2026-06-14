@@ -20,8 +20,22 @@ use heapless::Vec;
 /// Number of u32 samples in the bulk capture buffer.
 const SAMPLE_BUFFER_LEN: usize = 24576;
 
-/// NOP iterations for a ~500ns half-bit delay at 64MHz.
+/// NOP iterations for a half-bit delay (used by the timeslot TX fallback).
 pub const HALF_BIT_NOPS: u32 = 32;
+
+/// Cycle-counter target for one bit-banged Maple half-bit (DWT CYCCNT @ 64MHz).
+///
+/// The old `HALF_BIT_NOPS = 32` loop works on the production XIAO, but its
+/// actual duration is a codegen artifact: with fat LTO, unrelated code changes
+/// can re-inline the TX path and move the wire timing. POLLPHASE data from that
+/// working build puts a GET_CONDITION TX around 395us. That frame contains 163
+/// calls to `delay_half_bit` (idle + start + frame + one payload word + CRC +
+/// end), so the known-good XIAO center is about 155 CPU cycles per half-bit.
+const HALF_BIT_CYCLES: u32 = 155;
+
+/// Ignore normal busy-wait/read overshoot, but do not let a real interrupt make
+/// the next half-bit short while the schedule tries to catch up.
+const TX_DEADLINE_GRACE_CYCLES: u32 = 8;
 
 /// NOP iterations for pin stabilization after output mode set.
 pub const PIN_STABILIZE_NOPS: u32 = 100;
@@ -89,11 +103,49 @@ fn read_p0_in() -> u32 {
     unsafe { core::ptr::read_volatile((P0_BASE + GPIO_IN_OFFSET) as *const u32) }
 }
 
-/// ~500ns delay at 64MHz
-#[inline]
+/// Read the DWT cycle counter. Enabled once in `MapleBus::new`.
+#[inline(always)]
+fn cyccnt() -> u32 {
+    // SAFETY: CYCCNT is a free-running read-only counter; reading is always safe.
+    unsafe { (*cortex_m::peripheral::DWT::PTR).cyccnt.read() }
+}
+
+/// Absolute cycle deadline for the next bit-banged half-bit edge.
+///
+/// Accessed only from the single poll-task TX path (`write_packet`/`write_lcd`
+/// and their pattern/bit helpers). TX never overlaps RX or re-enters, so this
+/// has the same single-context invariant as `SAMPLE_BUFFER`.
+static mut TX_DEADLINE: u32 = 0;
+
+/// Reset the half-bit schedule to "now" at the start of each TX frame.
+#[inline(always)]
+fn tx_timing_reset() {
+    // SAFETY: single TX context (see `TX_DEADLINE`).
+    unsafe { TX_DEADLINE = cyccnt() };
+}
+
+/// One Maple half-bit, anchored to the DWT cycle counter.
+///
+/// The period is the measured XIAO-good center, not the compiled duration of a
+/// Rust `for` loop. If the wait is late by more than normal read/branch
+/// overshoot, resync to the delivered edge so we stretch one half-bit rather
+/// than compressing the next one.
+#[inline(always)]
 fn delay_half_bit() {
-    for _ in 0..HALF_BIT_NOPS {
-        cortex_m::asm::nop();
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: single TX context (see `TX_DEADLINE`).
+    let deadline = unsafe {
+        let d = TX_DEADLINE.wrapping_add(HALF_BIT_CYCLES);
+        TX_DEADLINE = d;
+        d
+    };
+
+    while (cyccnt().wrapping_sub(deadline) as i32) < 0 {}
+
+    let late = cyccnt().wrapping_sub(deadline);
+    if late > TX_DEADLINE_GRACE_CYCLES {
+        // SAFETY: single TX context.
+        unsafe { TX_DEADLINE = deadline.wrapping_add(late) };
     }
     compiler_fence(Ordering::SeqCst);
 }
@@ -122,6 +174,17 @@ impl MapleBus {
         // Small delay for pins to stabilize
         for _ in 0..PIN_STABILIZE_NOPS {
             cortex_m::asm::nop();
+        }
+
+        // Enable the DWT cycle counter for cycle-anchored bit-bang TX timing
+        // (`delay_half_bit`). Idempotent one-time enable; harmless if another
+        // diagnostic feature has already enabled it.
+        // SAFETY: DWT/DCB are core debug peripherals not owned elsewhere at
+        // run time; this only sets the CYCCNT-enable bits.
+        unsafe {
+            let mut core = cortex_m::Peripherals::steal();
+            core.DCB.enable_trace();
+            core.DWT.enable_cycle_counter();
         }
 
         Self { sdcka, sdckb }
@@ -333,6 +396,7 @@ impl MapleBus {
     pub fn write_packet(&mut self, packet: &MaplePacket) {
         self.set_output_mode();
         self.set_idle();
+        tx_timing_reset();
         delay_half_bit(); // Stabilize before start pattern
         let mut phase = true;
 
@@ -357,6 +421,7 @@ impl MapleBus {
     pub fn write_lcd(&mut self, sender: u8, dest: u8, framebuffer: &[u8; 192]) {
         self.set_output_mode();
         self.set_idle();
+        tx_timing_reset();
         delay_half_bit();
         let mut phase = true;
         self.send_start_pattern();

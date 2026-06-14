@@ -32,9 +32,8 @@ echo "=== Clippy (maple-protocol) ==="
 ELF="target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble"
 
 # Build each release variant and verify its timing invariants (pinned RX
-# sampling loop, hardware-timed TX). The vmu variants are in the matrix
-# because the 2026-06-12 TX-codegen regression existed ONLY in vmu builds —
-# every shipped feature combination must be built and checked.
+# sampling loop, hardware-timed VMU LCD TX). VMU is always compiled in now, so
+# every variant exercises it — there is no separate +vmu matrix to maintain.
 build_and_check() {
     local label="$1" features="$2"
     echo ""
@@ -47,9 +46,7 @@ build_and_check() {
 
 build_and_check "xiao+rtt" "board-xiao,rtt"
 build_and_check "xiao" "board-xiao"
-build_and_check "xiao+vmu" "board-xiao,vmu"
 build_and_check "dk" "board-dk"
-build_and_check "dk+vmu" "board-dk,vmu"
 
 echo ""
 echo -e "${GREEN}All checks passed!${NC}"

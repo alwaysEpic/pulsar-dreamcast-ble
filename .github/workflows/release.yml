@@ -18,9 +18,9 @@ jobs:
       matrix:
         include:
           - board: xiao
-            features: board-xiao,vmu
+            features: board-xiao
           - board: dk
-            features: board-dk,vmu
+            features: board-dk
     steps:
       - uses: actions/checkout@v4
 
