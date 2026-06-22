@@ -14,7 +14,7 @@
 
 #[allow(unused_imports)] // Re-exports for external consumers
 pub use maple_protocol::xbox_hid::{
-    buttons, hat, GamepadReport, HID_REPORT_DESCRIPTOR_EXT, HID_REPORT_DESCRIPTOR_STD,
+    buttons, hat, GamepadReport, HID_REPORT_DESCRIPTOR_GENERIC, HID_REPORT_DESCRIPTOR_XBOX,
 };
 
 use heapless::Vec;
@@ -54,6 +54,21 @@ pub struct HidService {
         descriptor(uuid = "2908", security = "JustWorks", value = "[0x01, 0x01]")
     )]
     pub report: [u8; 16],
+
+    /// HID Report - Output (UUID 0x2A4D), Report ID 3 — rumble (8 bytes).
+    /// The real Xbox One S/Series BLE controller exposes this, and Windows'
+    /// "Bluetooth LE XINPUT compatible input device" driver requires an Output
+    /// report to start (no Output → Code 10 / STATUS_INVALID_PARAMETER). Writes
+    /// are accepted and ignored — the gatt_server run loop swallows all writes
+    /// (no Dreamcast rumble actuator wired yet).
+    #[characteristic(
+        uuid = "2A4D",
+        write,
+        write_without_response,
+        security = "JustWorks",
+        descriptor(uuid = "2908", security = "JustWorks", value = "[0x03, 0x02]")
+    )]
+    pub rumble: [u8; 8],
 
     /// HID Control Point (UUID 0x2A4C) - Write without response
     #[characteristic(uuid = "2A4C", write_without_response, security = "JustWorks")]
@@ -112,7 +127,8 @@ impl GamepadServer {
 
         // Initial report: sticks centered (32768), everything else zero
         let initial_report = GamepadReport::new();
-        self.hid.report_set(&initial_report.to_bytes())?;
+        self.hid
+            .report_set(&(profile.serialize_report)(initial_report))?;
 
         // Device Information from active profile
         let mut manufacturer: Vec<u8, 32> = Vec::new();
@@ -148,8 +164,7 @@ impl GamepadServer {
         conn: &Connection,
         report: &GamepadReport,
     ) -> Result<(), NotifyValueError> {
-        let profile = crate::ble::softdevice::get_profile();
-        let bytes = (profile.serialize_report)(*report);
+        let bytes = Self::serialize_report_for_active_profile(report);
 
         let mut skip = false;
         LAST_REPORT.lock(|cell| {
@@ -181,6 +196,13 @@ impl GamepadServer {
         };
 
         self.hid.report_notify(conn, &bytes)
+    }
+
+    /// Serialize a report using the active BLE profile.
+    #[must_use]
+    pub fn serialize_report_for_active_profile(report: &GamepadReport) -> [u8; 16] {
+        let profile = crate::ble::softdevice::get_profile();
+        (profile.serialize_report)(*report)
     }
 }
 

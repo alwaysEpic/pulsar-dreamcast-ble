@@ -14,7 +14,7 @@ pub mod softdevice;
 pub mod task;
 
 pub use hid::GamepadServer;
-pub use profile::{Profile, ProfileId, PROFILE_EXT, PROFILE_STD};
+pub use profile::{Profile, ProfileId, PROFILE_GENERIC, PROFILE_XBOX};
 pub use security::Bonder;
 pub use softdevice::{
     advertise, get_connection_state, init_softdevice, set_connection_state, set_profile,

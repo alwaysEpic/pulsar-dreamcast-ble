@@ -1,0 +1,4 @@
+# Extra deps for the UHID/evdev end-to-end test (test_evdev_mapping.py).
+# Linux only — needs /dev/uhid and the libevdev C library. Installed in CI.
+-r requirements.txt
+libevdev>=0.5

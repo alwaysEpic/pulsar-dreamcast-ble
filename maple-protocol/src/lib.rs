@@ -19,5 +19,6 @@
 #![no_std]
 
 pub mod controller_state;
+pub mod guide_chord;
 pub mod packet;
 pub mod xbox_hid;

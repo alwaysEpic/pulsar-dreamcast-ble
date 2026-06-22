@@ -48,7 +48,7 @@ fn bond_crc(body: &[u8]) -> u32 {
 
 /// Magic number to identify valid profile preference data (V2 schema).
 /// Distinct from the legacy `NAME_MAGIC` so old prefs are ignored — fresh
-/// install or post-upgrade defaults to `ProfileId::Std`.
+/// install or post-upgrade defaults to `ProfileId::Xbox`.
 const PROFILE_MAGIC: u32 = 0xB10F_C0DE;
 
 /// Stored bonding data structure (must be 4-byte aligned for flash writes)
@@ -238,23 +238,23 @@ pub async fn save_bond(
 #[repr(C, align(4))]
 struct StoredProfile {
     magic: u32,
-    /// `ProfileId` discriminant: 0 = Std, 1 = Ext.
+    /// `ProfileId` discriminant: 0 = Xbox, 1 = Generic.
     profile_id: u8,
     _pad: [u8; 3],
 }
 
-/// Load active profile from flash, defaulting to `Std` when no valid pref is stored.
+/// Load active profile from flash, defaulting to `Xbox` when no valid pref is stored.
 #[must_use]
 pub fn load_profile() -> crate::ble::profile::ProfileId {
     use crate::ble::profile::ProfileId;
     // SAFETY: NAME_FLASH_ADDR is a valid, aligned flash address. StoredProfile is repr(C, align(4)).
     let stored = unsafe { &*(NAME_FLASH_ADDR as *const StoredProfile) };
     if stored.magic != PROFILE_MAGIC {
-        return ProfileId::Std;
+        return ProfileId::Xbox;
     }
     match stored.profile_id {
-        1 => ProfileId::Ext,
-        _ => ProfileId::Std,
+        1 => ProfileId::Generic,
+        _ => ProfileId::Xbox,
     }
 }
 

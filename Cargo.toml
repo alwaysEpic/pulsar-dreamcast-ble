@@ -3,7 +3,7 @@ members = [".", "maple-protocol"]
 
 [package]
 name = "pulsar-dreamcast-ble"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["alwaysEpic"]

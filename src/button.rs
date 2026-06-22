@@ -119,7 +119,7 @@ async fn handle_triple_press(led: &mut Output<'static>) {
 ///
 /// - Hold 3 seconds: enter pairing/sync mode
 /// - Hold 10 seconds: enter System Off (manual sleep)
-/// - Triple-press within 2 seconds: toggle BLE profile (STD <-> EXT) and reset
+/// - Triple-press within 2 seconds: toggle BLE profile (Xbox <-> Generic) and reset
 ///
 /// LED behavior based on `ConnectionState`:
 /// - `Idle`/`Reconnecting`: OFF

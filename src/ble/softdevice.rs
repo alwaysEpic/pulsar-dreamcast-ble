@@ -9,7 +9,7 @@ use nrf_softdevice::ble::{peripheral, Connection};
 use nrf_softdevice::{raw, Softdevice};
 
 use crate::ble::hid::GamepadServer;
-use crate::ble::profile::{Profile, PROFILE_STD};
+use crate::ble::profile::{Profile, PROFILE_XBOX};
 use crate::ble::security::Bonder;
 
 /// Connection state machine states.
@@ -153,9 +153,9 @@ static ADV_DATA_RECONNECT: [u8; 13] = [
 ];
 
 /// Active profile pointer, set at init and read during advertising.
-/// Defaults to `PROFILE_STD` so calls before `set_profile` still resolve.
+/// Defaults to `PROFILE_XBOX` so calls before `set_profile` still resolve.
 static ACTIVE_PROFILE: AtomicPtr<Profile> =
-    AtomicPtr::new(&PROFILE_STD as *const Profile as *mut Profile);
+    AtomicPtr::new(&PROFILE_XBOX as *const Profile as *mut Profile);
 
 /// Set the active profile (called once at init before advertising starts).
 pub fn set_profile(profile: &'static Profile) {

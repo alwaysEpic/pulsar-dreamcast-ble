@@ -1,0 +1,4 @@
+# Core deps for the descriptor-layout tests (test_descriptor_layout.py).
+# Pure-Python; runs on any OS (the hid-tools *parser* needs no kernel).
+hid-tools>=0.8
+pytest>=7.0

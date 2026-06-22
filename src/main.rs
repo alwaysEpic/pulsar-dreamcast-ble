@@ -90,7 +90,7 @@ async fn main(spawner: Spawner) {
         board::qspi_flash_deep_power_down();
     }
 
-    // Load active profile from flash; defaults to STD on first boot.
+    // Load active profile from flash; defaults to Xbox on first boot.
     let profile_id = ble::flash_bond::load_profile();
     let profile = profile_id.profile();
     log!(
@@ -395,6 +395,10 @@ async fn main(spawner: Spawner) {
         let mut vmu_anim_counter: u16 = 0;
         // ~17ms per poll, splash holds ~30s before transitioning to the pulsar.
         let mut vmu_splash_polls: u16 = 30 * 60;
+        // Polls to hold the Guide-chord "home" glyph (~1s at ~17ms/poll)
+        // before resuming normal content. 0 = not showing it.
+        const VMU_HOME_POLLS: u16 = 60;
+        let mut vmu_home_polls: u16 = 0;
         // Advance the animation every 20 polls (~340ms, ~3fps). Each frame is
         // a ~1.7ms hardware-timed DMA TX the CPU awaits through — ~0.5ms of
         // average poll period, no bus corruption possible.
@@ -547,8 +551,51 @@ async fn main(spawner: Spawner) {
                 // costs ~0.5ms of average poll period and cannot corrupt the
                 // bus or perturb the controller.
                 let vmu_busy = goodbye_state.is_some();
+                // Best-effort Guide-chord home glyph. Consume the one-shot flag
+                // (only when not mid-goodbye) and swap in the house icon; the
+                // hold counter keeps it on-screen for ~1s. This only changes
+                // WHICH frame the existing single write sends — no extra bus
+                // traffic, so Maple timing is untouched. If a chord fires during
+                // goodbye it's simply dropped (device is shutting down).
+                if !vmu_busy
+                    && pulsar_dreamcast_ble::GUIDE_GLYPH_PENDING
+                        .swap(false, core::sync::atomic::Ordering::Relaxed)
+                {
+                    vmu_framebuf = pulsar_dreamcast_ble::vmu::build_home_splash();
+                    vmu_frame_dirty = true;
+                    vmu_home_polls = VMU_HOME_POLLS;
+                }
                 if vmu_busy {
                     // Goodbye in flight — leave vmu_framebuf alone.
+                } else if vmu_home_polls > 0 {
+                    vmu_home_polls -= 1;
+                    // Re-mark dirty on the animation interval so the static home
+                    // frame retries past the ~64% CRC-collision drop rate and
+                    // reliably lands; the framebuffer content stays the house.
+                    if vmu_home_polls % VMU_ANIM_INTERVAL == 0 {
+                        vmu_frame_dirty = true;
+                    }
+                    if vmu_home_polls == 0 {
+                        // Hold over: explicitly redraw the underlying content
+                        // *now* so the house never lingers. The splash/animation
+                        // branches below only re-render on their own schedule, so
+                        // relying on them would freeze the house on-screen (the
+                        // splash branch doesn't redraw at all). Restore the boot
+                        // profile splash if still in its window, else the pulsar.
+                        if vmu_splash_polls > 0 {
+                            vmu_framebuf = pulsar_dreamcast_ble::vmu::build_profile_splash(
+                                profile.vmu_glyph,
+                                profile.vmu_label,
+                            );
+                        } else {
+                            vmu_framebuf =
+                                pulsar_dreamcast_ble::vmu::build_animated_frame(vmu_anim_step);
+                            vmu_anim_step =
+                                (vmu_anim_step + 1) % pulsar_dreamcast_ble::vmu::ROTATION_FRAMES;
+                            vmu_anim_counter = 0;
+                        }
+                        vmu_frame_dirty = true;
+                    }
                 } else if vmu_delay > 0 {
                     vmu_delay -= 1;
                 } else if vmu_splash_polls > 0 {

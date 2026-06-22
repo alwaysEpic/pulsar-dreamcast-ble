@@ -14,7 +14,7 @@ the descriptor, which physical input maps to which normalized function. That is
 exactly the stage issue #2 is about, and it is system-independent, so `system.DC`
 here is just the connection target.
 
-A red STD test is the harness doing its job: it means our STD descriptor does not
+A red Xbox test is the harness doing its job: it means our Xbox descriptor does not
 parse the way a genuine Xbox One S BLE controller does, i.e. issue #2 reproduced.
 Once the descriptor is fixed these go (and stay) green.
 
@@ -36,9 +36,9 @@ from device_data.gc import gc_axes
 from device_data.test_data_generator import axes_test_data_generator
 
 
-# Names match PROFILE_STD / PROFILE_EXT gap_name in src/ble/profile.rs.
-DEVICE_NAME_STD = 'Xbox Wireless Controller'
-DEVICE_NAME_EXT = 'Dreamcast Wireless Controller'
+# Names match PROFILE_XBOX / PROFILE_GENERIC gap_name in src/ble/profile.rs.
+DEVICE_NAME_XBOX = 'Xbox Wireless Controller'
+DEVICE_NAME_DREAMCAST = 'Dreamcast Wireless Controller'
 
 with open(os.path.join(os.path.dirname(__file__), 'fixtures.json'), encoding='utf-8') as _f:
     FIXTURES = json.load(_f)
@@ -61,18 +61,18 @@ def _expected_generic(wire):
 
 
 def _check_buttons(blueretro, descriptor):
-    ''' Send `descriptor`, then our STD (gappy) report bytes for each button, and
-        return a list of mapping failures. Shared by the control and the STD test
+    ''' Send `descriptor`, then our Xbox (gappy) report bytes for each button, and
+        return a list of mapping failures. Shared by the control and the Xbox test
         so the *only* difference between them is the descriptor under test. '''
-    blueretro.send_name(DEVICE_NAME_STD)
+    blueretro.send_name(DEVICE_NAME_XBOX)
     blueretro.send_hid_desc(descriptor)
 
     for _ in range(2):
-        blueretro.send_to_bridge(0x01, FIXTURES['neutral']['std'])
+        blueretro.send_to_bridge(0x01, FIXTURES['neutral']['xbox'])
 
     failures = []
     for name, reports in FIXTURES['buttons'].items():
-        report = reports['std']
+        report = reports['xbox']
         rsp = blueretro.send_to_bridge(0x01, report)
 
         wire = _wire_btns(report)
@@ -94,7 +94,7 @@ def test_harness_control_reference_xbox(blueretro):
     ''' Control / baseline. Runs the exact assertion path below against
         BlueRetro's OWN reference Xbox One S BLE descriptor (imported from their
         suite). This MUST be green: it proves the harness is wired correctly and
-        our assertions are sound, so a red STD test is a real finding about our
+        our assertions are sound, so a red Xbox test is a real finding about our
         descriptor — not a harness bug. If this is red, fix the harness first. '''
     # Hard import (not importorskip): this control is the harness gate, so a
     # missing/renamed reference module must FAIL the job, not silently skip it.
@@ -104,7 +104,7 @@ def test_harness_control_reference_xbox(blueretro):
         pytest.fail(
             "CONTROL BROKEN — BlueRetro reference module 'pytest_xbox_ble_controller' "
             f"could not be imported ({exc}); the harness gate is gone, fix it before "
-            "trusting any STD result.")
+            "trusting any Xbox result.")
     failures = _check_buttons(blueretro, xbox_ref.HID_DESC)
     assert not failures, (
         "CONTROL FAILED — harness wiring/assertions are wrong, not our descriptor:\n  "
@@ -112,23 +112,23 @@ def test_harness_control_reference_xbox(blueretro):
 
 
 @pytest.mark.parametrize('blueretro', [[system.DC, dev_mode.PAD, bt_conn_type.BT_LE]], indirect=True)
-def test_pulsar_std_buttons_mapping(blueretro):
-    ''' Each physical button on the STD profile must decode to the right
+def test_pulsar_xbox_buttons_mapping(blueretro):
+    ''' Each physical button on the Xbox profile must decode to the right
         BlueRetro-generic button (the bug in issue #2). Only meaningful if the
         control above is green. '''
-    failures = _check_buttons(blueretro, bytes.fromhex(FIXTURES['descriptors']['std']))
-    assert not failures, "STD profile mis-maps buttons on BlueRetro:\n  " + "\n  ".join(failures)
+    failures = _check_buttons(blueretro, bytes.fromhex(FIXTURES['descriptors']['xbox']))
+    assert not failures, "Xbox profile mis-maps buttons on BlueRetro:\n  " + "\n  ".join(failures)
 
 
 @pytest.mark.parametrize('blueretro', [[system.DC, dev_mode.PAD, bt_conn_type.BT_LE]], indirect=True)
-def test_pulsar_std_dpad_mapping(blueretro):
+def test_pulsar_xbox_dpad_mapping(blueretro):
     ''' The hat switch (byte 12) must decode to the right D-pad directions.
-        Mirrors BlueRetro's own Xbox BLE hat test against our STD descriptor. '''
-    blueretro.send_name(DEVICE_NAME_STD)
-    blueretro.send_hid_desc(bytes.fromhex(FIXTURES['descriptors']['std']))
+        Mirrors BlueRetro's own Xbox BLE hat test against our Xbox descriptor. '''
+    blueretro.send_name(DEVICE_NAME_XBOX)
+    blueretro.send_hid_desc(bytes.fromhex(FIXTURES['descriptors']['xbox']))
 
     for _ in range(2):
-        blueretro.send_to_bridge(0x01, FIXTURES['neutral']['std'])
+        blueretro.send_to_bridge(0x01, FIXTURES['neutral']['xbox'])
 
     # hat nibble 0 = null/neutral, 1..8 = N, NE, E, ... ; 9..15 = out of range -> neutral.
     shifted_hat = hat_to_ld_btns[-1:] + hat_to_ld_btns[:-1]
@@ -146,20 +146,20 @@ def test_pulsar_std_dpad_mapping(blueretro):
             failures.append(
                 f"hat {hat_value}: expected d-pad=0x{br_btns:08x} got=0x{rsp['generic_input']['btns'][0]:08x}")
 
-    assert not failures, "STD profile mis-maps the D-pad on BlueRetro:\n  " + "\n  ".join(failures)
+    assert not failures, "Xbox profile mis-maps the D-pad on BlueRetro:\n  " + "\n  ".join(failures)
 
 
 @pytest.mark.parametrize('blueretro', [[system.DC, dev_mode.PAD, bt_conn_type.BT_LE]], indirect=True)
-def test_pulsar_std_axes_scaling(blueretro):
+def test_pulsar_xbox_axes_scaling(blueretro):
     ''' Sticks (unsigned 0-65535, center 32768) and triggers (0-1023) must decode
         to the right axis with the right range/sign. Guards the signed-Logical-
         Maximum stick regression (the 0x26 FF FF -> -1 bug) and confirms our
         right-stick (Rx/Ry) and trigger (Z/Rz) usages land on the expected axes. '''
-    blueretro.send_name(DEVICE_NAME_STD)
-    blueretro.send_hid_desc(bytes.fromhex(FIXTURES['descriptors']['std']))
+    blueretro.send_name(DEVICE_NAME_XBOX)
+    blueretro.send_hid_desc(bytes.fromhex(FIXTURES['descriptors']['xbox']))
 
     for _ in range(2):
-        blueretro.send_to_bridge(0x01, FIXTURES['neutral']['std'])
+        blueretro.send_to_bridge(0x01, FIXTURES['neutral']['xbox'])
 
     failures = []
     for axes in axes_test_data_generator(xbox_axes, gc_axes, 0.0135):
@@ -180,34 +180,34 @@ def test_pulsar_std_axes_scaling(blueretro):
                     f"{ax.name}: generic expected {axes[ax]['generic']} "
                     f"got {rsp['generic_input']['axes'][ax]}")
 
-    assert not failures, "STD profile mis-scales axes on BlueRetro:\n  " + "\n  ".join(failures)
+    assert not failures, "Xbox profile mis-scales axes on BlueRetro:\n  " + "\n  ".join(failures)
 
 
-@pytest.mark.xfail(reason="EXT targets Steam/PC (generic HID); its contiguous "
+@pytest.mark.xfail(reason="Generic targets Steam/PC (generic HID); its contiguous "
                           "Button 1-15 layout is expected to mis-map on BlueRetro, "
                           "whose generic-HID order is A,B,C,X,Y,Z. Probe only.",
                    strict=False)
 @pytest.mark.parametrize('blueretro', [[system.DC, dev_mode.PAD, bt_conn_type.BT_LE]], indirect=True)
-def test_pulsar_ext_buttons_probe(blueretro):
-    ''' Characterize what BlueRetro does with the EXT profile. EXT is the
+def test_pulsar_generic_buttons_probe(blueretro):
+    ''' Characterize what BlueRetro does with the Generic profile. Generic is the
         xpadneo-style contiguous layout meant for Steam/Linux/Android, not for
         BlueRetro. This probe asserts the *correct* mapping (same generic button
-        each physical button should produce) and is xfail-tolerant: XFAIL = EXT
+        each physical button should produce) and is xfail-tolerant: XFAIL = Generic
         mis-maps on BlueRetro as expected; XPASS = it happens to work, revisit. '''
-    blueretro.send_name(DEVICE_NAME_EXT)
-    blueretro.send_hid_desc(bytes.fromhex(FIXTURES['descriptors']['ext']))
+    blueretro.send_name(DEVICE_NAME_DREAMCAST)
+    blueretro.send_hid_desc(bytes.fromhex(FIXTURES['descriptors']['generic']))
 
     for _ in range(2):
-        blueretro.send_to_bridge(0x01, FIXTURES['neutral']['ext'])
+        blueretro.send_to_bridge(0x01, FIXTURES['neutral']['generic'])
 
     failures = []
     for name, reports in FIXTURES['buttons'].items():
-        # The correct generic button is what the (known-good) STD wire produces.
-        correct = _expected_generic(_wire_btns(reports['std']))
-        rsp = blueretro.send_to_bridge(0x01, reports['ext'])
+        # The correct generic button is what the (known-good) Xbox wire produces.
+        correct = _expected_generic(_wire_btns(reports['xbox']))
+        rsp = blueretro.send_to_bridge(0x01, reports['generic'])
         got = rsp['generic_input']['btns'][0]
         if got != correct:
             failures.append(
                 f"{name}: expected generic=0x{correct:08x} got=0x{got:08x}")
 
-    assert not failures, "EXT profile mapping on BlueRetro:\n  " + "\n  ".join(failures)
+    assert not failures, "Generic profile mapping on BlueRetro:\n  " + "\n  ".join(failures)

@@ -128,7 +128,7 @@ impl GamepadReport {
     /// Convert to a 16-byte report using the gappy bit layout a real Microsoft
     /// Xbox One S controller transmits: buttons sit at fixed bit positions with
     /// reserved gaps between them (A=bit0, B=1, X=3, Y=4, ...). This wire layout is
-    /// deliberately NOT contiguous. `HID_REPORT_DESCRIPTOR_STD` advertises a real
+    /// deliberately NOT contiguous. `HID_REPORT_DESCRIPTOR_XBOX` advertises a real
     /// Xbox One S BLE descriptor, which `BlueRetro` fingerprints by descriptor
     /// *shape* (not VID/PID) and then decodes with its own hard-coded Xbox bitmap —
     /// so these gappy bits land on the right Dreamcast functions. Do NOT "align"
@@ -138,8 +138,7 @@ impl GamepadReport {
     /// Byte 13 (face buttons + bumpers):
     ///   bit 0=A, 1=B, 2=reserved, 3=X, 4=Y, 5=reserved, 6=LB, 7=RB
     /// Byte 14 (system buttons + stick clicks):
-    ///   bits 0-1=reserved, 2=View, 3=Menu, 4=reserved (Xbox is on Report 2),
-    ///   5=L3, 6=R3, 7=reserved
+    ///   bits 0-1=reserved, 2=View, 3=Menu, 4=Guide/Xbox, 5=L3, 6=R3, 7=reserved
     ///
     /// Sticks, triggers, hat, and byte 15 are identical to `to_bytes`.
     #[must_use]
@@ -176,6 +175,9 @@ impl GamepadReport {
         }
         if b & buttons::START != 0 {
             byte14 |= 1 << 3;
+        }
+        if b & buttons::GUIDE != 0 {
+            byte14 |= 1 << 4;
         }
         if b & buttons::L3 != 0 {
             byte14 |= 1 << 5;
@@ -217,7 +219,9 @@ impl GamepadReport {
 ///   Bit 7  = Button 8  = Menu/Start
 ///   Bit 8  = Button 9  = Left Stick Click (L3)
 ///   Bit 9  = Button 10 = Right Stick Click (R3)
-///   Bits 10-14 = reserved
+///   Bit 10 = Guide / Xbox button (logical flag — `to_bytes_ms` maps it to the
+///            real Xbox BLE Guide bit, byte 14 bit 4; not a numbered button)
+///   Bits 11-14 = reserved
 pub mod buttons {
     pub const A: u16 = 1 << 0;
     pub const B: u16 = 1 << 1;
@@ -229,12 +233,17 @@ pub mod buttons {
     pub const START: u16 = 1 << 7;
     pub const L3: u16 = 1 << 8;
     pub const R3: u16 = 1 << 9;
+    /// Guide / Xbox button. `to_bytes_ms` emits this at byte 14 bit 4 — the
+    /// position SDL/Steam/Windows read as Guide for the 0x0B20 BLE Xbox.
+    pub const GUIDE: u16 = 1 << 10;
 }
 
-/// HID Report Descriptor — EXT profile (xpadneo-patched contiguous layout).
+/// HID Report Descriptor — Generic profile (xpadneo-style contiguous layout).
 ///
 /// Buttons 1-15 are packed contiguously in bytes 13-14. Compatible with Steam Input,
-/// Linux desktop (xpadneo), and Android generic HID. Used by `PROFILE_EXT` (PID 0x0B20).
+/// Linux desktop (xpadneo), and Android generic HID. Used by `PROFILE_GENERIC`
+/// (Xbox One S 1708 BLE identity 0x045E/0x0B20). Hosts disagree on 0x0B20's button
+/// layout: macOS maps this contiguous form, SDL/Flycast/Windows expect gappy (issue #7).
 ///
 /// Stick/trigger usages follow xpadneo convention:
 ///   - Left stick:  X (0x30) / Y (0x31)    — Generic Desktop
@@ -252,12 +261,17 @@ pub mod buttons {
 ///   Bytes 13-14: Buttons 1-15   (15 bits + 1-bit padding)
 ///   Byte 15:     AC Back        (1 bit + 7-bit padding)
 ///
-/// Report ID 0x02 - Xbox/Guide button (1 byte, same Application collection):
-///   Byte 0: AC Home (1 bit + 7-bit padding)
-///
-/// Report ID 0x03 - Force feedback output (9 bytes, host→device)
+/// This is the *only* report. A HID-over-GATT host can only see reports backed
+/// by a GATT Report characteristic (0x2A4D) + Report Reference descriptor
+/// (0x2908), and `HidService` exposes exactly one (Report ID 1 / Input). Earlier
+/// revisions also declared Report ID 0x02 (Guide/AC Home), 0x03 (rumble Output),
+/// and 0x04 (battery) in this Report Map — but none had a backing characteristic,
+/// so strict generic-HID hosts (Apple's GameController stack / the browser
+/// Gamepad API) rejected the whole map while lenient parsers (hidapi, Steam)
+/// tolerated it. Battery is reported via the dedicated Battery Service (0x180F),
+/// so it is not duplicated here.
 #[rustfmt::skip]
-pub const HID_REPORT_DESCRIPTOR_EXT: &[u8] = &[
+pub const HID_REPORT_DESCRIPTOR_GENERIC: &[u8] = &[
     0x05, 0x01,        // Usage Page (Generic Desktop)
     0x09, 0x05,        // Usage (Gamepad)
     0xA1, 0x01,        // Collection (Application)
@@ -368,81 +382,15 @@ pub const HID_REPORT_DESCRIPTOR_EXT: &[u8] = &[
     0x95, 0x01,        //   Report Count (1)
     0x81, 0x03,        //   Input (Constant) - padding
 
-    // === Report ID 0x02: Xbox/Guide Button ===
-    0x85, 0x02,        //   Report ID (2)
-    0x05, 0x0C,        //   Usage Page (Consumer)
-    0x0A, 0x23, 0x02,  //   Usage (AC Home)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x01,        //   Logical Maximum (1)
-    0x95, 0x01,        //   Report Count (1)
-    0x75, 0x01,        //   Report Size (1)
-    0x81, 0x02,        //   Input (Data, Variable, Absolute)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x00,        //   Logical Maximum (0)
-    0x75, 0x07,        //   Report Size (7)
-    0x95, 0x01,        //   Report Count (1)
-    0x81, 0x03,        //   Input (Constant) - padding
-
-    // === Report ID 0x03: Rumble Output ===
-    0x05, 0x0F,        //   Usage Page (Physical Interface Device)
-    0x09, 0x21,        //   Usage (Set Effect Report)
-    0x85, 0x03,        //   Report ID (3)
-    0xA1, 0x02,        //   Collection (Logical)
-    0x09, 0x97,        //     Usage (DC Enable Actuators)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x25, 0x01,        //     Logical Maximum (1)
-    0x75, 0x04,        //     Report Size (4)
-    0x95, 0x01,        //     Report Count (1)
-    0x91, 0x02,        //     Output (Data, Variable, Absolute)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x25, 0x00,        //     Logical Maximum (0)
-    0x75, 0x04,        //     Report Size (4)
-    0x95, 0x01,        //     Report Count (1)
-    0x91, 0x03,        //     Output (Constant) - padding
-    0x09, 0x70,        //     Usage (Magnitude)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x25, 0x64,        //     Logical Maximum (100)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x04,        //     Report Count (4)
-    0x91, 0x02,        //     Output (Data, Variable, Absolute)
-    0x09, 0x50,        //     Usage (Duration)
-    0x66, 0x01, 0x10,  //     Unit (SI Linear: Time)
-    0x55, 0x0E,        //     Unit Exponent (-2)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x26, 0xFF, 0x00,  //     Logical Maximum (255)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x01,        //     Report Count (1)
-    0x91, 0x02,        //     Output (Data, Variable, Absolute)
-    0x09, 0xA7,        //     Usage (Start Delay)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x26, 0xFF, 0x00,  //     Logical Maximum (255)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x01,        //     Report Count (1)
-    0x91, 0x02,        //     Output (Data, Variable, Absolute)
-    0x65, 0x00,        //     Unit (None)
-    0x55, 0x00,        //     Unit Exponent (0)
-    0x09, 0x7C,        //     Usage (Loop Count)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x26, 0xFF, 0x00,  //     Logical Maximum (255)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x01,        //     Report Count (1)
-    0x91, 0x02,        //     Output (Data, Variable, Absolute)
-    0xC0,              //   End Collection
-
-    // === Report ID 0x04: Battery ===
-    0x05, 0x06,        //   Usage Page (Generic Device Controls)
-    0x09, 0x20,        //   Usage (Battery Strength)
-    0x85, 0x04,        //   Report ID (4)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
-    0x75, 0x08,        //   Report Size (8)
-    0x95, 0x01,        //   Report Count (1)
-    0x81, 0x02,        //   Input (Data, Variable, Absolute)
-
+    // Report IDs 0x02 (Guide/AC Home), 0x03 (rumble Output), and 0x04 (battery)
+    // were removed: none had a backing GATT Report characteristic, so strict
+    // HID-over-GATT hosts rejected the whole Report Map. Battery is its own
+    // service (0x180F); the Guide/rumble functions were never wired up. See the
+    // descriptor doc comment above.
     0xC0,              // End Collection
 ];
 
-/// HID Report Descriptor — STD profile (real Xbox One S BLE controller).
+/// HID Report Descriptor — Xbox profile (real Xbox One S BLE controller).
 ///
 /// Report ID 0x01 is byte-identical to the descriptor a genuine Xbox One S/Series
 /// BLE controller advertises: Z/Rz right stick, Simulation-Controls Brake/Accel
@@ -452,15 +400,15 @@ pub const HID_REPORT_DESCRIPTOR_EXT: &[u8] = &[
 /// (A=0, B=1, X=3, Y=4, LB=6, RB=7, View=10, Menu=11, L3=13, R3=14) decode correctly
 /// even though the descriptor declares the buttons contiguously.
 ///
-/// This is the *opposite* trade-off from `HID_REPORT_DESCRIPTOR_EXT`: EXT uses the
-/// xpadneo convention (Rx/Ry + Generic-Desktop Z/Rz, contiguous wire via `to_bytes`)
-/// for generic hosts (Steam/Linux/Android); STD mimics the real Xbox so adapters
-/// that key off the Xbox descriptor (BlueRetro) map every button correctly.
+/// This is the *opposite* trade-off from `HID_REPORT_DESCRIPTOR_GENERIC`: the Generic
+/// descriptor uses the xpadneo convention (Rx/Ry + Generic-Desktop Z/Rz, contiguous
+/// wire via `to_bytes`) for generic hosts (Android/browsers); the Xbox descriptor
+/// mimics the real Xbox so adapters that key off it (BlueRetro) map every button correctly.
 ///
 /// Diverging from this layout breaks BlueRetro recognition: it then generic-HID
 /// parses the buttons by Usage number and X/Y/Start shift (see issue #2).
 #[rustfmt::skip]
-pub const HID_REPORT_DESCRIPTOR_STD: &[u8] = &[
+pub const HID_REPORT_DESCRIPTOR_XBOX: &[u8] = &[
     0x05, 0x01,        // Usage Page (Generic Desktop)
     0x09, 0x05,        // Usage (Gamepad)
     0xA1, 0x01,        // Collection (Application)
@@ -576,25 +524,19 @@ pub const HID_REPORT_DESCRIPTOR_STD: &[u8] = &[
     0x95, 0x01,        //   Report Count (1)
     0x81, 0x03,        //   Input (Constant) - padding
 
-    // === Report ID 0x02: Xbox/Guide Button ===
-    0x85, 0x02,        //   Report ID (2)
-    0x05, 0x0C,        //   Usage Page (Consumer)
-    0x0A, 0x23, 0x02,  //   Usage (AC Home)
-    0x15, 0x00,
-    0x25, 0x01,
-    0x95, 0x01,
-    0x75, 0x01,
-    0x81, 0x02,
-    0x15, 0x00,
-    0x25, 0x00,
-    0x75, 0x07,
-    0x95, 0x01,
-    0x81, 0x03,        //   Input (Constant) - padding
-
-    // === Report ID 0x03: Rumble Output ===
+    // === Report ID 0x03: Rumble Output (BACKED by HidService.rumble) ===
+    // Matches the real Xbox One S/Series BLE descriptor (verified against DJm00n's
+    // 1914 0x0B20 dump). Windows' "Bluetooth LE XINPUT compatible input device"
+    // driver requires an Output (rumble) report to start -- without it the device
+    // fails Code 10 / STATUS_INVALID_PARAMETER. This is backed by a real GATT
+    // Output characteristic (0x2A4D, Report Ref [0x03,0x02]) -- NOT the phantom
+    // report that caused the earlier Steam crash. Writes are accepted and ignored
+    // (no Dreamcast rumble actuator wired yet).
+    // Reports 0x02 (Guide) and 0x04 (battery) stay removed -- the real BLE Xbox has
+    // neither (Guide is in Report 1's buttons; battery is the 0x180F service).
     0x05, 0x0F,        //   Usage Page (Physical Interface Device)
     0x09, 0x21,        //   Usage (Set Effect Report)
-    0x85, 0x03,
+    0x85, 0x03,        //   Report ID (3)
     0xA1, 0x02,        //   Collection (Logical)
     0x09, 0x97,
     0x15, 0x00,
@@ -635,19 +577,9 @@ pub const HID_REPORT_DESCRIPTOR_STD: &[u8] = &[
     0x75, 0x08,
     0x95, 0x01,
     0x91, 0x02,
-    0xC0,              //   End Collection
+    0xC0,              //   End Collection (rumble)
 
-    // === Report ID 0x04: Battery ===
-    0x05, 0x06,
-    0x09, 0x20,
-    0x85, 0x04,
-    0x15, 0x00,
-    0x26, 0xFF, 0x00,
-    0x75, 0x08,
-    0x95, 0x01,
-    0x81, 0x02,
-
-    0xC0,              // End Collection
+    0xC0,              // End Collection (application)
 ];
 
 #[cfg(test)]
@@ -778,6 +710,34 @@ mod tests {
         assert_eq!(bytes[13], 0b1101_1011);
         // byte 14: _(0) _(1) BACK(2) START(3) _(4) L3(5) R3(6) _(7) = 0x6C
         assert_eq!(bytes[14], 0b0110_1100);
+    }
+
+    #[test]
+    fn to_bytes_ms_guide() {
+        // Guide/Xbox button -> byte 14 bit 4 (the 0x0B20 BLE Guide position).
+        let report = GamepadReport {
+            buttons: buttons::GUIDE,
+            ..Default::default()
+        };
+        let bytes = report.to_bytes_ms();
+        assert_eq!(bytes[14], 1 << 4);
+        assert_eq!(bytes[13], 0);
+    }
+
+    #[test]
+    fn to_bytes_guide_is_button_11() {
+        // Generic/contiguous layout: the Guide chord (same profile-agnostic
+        // detection as Xbox) sets buttons::GUIDE (bit 10), which `to_bytes` packs
+        // into byte 14 bit 2 = Button 11 — a host-visible numbered button the user
+        // can bind to "Guide" in Steam. (Xbox's `to_bytes_ms` instead lands it on
+        // the native 0x0B20 Guide bit; see `to_bytes_ms_guide`.)
+        let report = GamepadReport {
+            buttons: buttons::GUIDE,
+            ..Default::default()
+        };
+        let bytes = report.to_bytes();
+        assert_eq!(bytes[14], 1 << 2); // Button 11
+        assert_eq!(bytes[13], 0);
     }
 
     #[test]

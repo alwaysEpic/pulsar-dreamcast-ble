@@ -44,6 +44,13 @@ No need to re-pair each time.
 
 The Dreamcast controller has one analog stick, which maps to the left stick. The right stick is not available.
 
+### Guide / Xbox Button (chord)
+
+The Dreamcast pad has no Guide button, so it's a chord: **pull Left Trigger + Right Trigger and hold Start together (about a third of a second).** This sends the **Guide (Xbox) button** — e.g. it opens the **Steam overlay** / Big Picture, or the Xbox Game Bar.
+
+- It's deliberately a *hold* so it won't fire by accident during play, and it's kept off the face buttons so it never collides with the Dreamcast/GDEMU `A+B+X+Y+Start` reset combo. While held, the triggers and Start are suppressed so the host sees only Guide.
+- The chord works on **both profiles.** On **Xbox** it's the real native Guide button (the Steam overlay opens automatically). On **Dreamcast** it comes through as a plain **Button 11** — bind that to "Guide" in Steam Input (or your host's controller settings) if you want the overlay shortcut there.
+
 ## Sync Button
 
 | Action | Result |
@@ -51,18 +58,20 @@ The Dreamcast controller has one analog stick, which maps to the left stick. The
 | Short press | Wake / request reconnect |
 | Hold 3s | Pairing mode (60s) — clears the current bond |
 | Hold 10s | Sleep — shows `BYE`, releases into deep sleep |
-| Triple-press | Switch profile (STD ⇄ EXT) and reboot |
+| Triple-press | Switch profile (Xbox ⇄ Dreamcast) and reboot |
 
 After holding 3s and pairing fresh, the **old** host still has us in its Bluetooth list. Forget the adapter there before it'll let you pair again — same as any single-bond controller (Xbox, etc.).
 
 ### Profiles
 
-Two button layouts, switchable with a triple-press. Use **STD** by default. Switch to **EXT** if buttons feel wrong on your host.
+Two identities, switchable with a triple-press. **Use Xbox by default** — it now works essentially everywhere tested: macOS (browser + Steam), Windows (+ Steam), Linux (xpadneo), BlueRetro, and BLE receivers.
+
+The **Dreamcast** profile is **not** a Dreamcast-controller emulation — it's just a plain, **generic BLE HID gamepad**; the only "Dreamcast" thing about it is the Bluetooth name. Pick it if you'd rather not present as an Xbox controller (e.g. to avoid Xbox button prompts in games) or for a host that prefers a neutral HID gamepad.
 
 | Profile | Best for | Bluetooth name |
 |---|---|---|
-| **STD** (default) | iBlueControlMod, BlueRetro, most BLE gamepad receivers, kernel HID quirk paths | Xbox Wireless Controller |
-| **EXT** | Steam Input, Linux (xpadneo), Android generic HID | Dreamcast Wireless Controller |
+| **Xbox** (default) | macOS (browser + Steam), Windows (+ Steam), Linux (xpadneo), BlueRetro, iBlueControlMod / BLE receivers — anything that recognizes an Xbox controller | Xbox Wireless Controller |
+| **Dreamcast** | A plain, generic BLE HID gamepad (neutral identity — only the Bluetooth name is Dreamcast-branded) — Android, simple HID consumers, or hosts where you'd rather not present as Xbox | Dreamcast Wireless Controller |
 
 After switching, forget the adapter on your host and pair again so it picks up the new HID layout. The profile is saved to flash.
 
@@ -72,8 +81,8 @@ The adapter draws on the VMU LCD while connected — a profile splash on every c
 
 <table>
   <tr>
-    <td align="center"><img src="images/std.jpeg" width="220" alt="STD profile splash"><br>STD profile (boot)</td>
-    <td align="center"><img src="images/ext.jpeg" width="220" alt="EXT profile splash"><br>EXT profile (boot)</td>
+    <td align="center"><img src="images/std.jpeg" width="220" alt="Xbox profile splash"><br>Xbox profile (boot)</td>
+    <td align="center"><img src="images/ext.jpeg" width="220" alt="Dreamcast profile splash"><br>Dreamcast profile (boot)</td>
     <td align="center"><img src="images/pulsar.jpeg" width="220" alt="Rotating pulsar"><br>In-session</td>
   </tr>
   <tr>
@@ -148,5 +157,9 @@ When asleep, the adapter draws minimal power (~5 microamps). The battery charges
 - The adapter sleeps after 60 seconds without a Bluetooth connection, 60 seconds if Bluetooth connects but no controller is detected, or after 10 minutes of no controller input. Keep interacting with the controller to prevent the inactivity timeout.
 
 **Inputs feel wrong or mapped incorrectly**
-- Try the other profile: triple-press sync to switch between STD and EXT. After switching, forget the adapter on your host and pair fresh — most hosts cache the HID layout per-bond.
+- Try the other profile: triple-press sync to switch between Xbox and Dreamcast. After switching, forget the adapter on your host and pair fresh — most hosts cache the HID layout per-bond.
 - Some hosts remap buttons in their own settings (Steam Input, accessibility shortcuts). Check there too.
+
+**Flycast's mapping screen shows the stick "Up"/"Left" rows blank**
+- Use the **Xbox** profile for SDL-based emulators (Flycast, RetroArch); the Dreamcast stick maps to the left analog stick.
+- After "Reset to default," Flycast may label only the **Down**/**Right** rows ("Left Stick Y+/X+") and leave **Up**/**Left** blank. That's cosmetic — it binds the *full* axis to both directions, so the stick works fully in-game. No need to reset again or hand-map the blank rows.

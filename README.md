@@ -11,8 +11,9 @@ Use your Dreamcast controller wirelessly with any Bluetooth device. Pulsar speak
 ## Features
 
 - All Dreamcast inputs: A/B/X/Y, Start, D-pad, analog stick, analog triggers
+- Guide/Xbox button via a trigger + Start chord (opens the Steam overlay, Game Bar, etc.)
 - Works with any BLE HID host (PC, iOS, Android, Switch, Dreamcast via iBlueControlMod)
-- Two switchable button profiles (STD/EXT) for broad host compatibility
+- Two switchable identities for broad host compatibility: **Xbox** (default), or a plain **generic BLE HID gamepad** (labeled "Dreamcast" — neutral identity, not controller emulation)
 - VMU LCD display: profile splash, rotating pulsar with battery indicator, mode splashes
 - 60Hz controller polling with continuous BLE reporting
 - Pairing persists across power cycles (flash-based bonding)
@@ -28,11 +29,12 @@ Use your Dreamcast controller wirelessly with any Bluetooth device. Pulsar speak
 
 **Tested:**
 - Steam Deck (as Xbox gamepad)
-- macOS (as Xbox gamepad)
+- macOS — browser + Steam (as Xbox gamepad)
+- Windows — Steam (as Xbox gamepad)
+- Linux — xpadneo (as Xbox gamepad)
 - Dreamcast (via [iBlueControlMod](https://handheldlegend.com/products/dreamcast-ibluecontrolmod-bluetooth-mod) adapter)
 
 **Should work (untested):**
-- Windows, Linux (as Xbox gamepad)
 - iOS, Android (as BLE HID gamepad)
 - PlayStation, Nintendo Switch (as generic controller)
 
@@ -83,9 +85,11 @@ If you need RTT debug logging, flash via SWD instead. The SoftDevice must be fla
 - Short press → wake / request reconnect
 - Hold 3s → clear bond and start pairing
 - Hold 10s → sleep (`BYE` splash, then powers off)
-- Triple-press → switch profile (STD ⇄ EXT, different button layouts)
+- Triple-press → switch profile (Xbox ⇄ Dreamcast identity)
 
-The VMU LCD shows the active profile on connect, a rotating pulsar with battery indicator while in use, and splashes for pairing (`SYNC`) and sleeping (`BYE`).
+**Guide / Xbox button:** pull both triggers and hold Start (~⅓ second) to send the Guide button — opens the Steam overlay / Big Picture, the Xbox Game Bar, etc. Works on both profiles.
+
+The VMU LCD shows the active profile on connect, a rotating pulsar with battery indicator while in use, a home icon when you press the Guide chord, and splashes for pairing (`SYNC`) and sleeping (`BYE`).
 
 <p align="center"><img src="docs/images/pulsar.jpeg" width="280" alt="Rotating pulsar animation on the VMU LCD"></p>
 

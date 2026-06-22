@@ -15,6 +15,8 @@ use crate::ble::{
 };
 use crate::maple::ControllerState;
 use crate::{CONTROLLER_STATE, PROFILE_CHANGE, SYNC_MODE, WAKE_REQUEST};
+use maple_protocol::guide_chord::GuideChord;
+use maple_protocol::xbox_hid::buttons;
 
 #[cfg(feature = "board-xiao")]
 use crate::BATTERY_LEVEL;
@@ -336,6 +338,7 @@ async fn handle_connection(
 
         let mut current_state = ControllerState::default();
         let mut notify_fails: u8 = 0;
+        let mut guide_chord = GuideChord::default();
 
         loop {
             // Read any pending state change promptly, then wait for send timer.
@@ -351,8 +354,24 @@ async fn handle_connection(
                 current_state = CONTROLLER_STATE.wait().await;
             }
 
-            let report = current_state.to_gamepad_report();
-            let report_bytes = report.to_bytes();
+            let mut report = current_state.to_gamepad_report();
+            // Synthesize the Guide button from the L+R+Start hold-chord.
+            // Detection runs before profile serialization, so both the Xbox and
+            // the generic profile get it. State machine lives in maple-protocol
+            // (host-tested); here we just feed it the monotonic clock and act.
+            let chord = guide_chord.update(&current_state, Instant::now().as_millis());
+            if chord.active {
+                report.buttons = (report.buttons | buttons::GUIDE) & !buttons::START;
+                report.left_trigger = 0;
+                report.right_trigger = 0;
+            }
+            if chord.rising_edge {
+                // Best-effort, fire-and-forget: ask the main loop to flash the
+                // VMU home glyph. Single non-blocking atomic store; the main
+                // loop may drop it. Never touches the controller path.
+                crate::GUIDE_GLYPH_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            let report_bytes = GamepadServer::serialize_report_for_active_profile(&report);
             let _ = server.hid.report_set(&report_bytes);
             if server.send_report(&conn, &report).is_err() {
                 notify_fails += 1;

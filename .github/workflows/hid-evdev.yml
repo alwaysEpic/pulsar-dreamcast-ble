@@ -1,0 +1,73 @@
+name: HID descriptor mapping
+
+on:
+  push:
+    branches: [main, "feat/**"]
+    paths:
+      - "tests/hid_evdev/**"
+      - "tests/blueretro/fixtures.json"
+      - "maple-protocol/src/xbox_hid.rs"
+      - "src/ble/hid.rs"
+      - "src/ble/profile.rs"
+      - ".github/workflows/hid-evdev.yml"
+  pull_request:
+    paths:
+      - "tests/hid_evdev/**"
+      - "tests/blueretro/fixtures.json"
+      - "maple-protocol/src/xbox_hid.rs"
+      - "src/ble/hid.rs"
+      - "src/ble/profile.rs"
+      - ".github/workflows/hid-evdev.yml"
+
+jobs:
+  descriptor-layout:
+    name: Descriptor layout (any OS, pure-Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r tests/hid_evdev/requirements.txt
+      - name: Run descriptor-layout tests
+        run: pytest tests/hid_evdev/test_descriptor_layout.py -v
+
+  evdev-mapping:
+    name: UHID/evdev end-to-end (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install libevdev runtime
+        run: sudo apt-get update && sudo apt-get install -y libevdev-dev
+      - name: Ensure uhid module is available
+        run: |
+          # CONFIG_UHID=m on the runner kernel, but the .ko isn't shipped in the
+          # base image — pull it from linux-modules-extra for the running kernel.
+          if ! sudo modprobe uhid 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe uhid 2>/dev/null || true
+          fi
+          sudo modprobe hid_microsoft 2>/dev/null || true
+      - name: Install Python deps
+        run: pip install -r tests/hid_evdev/requirements-linux.txt
+      - name: Pre-flight — require /dev/uhid, else fail with diagnostics
+        run: |
+          if [ -c /dev/uhid ]; then
+            echo "/dev/uhid present on $(uname -r)"
+          else
+            echo "::error::/dev/uhid not available on $(uname -r)"
+            echo "--- UHID kernel config ---"
+            grep -i config_uhid "/boot/config-$(uname -r)" 2>/dev/null \
+              || { zcat /proc/config.gz 2>/dev/null | grep -i config_uhid; } \
+              || echo "(kernel config not readable)"
+            exit 1
+          fi
+          python -c "import libevdev, hidtools.uhid; print('libevdev + hidtools OK')"
+      - name: Run evdev mapping tests as root
+        # /dev/uhid and /dev/input/* need root; -rs surfaces any skip reason.
+        run: sudo "$(which python)" -m pytest tests/hid_evdev/test_evdev_mapping.py -v -rs

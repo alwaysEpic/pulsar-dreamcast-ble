@@ -104,6 +104,15 @@ pub static PROFILE_CHANGE: Signal<CriticalSectionRawMutex, ble::ProfileId> = Sig
 pub static GOODBYE_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Set by the BLE task on the rising edge of the Guide chord (L+R+Start held).
+/// The main poll loop picks this up and briefly flashes a "home" glyph on the
+/// VMU LCD, then resumes normal content. Purely cosmetic and strictly
+/// best-effort: a single non-blocking atomic store on the BLE side, and the
+/// main loop is free to drop it (goodbye in flight, frame CRC-collision) — it
+/// must never perturb Maple bus timing or the controller poll.
+pub static GUIDE_GLYPH_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Signaled by the button task on any short sync-button press. The BLE task
 /// uses this as the explicit "wake from silent reconnect-wait" trigger,
 /// matching how Xbox / PlayStation controllers use their dedicated wake
