@@ -166,15 +166,91 @@ impl GamepadServer {
     ) -> Result<(), NotifyValueError> {
         let bytes = Self::serialize_report_for_active_profile(report);
 
-        let mut skip = false;
-        LAST_REPORT.lock(|cell| {
-            let cached = cell.get();
-            if cached.is_some_and(|c| c == bytes) {
-                skip = true;
-            } else {
-                cell.set(Some(bytes));
-            }
-        });
+        // Debug-only: overwrite the right-stick bytes (4-7) with the latest raw
+        // IP5306 gauge sample. The Dreamcast has no right stick, so those four
+        // bytes are a constant 0x8000/0x8000 and carry no real input.
+        //
+        // Injected *before* dedup, unlike `seq-counter` below: a new gauge
+        // sample changes the payload and so forces a notify, which is what makes
+        // the channel work on an idle controller. (seq-counter deliberately goes
+        // after, because dedup behavior is the thing it measures.)
+        #[cfg(feature = "gauge-debug")]
+        let bytes = {
+            let mut b = bytes;
+            let packed = crate::GAUGE_SAMPLE.load(core::sync::atomic::Ordering::Relaxed);
+            b[4..8].copy_from_slice(&packed.to_le_bytes());
+            b
+        };
+
+        // Debug-only: same four right-stick bytes, carrying the connection
+        // parameter negotiation instead.
+        //
+        // `conn.conn_params()` is the **live negotiated** value, not what we
+        // asked for: nrf-softdevice writes `state.conn_params` from
+        // `BLE_GAP_EVT_CONN_PARAM_UPDATE` (its `gap.rs`), so this is the
+        // interval the link is actually running at, read from the SoftDevice's
+        // own bookkeeping. Pairing it with the update call's return code
+        // separates "the host declined our request" from "the request was never
+        // issued" — indistinguishable from outside, and the reason three rounds
+        // of parameter tuning produced no information.
+        //
+        // Both fields are in 1.25 ms units (12 = 15 ms, 9 = 11.25 ms), and are
+        // saturated to u8: the BLE maximum is 3200 units, but anything past 255
+        // (319 ms) means something has gone far more wrong than a rejected
+        // request.
+        //
+        // ⚠ Unlike `gauge-debug`, this payload is **constant** — rc and the
+        // negotiated interval do not change once the link is up. So it does NOT
+        // defeat the wire-level dedup below and does NOT self-publish on an idle
+        // controller: with a still stick every report is byte-identical, every
+        // notify is skipped, and a capture reads **zero** reports. Keep the
+        // input moving for the whole capture, exactly like a normal run.
+        // (Observed 2026-07-27: a capture taken on a deliberately idle stick
+        // returned 0 reads and looked like a dead link.)
+        // Debug-only: right-stick bytes carry the Maple poll-failure counters.
+        // Injected *before* dedup like `gauge-debug`, but the bytes only change
+        // when a poll actually fails (~a few times a second under the fault
+        // being chased), so dedup dynamics stay representative. Layout:
+        // [4-5] = total failed polls (LE u16, wrapping), [6] = longest
+        // consecutive-failure streak since boot, [7] = 0x5A marker.
+        #[cfg(feature = "maple-fail-debug")]
+        let bytes = {
+            let mut b = bytes;
+            let total = crate::MAPLE_FAIL_TOTAL.load(core::sync::atomic::Ordering::Relaxed);
+            let streak = crate::MAPLE_FAIL_MAX_CONSEC.load(core::sync::atomic::Ordering::Relaxed);
+            b[4..6].copy_from_slice(&total.to_le_bytes());
+            b[6] = streak;
+            b[7] = crate::MAPLE_FAIL_MAGIC;
+            b
+        };
+
+        // Debug-only: same four right-stick bytes, carrying poll-loop period
+        // telemetry (rotating tagged payloads — see `crate::poll_period`).
+        // Injected before dedup like the channels above; the tag byte rotates
+        // per send, so this build never dedups identical sticks. Fine for its
+        // purpose (rotation captures), but it means seq-counter dedup dynamics
+        // in THIS build are not representative — acceptance captures use
+        // builds without this feature.
+        #[cfg(feature = "poll-period-debug")]
+        let bytes = {
+            let mut b = bytes;
+            crate::poll_period::inject(&mut b);
+            b
+        };
+
+        #[cfg(feature = "connparam-debug")]
+        let bytes = {
+            let mut b = bytes;
+            let p = conn.conn_params();
+            let rc = crate::CONNPARAM_RC.load(core::sync::atomic::Ordering::Relaxed);
+            b[4] = u8::try_from(rc).unwrap_or(0xFE); // 0xFE = rc did not fit
+            b[5] = u8::try_from(p.min_conn_interval).unwrap_or(0xFF);
+            b[6] = u8::try_from(p.max_conn_interval).unwrap_or(0xFF);
+            b[7] = crate::CONNPARAM_MAGIC;
+            b
+        };
+
+        let skip = LAST_REPORT.lock(|cell| cell.get().is_some_and(|c| c == bytes));
         if skip {
             return Ok(());
         }
@@ -184,7 +260,7 @@ impl GamepadServer {
         // detect reports dropped between here and the host. Injected *after* dedup,
         // so the dedup/send-on-change behavior under test is unchanged.
         #[cfg(feature = "seq-counter")]
-        let bytes = {
+        let wire_bytes = {
             let mut b = bytes;
             let n = SEQ_COUNTER.lock(|c| {
                 let v = c.get();
@@ -194,8 +270,20 @@ impl GamepadServer {
             b[15] = (b[15] & 0x01) | ((n & 0x7F) << 1);
             b
         };
+        #[cfg(not(feature = "seq-counter"))]
+        let wire_bytes = bytes;
 
-        self.hid.report_notify(conn, &bytes)
+        // Cache only after the SoftDevice accepts the notification. Updating
+        // the cache before the send poisoned it on TX-queue-full errors: the
+        // next tick with an unchanged stick deduped against a report the host
+        // never received, silently swallowing that state change (host-side
+        // symptom: a doubled connection interval). The cache stores the
+        // pre-seq payload so dedup compares input state, not counter noise.
+        let result = self.hid.report_notify(conn, &wire_bytes);
+        if result.is_ok() {
+            LAST_REPORT.lock(|cell| cell.set(Some(bytes)));
+        }
+        result
     }
 
     /// Serialize a report using the active BLE profile.

@@ -3,7 +3,6 @@
 
 //! `SoftDevice` initialization and BLE advertising.
 
-use crate::log;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use nrf_softdevice::ble::{peripheral, Connection};
 use nrf_softdevice::{raw, Softdevice};
@@ -60,11 +59,21 @@ fn softdevice_config(profile: &Profile) -> nrf_softdevice::Config {
     let name_len = (profile.gap_name.len() - 1) as u16;
 
     nrf_softdevice::Config {
+        // LFCLK = the module's 32.768 kHz crystal. Verified against the Seeed
+        // XIAO nRF52840 schematic v1.1 (sheet 3: X1 32.768KHz on P0.00/XL1 +
+        // P0.01/XL2, C7 10 pF) — the crystal IS populated. The Adafruit
+        // bootloader runs LFRC, but that is a software default, not a hardware
+        // constraint; either source works here. History (2026-08-04/05): this
+        // config was flip-flopped RC→XTAL→RC→XTAL chasing a rate regression
+        // that turned out to be binary-layout timing variance (the compiled-
+        // timing lottery) — the clock source was never
+        // the cause. XTAL is kept for its real 20 ppm accuracy and because the
+        // capture-validated v209 binary runs it.
         clock: Some(raw::nrf_clock_lf_cfg_t {
-            source: raw::NRF_CLOCK_LF_SRC_RC as u8,
-            rc_ctiv: 16,
-            rc_temp_ctiv: 2,
-            accuracy: raw::NRF_CLOCK_LF_ACCURACY_500_PPM as u8,
+            source: raw::NRF_CLOCK_LF_SRC_XTAL as u8,
+            rc_ctiv: 0, // must be 0 for non-RC sources
+            rc_temp_ctiv: 0,
+            accuracy: raw::NRF_CLOCK_LF_ACCURACY_20_PPM as u8,
         }),
         conn_gap: Some(raw::ble_gap_conn_cfg_t {
             conn_count: 1,

@@ -3,7 +3,6 @@
 
 //! BLE advertising and connection handling task.
 
-use crate::log;
 use embassy_time::{Duration, Instant, Timer};
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::security::SecurityHandler;
@@ -18,7 +17,6 @@ use crate::{CONTROLLER_STATE, PROFILE_CHANGE, SYNC_MODE, WAKE_REQUEST};
 use maple_protocol::guide_chord::GuideChord;
 use maple_protocol::xbox_hid::buttons;
 
-#[cfg(feature = "board-xiao")]
 use crate::BATTERY_LEVEL;
 
 /// BLE advertising and connection handling task.
@@ -112,15 +110,13 @@ pub async fn ble_task(
                         // Total-disconnect timeout: bail to System Off (XIAO) or
                         // Idle (DK).
                         if total_start.elapsed().as_millis() >= crate::SLEEP_TIMEOUT_MS {
-                            #[cfg(feature = "board-xiao")]
-                            {
-                                log!("BLE: Reconnect timeout, entering System Off");
-                                unsafe {
-                                    crate::board::enter_system_off();
-                                }
-                            }
-                            #[cfg(not(feature = "board-xiao"))]
-                            {
+                            if crate::board::SUPPORTS_SLEEP {
+                                // Hand off to main rather than sleeping here:
+                                // main owns `Power` and powers the 5 V boost
+                                // down before System Off. Never returns.
+                                log!("BLE: Reconnect timeout, requesting System Off");
+                                crate::request_sleep().await;
+                            } else {
                                 log!("BLE: Reconnect timeout, entering idle");
                                 set_connection_state(ConnectionState::Idle);
                                 break None;
@@ -159,6 +155,12 @@ pub async fn ble_task(
                 if let Some(conn) = conn {
                     set_connection_state(ConnectionState::Connected);
                     let outcome = handle_connection(sd, server, bonder, &mut flash, conn).await;
+                    // Every exit from a connection drops the wire-level dedup cache.
+                    // The next connection is a different peer, or the same one
+                    // renegotiating, so the previous session's last report must never
+                    // suppress the new session's first. Hoisted out of the match on
+                    // purpose: an arm added later cannot forget it.
+                    crate::ble::hid::reset_report_cache();
                     match outcome {
                         DisconnectOutcome::SyncRequested => {
                             bonder.clear();
@@ -203,15 +205,14 @@ pub async fn ble_task(
                         } else {
                             // No bond and sync timed out — sleep to save power.
                             // Wake via sync button → full reset → auto sync mode.
-                            #[cfg(feature = "board-xiao")]
-                            {
-                                log!("BLE: No bond after sync timeout, entering System Off");
-                                unsafe {
-                                    crate::board::enter_system_off();
-                                }
+                            // Routed through main so the 5 V boost goes down
+                            // with us (see `request_sleep`). Never returns.
+                            if crate::board::SUPPORTS_SLEEP {
+                                log!("BLE: No bond after sync timeout, requesting System Off");
+                                crate::request_sleep().await;
+                            } else {
+                                set_connection_state(ConnectionState::Idle);
                             }
-                            #[cfg(not(feature = "board-xiao"))]
-                            set_connection_state(ConnectionState::Idle);
                         }
                         break None;
                     }
@@ -229,6 +230,12 @@ pub async fn ble_task(
                 if let Some(conn) = conn {
                     set_connection_state(ConnectionState::Connected);
                     let outcome = handle_connection(sd, server, bonder, &mut flash, conn).await;
+                    // Every exit from a connection drops the wire-level dedup cache.
+                    // The next connection is a different peer, or the same one
+                    // renegotiating, so the previous session's last report must never
+                    // suppress the new session's first. Hoisted out of the match on
+                    // purpose: an arm added later cannot forget it.
+                    crate::ble::hid::reset_report_cache();
                     match outcome {
                         DisconnectOutcome::SyncRequested => {
                             bonder.clear();
@@ -270,9 +277,6 @@ enum DisconnectOutcome {
 
 /// Update connection state after a disconnection.
 fn transition_after_disconnect(bonder: &Bonder) {
-    // Drop the wire-level dedup cache — a new connection has no prior state
-    // to compare against, so the first HID report must always go out.
-    crate::ble::hid::reset_report_cache();
     if bonder.has_bond() {
         set_connection_state(ConnectionState::Reconnecting);
     } else {
@@ -303,14 +307,75 @@ async fn handle_connection(
     Timer::after(Duration::from_millis(100)).await;
     let _ = conn.request_security();
 
-    // Request Xbox-like connection parameters for ~100Hz polling
+    // Request the fastest connection interval Apple will consider for a BLE HID
+    // accessory. Units are 1.25 ms.
+    //
+    // The previous request (min 7 = 8.75 ms, max 9 = 11.25 ms) was **rejected on
+    // every macOS connection** — it broke two of Apple's rules (QA1931):
+    //
+    //   - Interval Min >= 15 ms (multiples of 15 ms)
+    //   - Interval Min + 15 ms <= Interval Max  (Interval Max == 15 ms is allowed)
+    //   - Interval Max * (Slave Latency + 1) <= 2 s
+    //   - Interval Max * (Slave Latency + 1) * 3 < connSupervisionTimeout
+    //   - Slave Latency <= 30
+    //   - 2 s <= connSupervisionTimeout <= 6 s
+    //
+    // with the exception that matters here: "If Bluetooth Low Energy HID is one
+    // of the connected services of an accessory, connection interval down to
+    // 11.25 ms may be accepted by the Apple product."
+    //
+    // 8.75 ms is below even that HID floor, and 8.75 + 15 > 11.25 broke the span
+    // rule. Apple: non-compliant requests "may be rejected, or the stability and
+    // the performance of the connection may be compromised". So the host ignored
+    // us and imposed its own 15 ms — which is exactly the 15.0 ms median every
+    // `hid_capture.py` run has ever reported. The old `~100Hz` comment was
+    // aspiration; 66.6 Hz (1000/15) was always the host's cap, not ours.
+    //
+    // **Both Apple-oriented alternatives were measured and neither moved macOS**
+    // (2026-07-27, `hid_capture.py --history`):
+    //
+    //   `826aef9`  min 11.25 / max 15 ms     -> median 15.0 ms  (x3)
+    //   `fe99c1a`  min 11.25 / max 26.25 ms  -> median 15.0 ms  (x2)
+    //              (fully rule-compliant: 11.25 + 15 = 26.25 exactly)
+    //
+    // So compliance was never the blocker — macOS wants 15 ms for this device
+    // and takes it whether or not the request is legal. Note 15 ms sits *inside*
+    // the `fe99c1a` range, so that one may even have been accepted-and-chosen
+    // rather than refused; the two are indistinguishable from outside, and no
+    // further parameter tuning can separate them (see the BUSY note below).
+    //
+    // Reverted to the original range because it has the **tightest ceiling of
+    // the three** — a host that honours it cannot grant worse than 11.25 ms,
+    // where the "compliant" range legally permits 26.25 ms (38 Hz):
+    //
+    //   this      8.75 - 11.25 ms  ->   89 - 114 Hz
+    //   826aef9  11.25 - 15    ms  -> 66.6 -  89 Hz
+    //   fe99c1a  11.25 - 26.25 ms  ->   38 -  89 Hz
+    //
+    // All three are identical on macOS, so the difference only shows on hosts
+    // that actually honour peripheral requests — BlueZ and most non-Apple
+    // centrals do. This adapter is not macOS-only, and optimising for the one
+    // host that ignores us would cost real rate everywhere else.
+    //
+    // Known cost: this violates two of Apple's rules (Min >= 11.25 ms for HID,
+    // and Min + 15 ms <= Max), and Apple warns non-compliant requests "may be
+    // rejected, or the stability and the performance of the connection may be
+    // compromised". Accepted deliberately — the whole project has run on these
+    // values with stable connections, IQR 0.7-1.1 ms and zero reversals across
+    // every capture. Rejection costs nothing: the host default is the same
+    // 15 ms the compliant requests obtained.
+    //
+    // The poll pacer locks one Maple poll to the head of each inter-event
+    // quiet window (radio-notification gate), so every connection event
+    // finds fresh controller state at any interval the host grants — see
+    // the POLL_PERIOD_MS docs in main.rs.
     Timer::after(Duration::from_millis(500)).await;
     if let Some(handle) = conn.handle() {
         let conn_params = nrf_softdevice::raw::ble_gap_conn_params_t {
             min_conn_interval: 7, // 8.75ms
-            max_conn_interval: 9, // 11.25ms
+            max_conn_interval: 9, // 11.25ms — tightest ceiling of the options tried
             slave_latency: 0,
-            conn_sup_timeout: 400, // 4000ms
+            conn_sup_timeout: 400, // 4000ms (within Apple's 2-6s window)
         };
         // SAFETY: Connection handle is valid (checked above). conn_params is
         // a well-formed struct on the stack, passed as a const pointer.
@@ -320,13 +385,35 @@ async fn handle_connection(
                 (&raw const conn_params).cast_mut(),
             )
         };
+        // `rc == 0` means the request was *queued*, not accepted — the outcome
+        // arrives later as BLE_GAP_EVT_CONN_PARAM_UPDATE. Publishing the raw
+        // code is the point: NRF_ERROR_BUSY (17) here would mean the request
+        // never went out at all, which no host-side measurement can reveal.
+        #[cfg(feature = "connparam-debug")]
+        crate::publish_connparam_rc(rc);
         if rc != 0 {
-            log!("BLE: Conn param update failed: {}", rc);
+            log!("BLE: Conn param update not queued, rc={}", rc);
         }
     }
 
     // Run GATT server while connected
-    let gatt_future = gatt_server::run(&conn, server, |_| {});
+    // Handle GATT writes. The only one we act on is the HID rumble Output report
+    // (Report ID 0x03): forward the commanded intensity to the board's motor.
+    let gatt_future = gatt_server::run(&conn, server, |event| {
+        if let crate::ble::hid::GamepadServerEvent::Hid(
+            crate::ble::hid::HidServiceEvent::RumbleWrite(data),
+        ) = event
+        {
+            // Xbox rumble report: byte 0 = enable mask, bytes 1..5 = motor
+            // magnitudes. Use the strongest commanded magnitude. ⚠ VERIFY layout.
+            let intensity = if data[0] != 0 {
+                data[1..5].iter().copied().max().unwrap_or(0)
+            } else {
+                0
+            };
+            crate::RUMBLE_LEVEL.signal(intensity);
+        }
+    });
 
     // Notification sender - sends HID reports at fixed 125Hz interval.
     // Reads state changes promptly (so the Signal is cleared before the next
@@ -360,10 +447,19 @@ async fn handle_connection(
             // the generic profile get it. State machine lives in maple-protocol
             // (host-tested); here we just feed it the monotonic clock and act.
             let chord = guide_chord.update(&current_state, Instant::now().as_millis());
-            if chord.active {
-                report.buttons = (report.buttons | buttons::GUIDE) & !buttons::START;
+            if chord.suppress {
+                // Suppress the chord's constituents from the instant all three are
+                // held (not just after it fires) so the 300ms arming window can't
+                // leak a Start/trigger press to the host before the Guide tap.
+                report.buttons &= !buttons::START;
                 report.left_trigger = 0;
                 report.right_trigger = 0;
+            }
+            if chord.emit_guide {
+                // Pulse Guide as a short tap, not a hold: a *held* Guide/Steam
+                // button puts the Steam Deck into shortcut-chord mode (Steam+R1 =
+                // screenshot). A tap just opens the guide menu. See guide_chord.rs.
+                report.buttons |= buttons::GUIDE;
             }
             if chord.rising_edge {
                 // Best-effort, fire-and-forget: ask the main loop to flash the
@@ -417,9 +513,9 @@ async fn handle_connection(
         }
     };
 
-    // Update battery level in BLE service when signaled (XIAO only).
-    // 0xFF = charging (don't update percentage), otherwise 0-100%.
-    #[cfg(feature = "board-xiao")]
+    // Update battery level in the BLE service when signaled. Boards without a
+    // gauge never signal BATTERY_LEVEL, so this future just stays pending (inert)
+    // on those builds. 0xFF = charging (don't update percentage), else 0-100%.
     let battery_future = async {
         loop {
             let level = BATTERY_LEVEL.wait().await;
@@ -433,8 +529,8 @@ async fn handle_connection(
     // Wait for sync mode request — disconnects active connection
     let sync_future = SYNC_MODE.wait();
 
-    // Run all until one completes (connection drops or sync requested)
-    #[cfg(feature = "board-xiao")]
+    // Run all until one completes (connection drops or sync requested). The
+    // battery future is inert on boards without a gauge (never signaled).
     let sync_requested = {
         let main_futures =
             embassy_futures::select::select3(gatt_future, notify_future, battery_future);
@@ -451,30 +547,6 @@ async fn handle_connection(
                     }
                     embassy_futures::select::Either3::Third(()) => {
                         log!("BLE: Disconnected (battery task ended)");
-                    }
-                }
-                false
-            }
-            embassy_futures::select::Either3::Second(()) => unreachable!(),
-            embassy_futures::select::Either3::Third(()) => {
-                log!("BLE: Sync mode requested, disconnecting");
-                true
-            }
-        }
-    };
-    #[cfg(not(feature = "board-xiao"))]
-    let sync_requested = {
-        let main_futures = embassy_futures::select::select(gatt_future, notify_future);
-        let combined =
-            embassy_futures::select::select3(main_futures, bond_save_future, sync_future);
-        match combined.await {
-            embassy_futures::select::Either3::First(inner) => {
-                match inner {
-                    embassy_futures::select::Either::First(_gatt_result) => {
-                        log!("BLE: Disconnected (GATT: {:?})", _gatt_result);
-                    }
-                    embassy_futures::select::Either::Second(()) => {
-                        log!("BLE: Disconnected (notify failure)");
                     }
                 }
                 false
