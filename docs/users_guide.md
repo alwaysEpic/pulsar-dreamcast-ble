@@ -142,6 +142,11 @@ How the level is measured depends on the board:
 Because the Pulsar v1 gauge moves in 25% steps, its indicator jumps between four states
 rather than sliding down gradually. That's the gauge, not a fault.
 
+<p align="center"><img src="images/pulsar/edited/controller-underside-usbc.jpg" width="420" alt="USB-C port reachable through the slot opening on the controller underside, with a VMU in the second slot"></p>
+
+*The USB-C port faces out through the slot opening on the controller's underside — the
+adapter charges in place, and a VMU in the second slot is unaffected.*
+
 Charge the battery over USB-C — on Pulsar v1 that's the carrier's own port, on a DIY build it's the XIAO's. A USB power brick or phone charger is recommended. **Note:** Some laptops (especially MacBooks) have smart USB ports that may reduce or cut power when the adapter is in deep sleep, since the USB peripheral is off and the laptop doesn't detect a device. If you notice the battery not charging from a laptop, either use a standard USB charger or keep the adapter awake while plugged in.
 
 ## Rumble
@@ -246,6 +251,11 @@ colours are deliberately dim to avoid glare through the shell window.
 | Dim red | Searching for controller |
 | Dim green | Controller found / connected |
 | All dark | Sleeping or idle |
+
+<p align="center"><img src="images/pulsar/edited/controller-back-led-bar.jpg" width="360" alt="Adapter in the VMU slot, status LED lighting the shell green"></p>
+
+*The status LED lighting the shell from the VMU slot (green = connected). The magenta
+gauge LEDs sit behind the same window.*
 
 **XIAO — onboard RGB (one LED).** No battery gauge; the level is on the VMU and your host.
 

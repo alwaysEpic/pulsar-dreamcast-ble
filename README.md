@@ -4,7 +4,7 @@
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)
 
-![Pulsar adapter in Dreamcast controller](docs/images/vmu_in_controller.jpeg)
+![Dreamcast controller with the Pulsar adapter's VMU LCD showing the rotating pulsar](docs/images/pulsar/edited/controller-front-lcd.jpg)
 
 Use your Dreamcast controller wirelessly with any Bluetooth device. Pulsar speaks the Dreamcast's Maple Bus protocol natively and presents itself as a standard Xbox One S BLE gamepad — just plug in, pair, and play.
 
@@ -122,8 +122,8 @@ A 3D-printable VMU-shaped case is included in [`3d_files/`](3d_files/). See [3d_
 
 <table>
   <tr>
-    <td><img src="docs/images/vmu_front.jpeg" width="300" alt="VMU front"></td>
-    <td><img src="docs/images/vmu_back.jpeg" width="300" alt="VMU back"></td>
+    <td><img src="docs/images/pulsar/edited/pulsar-device-overview-polished.jpg" width="300" alt="Assembled Pulsar adapter, front"></td>
+    <td><img src="docs/images/pulsar/edited/pulsar-device-back.jpg" width="300" alt="Assembled Pulsar adapter, back with controller cable"></td>
   </tr>
   <tr>
     <td><img src="docs/images/vmu_opened.jpeg" width="300" alt="Inside the enclosure"></td>
