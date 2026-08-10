@@ -148,6 +148,6 @@ if [ "$ok" -eq 1 ]; then
     echo -e "${GREEN}PASS${NC}: input path healthy on real hardware."
 else
     echo -e "${YELLOW}Note:${NC} read-min clean + tries high => sampling code is fine; suspect the bus/controller (signal integrity), not firmware."
-    echo -e "${RED}Bench gate failed — see docs/working_logs/dk_debug_log.md.${NC}"
+    echo -e "${RED}Bench gate failed — compare against a known-good bench run.${NC}"
     exit 1
 fi

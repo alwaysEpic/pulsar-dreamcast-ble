@@ -13,7 +13,7 @@
 //! VMU writes are now fire-and-forget and unanchored; collided frames are
 //! dropped by the VMU's CRC (~64% at the measured ~15ms connection interval,
 //! giving ~2fps effective animation from 6fps attempted). Do not re-enable
-//! without a soak test against `docs/working_logs/dk_debug_log.md` 2026-06-10.
+//! without a soak test against the 2026-06-10 bench measurements.
 //!
 //! The BLE SoftDevice fires connection events at interrupt priority 0, which
 //! corrupt long bit-bang Maple transactions (the ~7.6ms LCD TX, measured).

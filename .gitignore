@@ -12,3 +12,21 @@ tools/
 __pycache__/
 *.pyc
 rtt_logs/
+
+# Local agent tooling
+.agents/
+
+# Scratch: screen recordings, ad-hoc test files
+*.mov
+/test
+
+# PCB/fab: commit the extracted dirs, not the zip bundles; skip the obsolete
+# TPS61099 boost CAD library (chip dropped for the IP5306) + KiCad auto-backups.
+*.zip
+*.lck
+docs/LIB_TPS61099DRVR/
+pulsar-dreamcast-carrier/pulsar-dreamcast-carrier-backups/
+
+# Secure DFU bootloader build products (sources in bootloader/ are tracked)
+bootloader/_out/
+bootloader/pulsar_s140_ble/armgcc/_build/

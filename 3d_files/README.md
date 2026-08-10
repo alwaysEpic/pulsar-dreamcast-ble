@@ -7,10 +7,10 @@ This directory contains 3D models for a VMU-shaped enclosure for the Dreamcast B
 - **`blender_files/`** — Blender source files for the modified VMU enclosure (by alwaysEpic)
 - **`Edited_VMU_stls/`** — Modified STL exports ready for printing (by alwaysEpic)
 - **`VMU_ShellAssembly.step`** — STEP assembly file
+- **`pulsar_pcb.stl`**, **`Pulsar.step`** — the carrier board as a mesh/solid, for fit-checking only. Not manufacturing data; no board can be fabricated from them.
 - **`cable_hole_plug.stl`** — Cable hole plug by [byt3swap](https://github.com/byt3swap/dreamwave-enhanced) (used with permission)
-- **`Dreamcast+VMU+Shell.zip`** — KampCreates' original VMU shell model
 
-The original VMU 3D scan archives (`VMU.rar`, `VMUCapScan.rar`) are large binary files and not included in the repository. They are available as assets on the [GitHub Releases](https://github.com/alwaysEpic/pulsar-dreamcast-ble/releases) page to preserve them in case the original sources go offline.
+The VMU scan archives this work was modelled against are not redistributed here. Get them from the original thread linked under Attribution.
 
 ## Printing Tips
 
@@ -18,11 +18,14 @@ The front and back halves print best at roughly a 45-degree angle with a few sup
 
 ## Attribution
 
-- **Modified enclosure** (Blender files, edited STLs) by [alwaysEpic](https://github.com/alwaysEpic) — if you use or remix these, please credit the original author
-- **VMU shell recreation** by [KampCreates](https://makerworld.com/en/@KampCreates)
-- **Original VMU 3D scans** by [WeskMods](https://bitbuilt.net/forums/threads/dreamcast-vmu-scan.3988/)
+- **Modified enclosure** (Blender files, edited STLs) by [alwaysEpic](https://github.com/alwaysEpic) — modelled against the VMU scans below. If you use or remix these, please credit the author.
+- **VMU 3D scans** by [Wesk](https://bitbuilt.net/forums/threads/dreamcast-vmu-scan.3988/) — the reference this enclosure was built from. Wesk published them as reference material without stating licence terms; they are not redistributed here.
 - **Cable hole plug** by [byt3swap](https://github.com/byt3swap/dreamwave-enhanced) — used with permission
 
 ## License
 
-The 3D files in this directory are **not** covered by the project's GPL-3.0 license. The modified Blender files and edited STLs are shared under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) — you're free to use, modify, and redistribute them with attribution. Other files are included with attribution to their original creators; please credit them if you use or redistribute.
+These files are **not** covered by the project's GPL-3.0 licence.
+
+The Blender sources and edited STLs are the author's own modelling work — the Pulsar cutouts, pockets, plunger, tolerances, and print splits — and are offered under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): use, modify, and redistribute them with attribution.
+
+That grant covers only the author's own modelling work. `cable_hole_plug.stl` is byt3swap's and is included by permission; its terms are theirs, not ours.
