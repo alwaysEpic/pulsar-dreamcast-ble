@@ -184,13 +184,24 @@ const BATTERY_OUTLINE: [[u8; 2]; BATTERY_HEIGHT] = [
 const BAR_COLS: [usize; 4] = [2, 4, 6, 8];
 
 /// Number of bars to show for a given battery percentage.
+///
+/// Bucketed so that a **coarse 4-level gauge lands one bar per level**:
+/// 25 % → 1 bar, 50 % → 2, 75 % → 3, 100 % → 4. pulsarv1's IP5306 reports
+/// exactly those four values (it is a 4-LED fuel gauge, and `percent` is just
+/// the LED count re-expressed), so each bucket boundary has to sit *above* its
+/// value, not on it. The previous map started each bucket on the value
+/// (`75..=100 => 4`), which showed a full 4-bar icon for a 3-of-4 gauge reading
+/// — a whole quarter of charge optimistic on pulsarv1.
+///
+/// The XIAO's continuous SAADC gauge falls in the same quarters. Below 10 % the
+/// icon empties completely as a critical-charge cue.
 #[must_use]
 pub const fn bars_for_percent(percent: u8) -> u8 {
     match percent {
-        75..=100 => 4,
-        50..=74 => 3,
-        25..=49 => 2,
-        10..=24 => 1,
+        76..=u8::MAX => 4,
+        51..=75 => 3,
+        26..=50 => 2,
+        10..=25 => 1,
         _ => 0,
     }
 }
