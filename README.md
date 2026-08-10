@@ -38,7 +38,27 @@ Use your Dreamcast controller wirelessly with any Bluetooth device. Pulsar speak
 - iOS, Android (as BLE HID gamepad)
 - PlayStation, Nintendo Switch (as generic controller)
 
+## Supported Boards
+
+One firmware, three boards. They play identically; what differs is what they can show you and
+how you flash them.
+
+| Board | | Status light | Battery | Rumble | Flashing |
+|---|---|---|---|---|---|
+| **XIAO** | Hand-wired DIY build — the one this guide walks through | Onboard RGB | Voltage estimate | — | USB (UF2) |
+| **Pulsar v1** | Designed carrier with a XIAO mounted on it | 5-LED bar (status + battery) | IP5306 gauge, 4 levels | Yes | Wireless (OTA) |
+| **DK** | nRF52840-DK, bench only | Kit LEDs | — | — | Debug probe |
+
+Pulsar v1 runs the same XIAO module as the DIY build, so the two share their silicon — the
+carrier adds integrated power management, the LED bar, and a rumble motor around it. Its
+fabrication files are not published, but the design is described in the
+[bill of materials](docs/bill_of_materials.md) and all three boards' pin assignments are in
+[pin mapping](docs/pin_mapping.md).
+
 ## Build Your Own
+
+This section covers the **XIAO** build — the one you can make yourself with parts off the
+shelf. Everything after Wiring assumes that board unless stated.
 
 ### What You Need
 
@@ -83,8 +103,9 @@ If you need RTT debug logging, flash via SWD instead. The SoftDevice must be fla
 
 **Sync button:**
 - Short press → wake / request reconnect
-- Hold 3s → clear bond and start pairing
-- Hold 10s → sleep (`BYE` splash, then powers off)
+- Hold 2s → clear bond and start pairing
+- Hold 3.5s **while holding the controller's Start** → firmware update (OTA) mode
+- Hold 7s → sleep (`BYE` splash, then powers off)
 - Triple-press → switch profile (Xbox ⇄ Dreamcast identity)
 
 **Guide / Xbox button:** pull both triggers and hold Start (~⅓ second) to send the Guide button — opens the Steam overlay / Big Picture, the Xbox Game Bar, etc. Works on both profiles.

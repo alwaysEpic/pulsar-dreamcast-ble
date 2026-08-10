@@ -1,10 +1,24 @@
 # Dreamcast BLE Adapter -- Test Plan
 
-Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF52840 breadboard prototype).
+Comprehensive test plan for the Dreamcast-to-BLE controller adapter, across all three supported boards.
 
-**Revision:** 1.0
-**Date:** 2026-02-23
-**Target hardware:** Seeed XIAO nRF52840 + Pololu boost converter + BQ25101 charger + LiPo cell
+**Revision:** 2.0
+**Date:** 2026-08-07
+
+## Target hardware
+
+| Board | Build | Hardware under test |
+|---|---|---|
+| **Pulsar v1** | `board-pulsarv1` | Designed carrier with a XIAO nRF52840 mounted: IP5306 charge/boost/gauge, 5× WS2812 status bar, ERM rumble motor, LiPo cell |
+| **XIAO** | `board-xiao` | Seeed XIAO nRF52840 + boost converter + BQ25101 charger + LiPo cell, on perfboard or breadboard |
+| **DK** | `board-dk` | Nordic nRF52840-DK. Bench only: no battery, no boost rail, no gauge, no sleep |
+
+**Board applicability.** Unmarked cases run on all three. Cases that exercise hardware only
+some boards have are marked in their title — `(Pulsar v1)`, `(XIAO)`, `(XIAO / Pulsar v1)`,
+`(DK)`. A case marked for a board the DUT isn't is not a failure; it is not applicable.
+
+Release builds are mandatory on every board — debug builds miss the Maple Bus timing window,
+so a failure on a debug build tells you nothing.
 
 ---
 
@@ -12,7 +26,9 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 
 | Item | Purpose |
 |------|---------|
-| XIAO nRF52840 adapter (prototype) | Device under test (DUT) |
+| Pulsar v1 adapter | Device under test (DUT) — retail configuration |
+| XIAO nRF52840 adapter (DIY build) | Device under test (DUT) — hand-wired configuration |
+| nRF52840-DK | Device under test (DUT) — bench configuration, RTT console |
 | Dreamcast controller (OEM) | Input source |
 | Dreamcast controller (third-party, if available) | Compatibility |
 | LiPo cell (1000mAh) | Battery power |
@@ -156,12 +172,12 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 | **Pass/Fail** | Automatic reconnection within 10 seconds of power-on. |
 | **Equipment** | DUT, laptop or phone |
 
-### BLE-03: Sync Mode Entry (3-Second Hold)
+### BLE-03: Sync Mode Entry (2-Second Hold)
 
 | Field | Value |
 |-------|-------|
-| **Steps** | 1. Power on DUT with existing bond. 2. Hold sync button for 3 seconds. 3. Observe LED behavior (slow blink -> fast blink at 3s). 4. Release button. |
-| **Expected** | After 3s hold, DUT clears bond, enters sync mode (discoverable), LED blinks. RTT log shows "SYNC: Entering pairing mode (60s)". |
+| **Steps** | 1. Power on DUT with existing bond. 2. Hold sync button for 2 seconds. 3. Observe LED behavior (slow blink -> fast blink at 2s). 4. Release button. |
+| **Expected** | After 2s hold, DUT clears bond, enters sync mode (discoverable), LED blinks. RTT log shows "SYNC: Entering pairing mode (60s)". |
 | **Pass/Fail** | Bond cleared, new host can discover and pair. |
 | **Equipment** | DUT, SWD debugger (RTT), host device |
 
@@ -619,7 +635,7 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 | Field | Value |
 |-------|-------|
 | **Steps** | 1. Quickly double-tap sync button (not triple). 2. Observe behavior. |
-| **Expected** | Two short presses within 2 seconds should NOT trigger name toggle (requires 3 presses). Should not trigger sync mode (requires 3-second hold). |
+| **Expected** | Two short presses within 2 seconds should NOT trigger name toggle (requires 3 presses). Should not trigger sync mode (requires 2-second hold). |
 | **Pass/Fail** | No state change from double-tap. |
 | **Equipment** | DUT |
 
@@ -627,7 +643,7 @@ Comprehensive test plan for the Dreamcast-to-BLE controller adapter (XIAO nRF528
 
 | Field | Value |
 |-------|-------|
-| **Steps** | 1. DUT connected and operating normally. 2. Hold sync button for 3 seconds. |
+| **Steps** | 1. DUT connected and operating normally. 2. Hold sync button for 2 seconds. |
 | **Expected** | Enters sync mode, clears bond, disconnects from current host, becomes discoverable. |
 | **Pass/Fail** | Clean transition to sync mode. Old host cannot reconnect without re-pairing. |
 | **Equipment** | DUT, host |
@@ -808,6 +824,120 @@ Blind spots — what these gates do *not* catch. Worth keeping in mind when a te
 - *Pinned BlueRetro commit* can drift from real-hardware behavior over time (deliberate, for reproducibility — but re-verify on bumps).
 - *Paths-filtered triggers* — the QEMU job only runs on changes to `xbox_hid.rs` / harness files; a descriptor or serializer change elsewhere wouldn't fire it.
 - *QEMU ≠ real hardware,* and the fixtures-up-to-date check is regeneration-tautological — correctness rests on the QEMU mapping job.
+
+---
+
+## 10. Board-Specific Hardware
+
+Cases for hardware only some boards carry. Each is marked with the board it applies to.
+
+### HW-01: Status Indicator -- Searching and Connected (all boards)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Power on DUT with no controller attached. 2. Observe the status indicator. 3. Attach the controller. 4. Observe again. |
+| **Expected** | Searching: Pulsar v1 LED 0 dim red / XIAO onboard RGB solid red / DK LED4 on. Connected: Pulsar v1 LED 0 dim green / XIAO solid green / DK LED4 off and LED3 on. |
+| **Pass/Fail** | Both states render correctly for the board under test. |
+| **Equipment** | DUT, Dreamcast controller |
+
+### HW-02: Battery Gauge Renders on the LED Bar (Pulsar v1)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Power on with a charged cell. 2. Note how many of LEDs 1-4 are lit and in what colour. 3. Discharge or substitute a lower cell to cross a gauge boundary. 4. Observe. |
+| **Expected** | LEDs 1-4 light in dim magenta, one per 25% gauge level, distinct from LED 0's status colour. The count steps 4 -> 3 -> 2 -> 1 as the gauge crosses boundaries; it does not slide continuously. |
+| **Pass/Fail** | Correct LED count for the level, magenta, and clearly distinguishable from the status LED at operating brightness. |
+| **Equipment** | Pulsar v1 DUT, charged and partly discharged LiPo cells, multimeter |
+
+### HW-03: Battery Reading Survives a Status Change (Pulsar v1)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Connect with the controller attached and note the battery LED count. 2. Unplug the controller so status returns to searching. 3. Observe LEDs 1-4. 4. Reattach. |
+| **Expected** | The battery LEDs stay lit and unchanged through the status transition. Only LED 0 changes. |
+| **Pass/Fail** | Gauge is not blanked by a status change in either direction. |
+| **Equipment** | Pulsar v1 DUT, Dreamcast controller |
+
+### HW-04: No Gauge Reported Without One (XIAO / DK)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Power on the DUT. 2. Inspect the Battery Service level reported over BLE. 3. Observe the status indicator. |
+| **Expected** | XIAO reports a percentage derived from the battery ADC. DK reports no battery at all rather than a placeholder value. Neither attempts a gauge on its status LED. |
+| **Pass/Fail** | No board invents a battery reading it cannot measure. |
+| **Equipment** | DUT, host device, nRF Connect |
+
+### HW-05: Rumble Responds to Host Output Reports (Pulsar v1)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Pair in Xbox profile and connect. 2. Trigger rumble from the host (game, or a test tool that sends Output report ID 3). 3. Vary the requested intensity. 4. Stop rumble. |
+| **Expected** | The ERM motor runs while commanded, intensity tracks the requested level, and stops when the host stops. |
+| **Pass/Fail** | Motor follows host commands in both directions. |
+| **Equipment** | Pulsar v1 DUT, host capable of sending rumble |
+
+### HW-06: Rumble Stops on Disconnect (Pulsar v1)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Start rumble from the host. 2. While it is running, drop the connection (turn off host Bluetooth). 3. Wait for the adapter to reconnect on its own without further host input. 4. Observe the motor throughout. |
+| **Expected** | The motor stops at disconnect and stays stopped through the silent reconnect. It does not resume when the rail comes back. |
+| **Pass/Fail** | No latched rumble across a disconnect/reconnect cycle. |
+| **Equipment** | Pulsar v1 DUT, host device |
+
+### HW-07: Rumble Commands Ignored Harmlessly (XIAO / DK)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Pair in Xbox profile. 2. Trigger rumble from the host. 3. Continue playing for 30 seconds. |
+| **Expected** | Nothing happens physically; input continues normally with no stalls, disconnects, or dropped reports. |
+| **Pass/Fail** | Rumble commands are accepted and discarded without side effects. |
+| **Equipment** | XIAO or DK DUT, host capable of sending rumble |
+
+### HW-08: OTA Update Gesture and Refusal (Pulsar v1)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. With a charged cell and the controller attached, hold sync past 3.5s while holding the controller's Start. 2. Observe. 3. Repeat on a cell below the DFU threshold, not charging. 4. Repeat while charging. |
+| **Expected** | Charged: three fast flashes, then reboot advertising as `PulsarDFU`. Low battery and not charging: refused, `CHRG` shown on the VMU, normal operation continues. Low battery but charging: allowed. |
+| **Pass/Fail** | Gesture fires only with the controller's Start held, and the battery gate behaves in all three cases. |
+| **Equipment** | Pulsar v1 DUT, Dreamcast controller, charged and depleted cells, USB charger |
+
+### HW-09: Update Gesture Preserves the Bond (Pulsar v1)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Pair with a host. 2. Perform the DFU gesture, including a run where the battery gate refuses it. 3. Return to normal operation without completing an update. 4. Power-cycle and observe reconnection. |
+| **Expected** | The bond survives in both cases. The adapter reconnects to the paired host without re-pairing. |
+| **Pass/Fail** | Requesting an update — successful or refused — never clears the pairing. |
+| **Equipment** | Pulsar v1 DUT, Dreamcast controller, host device |
+
+### HW-10: LED Bar Blanked Before Sleep (Pulsar v1)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Connect and confirm the bar is lit. 2. Hold sync for 7 seconds to sleep. 3. Observe the bar through the goodbye splash and after. |
+| **Expected** | All five LEDs go dark before the board sleeps. No LED is left partly driven. |
+| **Pass/Fail** | Bar fully dark in sleep. |
+| **Equipment** | Pulsar v1 DUT |
+
+### HW-11: Sleep Behaviour by Board (all boards)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Hold sync for 7 seconds. 2. Observe the goodbye splash and what the board does next. 3. Press sync. |
+| **Expected** | Pulsar v1 and XIAO show `BYE` then enter System Off and wake on sync with a full restart. DK shows `BYE` then halts — the splash is testable on the bench without power management. |
+| **Pass/Fail** | Each board reaches its documented end state. |
+| **Equipment** | DUT, VMU |
+
+### HW-12: Firmware Update Path by Board (all boards)
+
+| Field | Value |
+|-------|-------|
+| **Steps** | 1. Update the DUT by its documented route: Pulsar v1 wireless, XIAO UF2 drag-and-drop, DK debug probe. 2. Confirm the new version is running. 3. Attempt to pair or reconnect. |
+| **Expected** | Each board updates by its own route. Coming from v0.3.0 or earlier the bond does not survive, and the adapter must be paired fresh — this is expected, and is called out in the user guide. |
+| **Pass/Fail** | Update completes and the adapter operates normally after re-pairing where required. |
+| **Equipment** | DUT, host device, UF2 file / probe / signed package as applicable |
 
 ---
 
