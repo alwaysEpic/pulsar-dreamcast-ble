@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: [board-dk, board-xiao]
+        features: [board-dk, board-xiao, board-pulsarv1]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,11 +60,24 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: [board-dk, board-xiao]
+        features: [board-dk, board-xiao, board-pulsarv1]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7em-none-eabihf
+          # llvm-tools supplies llvm-objdump, which the timing check below
+          # disassembles the ELF with. Rustup's default profile omits it and the
+          # action installs only what is asked for, so without this the check
+          # fails on every hosted run.
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --no-default-features --features ${{ matrix.features }}
+      # The wire timing must not depend on codegen, and a layout shift has
+      # broken it before. Read the compiled ELF and fail if the pinned RX
+      # sampling loop or the hardware TX path regressed — the same check
+      # scripts/ci.sh runs locally, so a green badge means the same thing.
+      - name: Timing invariants
+        run: ./scripts/check_timing_invariants.sh
+             target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble
+             "${{ matrix.features }}"

@@ -46,6 +46,8 @@ build_and_check() {
 
 build_and_check "xiao+rtt" "board-xiao,rtt"
 build_and_check "xiao" "board-xiao"
+build_and_check "pulsarv1+rtt" "board-pulsarv1,rtt"
+build_and_check "pulsarv1" "board-pulsarv1"
 build_and_check "dk" "board-dk"
 
 echo ""

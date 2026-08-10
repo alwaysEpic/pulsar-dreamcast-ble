@@ -3,7 +3,7 @@ members = [".", "maple-protocol"]
 
 [package]
 name = "pulsar-dreamcast-ble"
-version = "0.3.0"
+version = "0.2.7"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["alwaysEpic"]
@@ -51,12 +51,52 @@ default = ["board-dk", "rtt"]
 rtt = ["dep:rtt-target"]
 board-dk = ["rtt"]
 board-xiao = []
+board-pulsarv1 = []
 
 # Debug-only: stamp a 7-bit sequence counter into report byte 15 (bits 1-7,
 # HID padding) so a host capture can detect reports dropped in transit. Not for
 # normal play. Combine with a board feature:
 #   cargo build --release --no-default-features --features board-dk,rtt,seq-counter
 seq-counter = []
+# HID side-channel: right-stick bytes 4-7 carry Maple get_condition failure
+# counters ([4-5]=total LE u16, [6]=max consecutive streak, [7]=0x5A marker).
+# Correlates poll-loop outages with host-side delivery gaps; mutually
+# exclusive with gauge-debug / connparam-debug (same bytes).
+#   cargo build --release --no-default-features --features board-pulsarv1,maple-fail-debug
+maple-fail-debug = []
+
+# Debug-only: smuggle the raw IP5306 `0x78` gauge byte out over BLE, in the
+# right-stick report bytes (4-7) the Dreamcast never uses. The XIAO has no
+# onboard debugger and there is no SWD probe for pulsarv1, so RTT cannot see
+# this board — the HID report is the only channel that works untethered, on
+# battery, which is exactly the condition the gauge has to be characterized in.
+# Corrupts the right stick; never ship it. Read with `hid_capture.py --gauge`:
+#   cargo build --release --no-default-features --features board-pulsarv1,gauge-debug
+gauge-debug = []
+
+# Debug-only: smuggle the BLE connection-parameter negotiation out over the same
+# right-stick bytes (4-7). Answers the one question three rounds of parameter
+# tuning could not (2026-07-27): the host runs us at 15 ms regardless of what we
+# request, and we cannot tell whether that is the host refusing or our own
+# request never being issued — `sd_ble_gap_conn_param_update` returns
+# NRF_ERROR_BUSY (17) if another procedure is in flight, and it fires 500 ms
+# after `request_security()` while bonding plausibly still is. This reports the
+# raw return code alongside the *live negotiated* interval the SoftDevice
+# actually holds. Mutually exclusive with gauge-debug (same bytes). Read with
+# `hid_capture.py --connparam`:
+#   cargo build --release --no-default-features --features board-pulsarv1,connparam-debug
+connparam-debug = []
+
+# HID side-channel: right-stick bytes 4-7 carry poll-loop period telemetry —
+# rotating tagged payloads (0xB0|k in byte 7): window-mean/max poll period,
+# get_condition span, sleep span, retry count, cadence overruns. Makes a bad
+# binary-layout roll readable in ONE 30 s capture instead of a day of them
+# (pulsarv1 has no RTT probe; the HID report is the only untethered channel).
+# Mutually exclusive with gauge-debug / connparam-debug / maple-fail-debug
+# (same bytes). Combinable with seq-counter (byte 15). Read with
+# `hid_capture.py --pollperiod`:
+#   cargo build --release --no-default-features --features board-pulsarv1,rtt,seq-counter,poll-period-debug
+poll-period-debug = []
 
 # Debug-only: DWT cycle-counter timing of the main poll loop, logged via RTT.
 # Attributes the per-poll time (get_condition vs VMU write vs rest). Needs rtt.
