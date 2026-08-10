@@ -1,19 +1,53 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! SoftDevice radio notification gate for Maple Bus LCD writes.
+//! SoftDevice radio notification gate for Maple Bus transactions.
 //!
-//! # ⚠ CURRENTLY UNUSED — preserved as a post-mortem (2026-06-10)
+//! # RE-ENABLED 2026-08-05 — now gates the controller poll loop (soak-gated)
 //!
-//! `main.rs` no longer calls [`init`]: every write-scheduling gate built on
-//! radio notifications produced SoftDevice assertion panics while VMU writes
-//! were active — the alternating-flag `ON_BOTH` original, `INT_ON_INACTIVE`,
-//! and the gap-classified `ON_BOTH` below all asserted within minutes, while
-//! identical builds with writes disabled ran clean. The mechanism was never
-//! identified (the write path makes no SD calls and masks no interrupts).
-//! VMU writes are now fire-and-forget and unanchored; collided frames are
-//! dropped by the VMU's CRC (~64% at the measured ~15ms connection interval,
-//! giving ~2fps effective animation from 6fps attempted). Do not re-enable
-//! without a soak test against the 2026-06-10 bench measurements.
+//! `main.rs` calls [`init`] again: the poll pacer starts each Maple
+//! transaction at the head of a radio-quiet window ([`idle_age_ms`] fresh),
+//! which removes the Maple/BLE collisions that field data proved were the
+//! real mechanism of the compiled-timing lottery (board log 2026-08-05:
+//! collision retries fed poll phase back into collision probability; gc mean
+//! 14-17ms on bad rolls, ~1-1.3 retries/poll).
+//!
+//! ## The 2026-06-10 assert history, and its confound
+//!
+//! This banner used to say "every gate built on these asserted while VMU
+//! writes were active; mechanism never identified — do not re-enable". A
+//! day after that verdict, `poll_timing`'s critical-section bug was found:
+//! its VMU-write measurement span masked interrupts and caused stochastic
+//! SD asserts — a path that only executes when writes are active, exactly
+//! reproducing the "writes-on asserts, writes-off clean" evidence that
+//! condemned this module. The notification config itself (`INT_ON_BOTH`)
+//! ran for hours with colliding writes and never asserted. Not proven
+//! innocent: the re-enable is gated on a fresh soak (historical assert rate
+//! ~1-2/min ⇒ a 30-60 min clean soak is decisive). If asserts return on a
+//! build WITHOUT `poll-timing`, this module really is guilty — disable the
+//! [`init`] call and fall back to the fixed-cadence pacer.
+//!
+//! ## ⚠ STALE NUMBERS REMOVED (2026-07-27)
+//!
+//! This banner used to quantify that loss as "~64% ... giving ~2fps effective
+//! animation from 6fps attempted". **Both figures are wrong for the current
+//! firmware and should not be quoted:**
+//!
+//! - The 6fps denominator contradicts the code. The animation advances every
+//!   `VMU_ANIM_INTERVAL` = 20 polls (`main.rs`), which at the 15ms poll period
+//!   is ~300ms — about **3.3fps attempted**, not 6.
+//! - The ~64%/2fps loss figures predate [`super::pwm_tx::write_lcd_dma`]. They
+//!   describe the old bit-bang LCD write, whose ~10ms radio-sensitive span was
+//!   the thing causing the collisions; the DMA path cut that to ~6.3ms
+//!   specifically to fit the BLE quiet gap. Nobody re-measured afterwards.
+//!
+//! The current effective rate is **unmeasured**. An attempt to recover it from
+//! video failed and is worth not repeating: the VMU LCD's persistence is long
+//! relative to the 300ms animation step, so successive rotation steps ghost
+//! together on the glass and there is no crisp frame boundary to detect —
+//! measured rates swung 0.61-2.01/s purely with the analysis threshold. Ground
+//! truth only exists in firmware, via a diagnostic build that restores the ACK
+//! read in `write_vmu_lcd` and counts it, accepting the timing cost for the
+//! duration of the test.
 //!
 //! The BLE SoftDevice fires connection events at interrupt priority 0, which
 //! corrupt long bit-bang Maple transactions (the ~7.6ms LCD TX, measured).
@@ -65,11 +99,11 @@ use nrf_softdevice_s140::{
     NRF_RADIO_NOTIFICATION_TYPES_NRF_RADIO_NOTIFICATION_TYPE_INT_ON_BOTH, NRF_SUCCESS,
 };
 
-/// DWT cycle count of the most recent notification (either edge).
-static LAST_EDGE_CYC: AtomicU32 = AtomicU32::new(0);
+/// RTC1 tick count of the most recent notification (either edge).
+static LAST_EDGE_TICKS: AtomicU32 = AtomicU32::new(0);
 
-/// DWT cycle count of the most recent INACTIVE-classified notification.
-static LAST_INACTIVE_CYC: AtomicU32 = AtomicU32::new(0);
+/// RTC1 tick count of the most recent INACTIVE-classified notification.
+static LAST_INACTIVE_TICKS: AtomicU32 = AtomicU32::new(0);
 
 /// True once any INACTIVE-classified notification has been seen.
 static INACTIVE_SEEN: AtomicBool = AtomicBool::new(false);
@@ -77,21 +111,49 @@ static INACTIVE_SEEN: AtomicBool = AtomicBool::new(false);
 /// Total notifications since boot (BOTH edges — two per radio event).
 static NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// CPU clock in MHz — CYCCNT cycles / (this × 1000) = milliseconds.
-const CPU_MHZ: u32 = 64;
+/// # Clock choice: RTC1 COUNTER, never the DWT (field-learned, run #48)
+///
+/// The first version of this module timestamped edges with DWT CYCCNT.
+/// **CYCCNT halts while the core sleeps in WFE**, so its inter-notification
+/// "gap" is CPU-awake time, not wall time — which made edge classification
+/// depend on how much CPU the rest of the firmware happened to burn per
+/// connection interval. Layouts that ran the poll body in ~7-9ms of awake
+/// time classified correctly (v216-v218); v219 rolled a faster body,
+/// awake time between events fell toward the 5ms threshold, and ACTIVE
+/// warnings (fired 800µs BEFORE radio activity) started classifying as
+/// INACTIVE — the scheduler then aligned Maple transactions directly into
+/// connection events (21% doubled intervals, 40-91ms stalls from align
+/// caps). A build-dependent clock inside the scheduler is the compiled-
+/// timing lottery all over again. RTC1 runs through sleep (it IS the
+/// embassy time base, `time-driver-rtc1`); reading its COUNTER register
+/// is one volatile load with no driver call, so it honors the "no
+/// timer-driver calls in interrupt context" rule below.
+const RTC1_COUNTER: *const u32 = 0x4001_1504 as *const u32;
+
+/// RTC1 tick rate (32.768 kHz) and its 24-bit counter mask.
+const RTC_HZ: u32 = 32_768;
+const RTC_MASK: u32 = 0x00FF_FFFF;
 
 /// Pre-gap threshold separating the two edges: ACTIVE→INACTIVE gaps are
 /// ~1-3ms (800µs warning + connection event), INACTIVE→ACTIVE gaps are
 /// ~12ms at the measured ~15ms connection interval. 5ms sits between.
-const GAP_CLASSIFY_CYC: u32 = 5 * CPU_MHZ * 1000;
+const GAP_CLASSIFY_TICKS: u32 = 5 * RTC_HZ / 1000;
 
 /// nRF52840 IRQ number for SWI1_EGU1.
 const SWI1_EGU1_IRQN: u32 = 21;
 
 #[inline]
-fn cyccnt() -> u32 {
-    // SAFETY: CYCCNT is a free-running read-only counter; reading is always safe.
-    unsafe { (*cortex_m::peripheral::DWT::PTR).cyccnt.read() }
+fn rtc_ticks() -> u32 {
+    // SAFETY: RTC1 COUNTER is a free-running read-only register (the
+    // embassy time base keeps the peripheral started); a single volatile
+    // read is always safe, including from interrupt context.
+    unsafe { core::ptr::read_volatile(RTC1_COUNTER) }
+}
+
+/// 24-bit wrapping tick delta.
+#[inline]
+fn tick_delta(now: u32, prev: u32) -> u32 {
+    now.wrapping_sub(prev) & RTC_MASK
 }
 
 /// Initialize radio notifications. Call once after SoftDevice is enabled.
@@ -115,14 +177,6 @@ pub fn init() -> bool {
     }
 
     INACTIVE_SEEN.store(false, Ordering::Release);
-
-    // Enable the DWT cycle counter for edge timestamps. DWT/DCB are not
-    // managed by the SoftDevice; stealing is safe here (single init at boot).
-    {
-        let mut p = unsafe { cortex_m::Peripherals::steal() };
-        p.DCB.enable_trace();
-        p.DWT.enable_cycle_counter();
-    }
 
     // Enable SWI1_EGU1 in the NVIC at priority 2
     // nRF52840 uses 3 priority bits in the upper bits of the priority register
@@ -150,8 +204,8 @@ pub fn idle_age_ms() -> Option<u32> {
     if !INACTIVE_SEEN.load(Ordering::Acquire) {
         return None;
     }
-    let edge = LAST_INACTIVE_CYC.load(Ordering::Acquire);
-    Some(cyccnt().wrapping_sub(edge) / (CPU_MHZ * 1000))
+    let edge = LAST_INACTIVE_TICKS.load(Ordering::Acquire);
+    Some(tick_delta(rtc_ticks(), edge) * 1000 / RTC_HZ)
 }
 
 /// Total notifications since boot (both edges — two per radio event, so the
@@ -165,13 +219,13 @@ pub fn notification_count() -> u32 {
 /// docs) and timestamps INACTIVE edges. Keep this minimal — it runs in
 /// interrupt context between SoftDevice activities.
 fn on_radio_notification() {
-    let now = cyccnt();
-    let prev = LAST_EDGE_CYC.swap(now, Ordering::AcqRel);
+    let now = rtc_ticks();
+    let prev = LAST_EDGE_TICKS.swap(now, Ordering::AcqRel);
     // Short pre-gap ⇒ this notification ends a connection event (INACTIVE).
     // First-ever notification: prev=0 makes the gap effectively random/huge,
     // which classifies as ACTIVE — safe (we just wait for the next event).
-    if now.wrapping_sub(prev) < GAP_CLASSIFY_CYC {
-        LAST_INACTIVE_CYC.store(now, Ordering::Release);
+    if tick_delta(now, prev) < GAP_CLASSIFY_TICKS {
+        LAST_INACTIVE_TICKS.store(now, Ordering::Release);
         INACTIVE_SEEN.store(true, Ordering::Release);
     }
     NOTIFY_COUNT.fetch_add(1, Ordering::Relaxed);

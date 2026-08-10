@@ -34,6 +34,13 @@ pub mod addressing {
     pub const HOST: u8 = 0x00;
     /// Controller in port A, main unit.
     pub const PORT_A_MAIN: u8 = 0x20;
+
+    /// Sub-peripheral slot bits within an address byte (bit 0 = slot 1 .. bit 4
+    /// = slot 5). Bits 7-6 are the port, bit 5 marks a main peripheral.
+    pub const SUB_PERIPHERAL_MASK: u8 = 0x1F;
+
+    /// VMU in expansion slot 1.
+    pub const SUB_SLOT_1: u8 = 0x01;
 }
 
 /// Result of a Maple Bus transaction.
@@ -86,17 +93,25 @@ impl Default for DeviceInfo {
 
 /// Maple Bus host controller.
 pub struct MapleHost {
-    /// Timeout for waiting for response (in busy-loop cycles).
-    pub timeout_cycles: u32,
+    /// Response-wait timeout, microseconds wall-clock (DWT-measured in
+    /// `wait_and_sample`). NOT an iteration count — the old `64_000`
+    /// iterations was believed to be ~1ms but compiled to ~8-12ms
+    /// depending on layout, and that variance was the "pattern B" strike
+    /// of the layout lottery (see `wait_and_sample`'s timeout note).
+    pub timeout_us: u32,
 }
 
 impl MapleHost {
     /// Create a new Maple Host with default timeout.
+    ///
+    /// 2ms: the spec floor for a peripheral reply is 50µs after the bus
+    /// goes neutral and the controller measures ~100µs, so 2ms is a ≥20×
+    /// ceiling that still keeps a silent bus cheap — a full 3-attempt
+    /// retry burst costs ≤ ~10ms (one connection interval) instead of the
+    /// old 25-36ms (2-3 intervals of delivery gap, the 45-60ms stalls).
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            timeout_cycles: 64_000,
-        }
+        Self { timeout_us: 2_000 }
     }
 
     /// Send a Device Info Request to discover what's connected.
@@ -113,7 +128,7 @@ impl MapleHost {
         // Read response using bulk sampling — no logging between TX and RX!
         // The controller responds within ~100µs; any rprintln here (~20ms via RTT)
         // causes us to miss the entire response.
-        let response = bus.read_packet_bulk(self.timeout_cycles);
+        let response = bus.read_packet_bulk(self.timeout_us);
 
         let Some(pkt) = response else {
             return MapleResult::Timeout;
@@ -156,7 +171,7 @@ impl MapleHost {
             #[cfg(feature = "poll-timing")]
             crate::poll_timing::record_tx(_pt_tx);
 
-            let response = bus.read_packet_bulk(self.timeout_cycles);
+            let response = bus.read_packet_bulk(self.timeout_us);
 
             let Some(pkt) = response else {
                 // Retry on timeout/error
@@ -164,6 +179,8 @@ impl MapleHost {
             };
             #[cfg(feature = "poll-timing")]
             crate::poll_timing::record_tries(u32::from(_attempt) + 1);
+            #[cfg(feature = "poll-period-debug")]
+            crate::poll_period::record_attempts(u32::from(_attempt) + 1);
 
             if pkt.command != commands::CONDITION_RESPONSE {
                 return MapleResult::UnexpectedResponse(pkt.command);
@@ -176,23 +193,63 @@ impl MapleHost {
 
         #[cfg(feature = "poll-timing")]
         crate::poll_timing::record_tries(u32::from(MAX_RETRIES));
+        #[cfg(feature = "poll-period-debug")]
+        crate::poll_period::record_attempts(u32::from(MAX_RETRIES));
         MapleResult::Timeout
     }
 
-    /// Send a `DEVICE_INFO` request to the VMU sub-peripheral to enumerate it.
+    /// Ask the **main peripheral** which sub-peripherals are attached.
     ///
-    /// The VMU will not accept `BLOCK_WRITE` until it has been enumerated.
-    pub fn enumerate_vmu(&self, bus: &mut MapleBus) -> bool {
+    /// Returns the sub-peripheral mask taken from the responder's *sender*
+    /// address (bit 0 = slot 1 ... bit 4 = slot 5), or `None` if the controller
+    /// did not answer.
+    ///
+    /// This is how the Maple bus is specified to report expansion devices: a
+    /// main peripheral ORs a bit into its sender address for each attached
+    /// sub-peripheral, so a bare port-1 controller answers as `0x20` and one
+    /// with a VMU in slot 1 answers as `0x21`.
+    ///
+    /// Presence therefore rides the controller's own device-info reply — the RX
+    /// path this firmware already decodes reliably on every detect. The previous
+    /// approach, addressing the VMU directly at `0x01`, never decoded a single
+    /// reply: the sub-peripheral answers with different latency than the
+    /// controller, so `read_packet_bulk`'s sample-index alignment heuristic
+    /// started mid-start-pattern and every frame parsed as noise.
+    pub fn sub_peripheral_mask(&self, bus: &mut MapleBus) -> Option<u8> {
         let packet = MaplePacket {
             sender: addressing::HOST,
-            recipient: 0x01, // SUB_PERIPHERAL_1
+            recipient: addressing::PORT_A_MAIN,
             command: commands::DEVICE_INFO_REQUEST,
             payload: Vec::new(),
         };
 
         bus.write_packet(&packet); // bit-bang, not DMA — see pwm_tx::write_packet_dma
 
-        let response = bus.read_packet_bulk(self.timeout_cycles);
+        let pkt = bus.read_packet_bulk(self.timeout_us)?;
+        if pkt.command != commands::DEVICE_INFO_RESPONSE {
+            return None;
+        }
+        Some(pkt.sender & addressing::SUB_PERIPHERAL_MASK)
+    }
+
+    /// Send a `DEVICE_INFO` request to the VMU sub-peripheral to enumerate it.
+    ///
+    /// The VMU will not accept `BLOCK_WRITE` until it has been enumerated, so
+    /// this is still sent for its side effect. **Do not use the return value to
+    /// decide presence** — use [`Self::sub_peripheral_mask`]. The VMU's reply to
+    /// a direct `0x01` request has never decoded on this firmware (see that
+    /// method's note), so this reports `false` even with a working VMU.
+    pub fn enumerate_vmu(&self, bus: &mut MapleBus) -> bool {
+        let packet = MaplePacket {
+            sender: addressing::HOST,
+            recipient: addressing::SUB_SLOT_1,
+            command: commands::DEVICE_INFO_REQUEST,
+            payload: Vec::new(),
+        };
+
+        bus.write_packet(&packet); // bit-bang, not DMA — see pwm_tx::write_packet_dma
+
+        let response = bus.read_packet_bulk(self.timeout_us);
         matches!(response, Some(pkt) if pkt.command == commands::DEVICE_INFO_RESPONSE)
     }
 
@@ -208,7 +265,7 @@ impl MapleHost {
             framebuffer,
         );
 
-        let response = bus.read_packet_bulk(self.timeout_cycles);
+        let response = bus.read_packet_bulk(self.timeout_us);
         matches!(response, Some(pkt) if pkt.command == 0x07)
     }
 
@@ -284,7 +341,7 @@ impl MapleHost {
             return false;
         }
 
-        let response = bus.read_packet_bulk(self.timeout_cycles);
+        let response = bus.read_packet_bulk(self.timeout_us);
         matches!(response, Some(pkt) if pkt.command == 0x07)
     }
 }

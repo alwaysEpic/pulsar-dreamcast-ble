@@ -16,6 +16,7 @@ use crate::maple::MaplePacket;
 use core::sync::atomic::{compiler_fence, Ordering};
 use embassy_nrf::gpio::{Flex, Pull};
 use heapless::Vec;
+use maple_protocol::wire;
 
 /// Number of u32 samples in the bulk capture buffer.
 const SAMPLE_BUFFER_LEN: usize = 24576;
@@ -37,23 +38,37 @@ const HALF_BIT_CYCLES: u32 = 155;
 /// the next half-bit short while the schedule tries to catch up.
 const TX_DEADLINE_GRACE_CYCLES: u32 = 8;
 
+/// CPU clock in MHz — DWT cycles / this = microseconds (nRF52840, 64 MHz).
+const CPU_MHZ: u32 = 64;
+
 /// NOP iterations for pin stabilization after output mode set.
 pub const PIN_STABILIZE_NOPS: u32 = 100;
 
 /// NOP iterations for pull-up stabilization after input mode set.
 const PULLUP_STABILIZE_NOPS: u32 = 200;
 
-/// Minimum B-line transitions required to accept a valid start pattern.
-const MIN_START_TRANSITIONS: u32 = 3;
-
-/// Maximum busy-loop iterations waiting for start pattern completion.
-const START_PATTERN_TIMEOUT: u32 = 10_000;
-
 /// Number of start pattern B-line toggles.
-const START_TOGGLE_COUNT: u32 = 4;
+const START_TOGGLE_COUNT: u32 = maple_protocol::wire::DATA_START_TOGGLES;
 
 /// Minimum bits required to attempt packet decode.
 const MIN_DECODE_BITS: usize = 32;
+
+/// Capacity of the decoded-bit buffer.
+///
+/// **Not a tuning knob — a correctness bound.** `bits.push` is `let _ =`, so
+/// once this fills every later bit is silently discarded: the frame's tail
+/// vanishes, `byte_count` drops below the header's own length field, and the
+/// packet is rejected as "incomplete" with nothing indicating a buffer ran out.
+///
+/// The previous value of 960 (120 bytes) sat 3 bytes above the 117 a 28-word
+/// DEVICE_INFO response needs (`4 + 28*4 + 1`). That margin is now load-bearing:
+/// VMU presence is read from the controller's device-info reply every 3s
+/// ([`crate::maple::host::MapleHost::sub_peripheral_mask`]), so this path takes
+/// a full-length response continuously rather than only at controller detect.
+///
+/// 2048 bits = 256 bytes, exactly the `bytes` array the decoder unpacks into —
+/// it cannot be raised further without growing that too.
+const MAX_DECODE_BITS: usize = 2048;
 
 /// Minimum bytes required for a valid frame header.
 const MIN_FRAME_BYTES: usize = 4;
@@ -230,7 +245,6 @@ impl MapleBus {
     /// Diagnostic: sample the bus briefly and report what we see.
     /// Call this after TX to check if any activity is present.
     pub fn diagnose_bus(&mut self) {
-        use crate::log;
         self.set_input_mode();
 
         // Quick sample: 1000 reads
@@ -457,9 +471,43 @@ impl MapleBus {
         }
     }
 
-    /// Wait for start pattern and bulk sample.
-    /// Returns `(success, wait_cycles, b_transitions, sample_count)`.
-    pub fn wait_and_sample(&mut self, timeout_cycles: u32) -> (bool, u32, u32, usize) {
+    /// Wait for a peripheral response and bulk sample it.
+    ///
+    /// Capture is triggered by the **first SDCKA falling edge** after the bus
+    /// goes neutral — the opening edge of the start pattern itself — so the
+    /// pattern lands inside the buffer and is validated against the spec by
+    /// [`maple_protocol::wire::find_data_start`] rather than counted here at
+    /// wire speed.
+    ///
+    /// The previous version counted SDCKB transitions in this loop
+    /// (`b_transitions >= 3`) and started the capture *after* the pattern. That
+    /// loop reads P0 every ~100ns against 250ns peripheral phases, so it can
+    /// undercount toggles, fall through into the data phase, and trigger on an
+    /// arbitrary edge — which left the decoder guessing alignment from a sample
+    /// index. Moving the check into software costs nothing on the wire: the asm
+    /// loop already fills the whole buffer on every call (~3.1ms), so triggering
+    /// ~4us earlier is free, and it buys a real conformance check — a non-data
+    /// pattern (8 toggles = light gun, 14 = reset) is now rejected instead of
+    /// clearing a `>= 3` threshold.
+    ///
+    /// # Timeouts are wall-clock (DWT), not iteration counts (2026-08-05)
+    ///
+    /// Both wait loops here used to time out on ITERATION counts
+    /// (`timeout_cycles = 64_000`, believed to be ~1ms but actually ~8-12ms
+    /// of compiled loop time) — the last layout-dependent duration in the
+    /// firmware, and the actual variable behind "pattern B" of the layout
+    /// lottery: an embassy RTC alarm ISR landing inside the ~395µs bit-bang
+    /// TX (~3.3/s, Poisson) stretches one half-bit, the controller rejects
+    /// the frame and stays silent, and the silent-bus retry burst then
+    /// costs 3 × the compiled timeout — 20-25ms on a lucky layout (rare
+    /// 30ms delivery gaps) vs 36ms+ on an unlucky one (the 45-60ms
+    /// quantized stalls, 18-23% doubled intervals, runs #48/#50/#52/#53).
+    /// Exact-binary A/B with the VMU removed pinned it to this path.
+    /// DWT deadlines make the timeout a designed constant on every layout.
+    /// (DWT is valid here: this is blocking code, the core never sleeps.)
+    ///
+    /// Returns `(success, waited_us, sample_count)`.
+    pub fn wait_and_sample(&mut self, timeout_us: u32) -> (bool, u32, usize) {
         self.set_input_mode();
 
         // SAFETY: Single-core, interrupts disabled during sampling. Only one
@@ -471,50 +519,27 @@ impl MapleBus {
         };
 
         // Wait for idle (both HIGH)
-        let mut count = 0u32;
+        let t0 = cyccnt();
+        let idle_budget = (timeout_us / 2).saturating_mul(CPU_MHZ);
         loop {
             let val = read_p0_in();
             if (val & PIN_A_MASK) != 0 && (val & PIN_B_MASK) != 0 {
                 break;
             }
-            count += 1;
-            if count > timeout_cycles / 2 {
-                return (false, count, 0, 0);
+            if cyccnt().wrapping_sub(t0) > idle_budget {
+                return (false, cyccnt().wrapping_sub(t0) / CPU_MHZ, 0);
             }
         }
-        let idle_cycles = count;
 
-        // Wait for A LOW (controller starts response)
-        count = 0;
+        // Wait for SDCKA LOW — the opening edge of the responder's start
+        // pattern — then capture immediately. This loop is the fast path for a
+        // silent bus: with no peripheral answering it times out here instead of
+        // spending a full ~3.1ms capture on nothing.
+        let start_budget = timeout_us.saturating_mul(CPU_MHZ);
+        let t1 = cyccnt();
         loop {
-            let val = read_p0_in();
-            if (val & PIN_A_MASK) == 0 {
-                break;
-            }
-            count += 1;
-            if count > timeout_cycles {
-                return (false, idle_cycles + count, 0, 0);
-            }
-        }
-        let wait_cycles = idle_cycles + count;
-
-        // Count B transitions while A is LOW
-        let mut b_transitions = 0u32;
-        let mut last_b = (read_p0_in() & PIN_B_MASK) != 0;
-        count = 0;
-
-        loop {
-            let val = read_p0_in();
-            let a = (val & PIN_A_MASK) != 0;
-            let b = (val & PIN_B_MASK) != 0;
-
-            if b != last_b {
-                b_transitions += 1;
-                last_b = b;
-            }
-
-            if a && b_transitions >= MIN_START_TRANSITIONS {
-                // Valid start pattern - sample immediately.
+            if (read_p0_in() & PIN_A_MASK) == 0 {
+                // Start pattern detected - sample immediately.
                 //
                 // The sample loop is inline asm, not `for s in samples`: the
                 // compiled loop's cycle count IS the sample rate, and every
@@ -545,12 +570,11 @@ impl MapleBus {
                     );
                 }
                 compiler_fence(Ordering::SeqCst);
-                return (true, wait_cycles, b_transitions, SAMPLE_BUFFER_LEN);
+                return (true, cyccnt().wrapping_sub(t0) / CPU_MHZ, SAMPLE_BUFFER_LEN);
             }
 
-            count += 1;
-            if count > START_PATTERN_TIMEOUT {
-                return (false, wait_cycles, b_transitions, 0);
+            if cyccnt().wrapping_sub(t1) > start_budget {
+                return (false, cyccnt().wrapping_sub(t0) / CPU_MHZ, 0);
             }
         }
     }
@@ -563,7 +587,7 @@ impl MapleBus {
         samples: &[u32],
         count: usize,
         start_sample: usize,
-    ) -> (Vec<u8, 960>, u32, u32, u32) {
+    ) -> (Vec<u8, MAX_DECODE_BITS>, u32, u32, u32) {
         const GAP_THRESHOLD: usize = 50;
         // A sustained run with no edge on either line, longer than any
         // inter-chunk gap (~900 samples at the measured ~7 M samples/s), marks
@@ -578,7 +602,7 @@ impl MapleBus {
         // cut made exactly that mistake and scanned the full buffer anyway).
         const END_IDLE_THRESHOLD: usize = 3000;
 
-        let mut bits: Vec<u8, 960> = Vec::new();
+        let mut bits: Vec<u8, MAX_DECODE_BITS> = Vec::new();
         let mut a_falls: u32 = 0;
         let mut b_falls: u32 = 0;
         let mut gaps_detected: u32 = 0;
@@ -645,52 +669,20 @@ impl MapleBus {
         (bits, a_falls, b_falls, gaps_detected)
     }
 
-    /// Find first N edges and their sample indices.
-    #[must_use]
-    #[allow(clippy::unused_self)] // Method on bus for API consistency
-    pub fn find_first_edges(
-        &self,
-        samples: &[u32],
-        count: usize,
-        max_edges: usize,
-    ) -> Vec<(usize, char, bool), 64> {
-        let mut edges: Vec<(usize, char, bool), 64> = Vec::new();
-        let mut last_a = (samples[0] & PIN_A_MASK) != 0;
-        let mut last_b = (samples[0] & PIN_B_MASK) != 0;
-
-        for (i, &sample) in samples[1..count].iter().enumerate() {
-            if edges.len() >= max_edges {
-                break;
-            }
-            let a = (sample & PIN_A_MASK) != 0;
-            let b = (sample & PIN_B_MASK) != 0;
-
-            if last_a && !a {
-                let _ = edges.push((i + 1, 'A', b));
-            }
-            if last_b && !b {
-                let _ = edges.push((i + 1, 'B', a));
-            }
-
-            last_a = a;
-            last_b = b;
-        }
-
-        edges
-    }
-
     /// Read a complete response packet using bulk sampling.
-    pub fn read_packet_bulk(&mut self, timeout_cycles: u32) -> Option<MaplePacket> {
+    pub fn read_packet_bulk(&mut self, timeout_us: u32) -> Option<MaplePacket> {
         // poll-timing spans are taken here, around whole calls — never inside
         // wait_and_sample, whose wait/capture loops are timing-critical.
         #[cfg(feature = "poll-timing")]
         let _pt_read = crate::poll_timing::start();
-        let (success, _wait_cycles, _b_trans, count) = self.wait_and_sample(timeout_cycles);
+        let (success, _waited_us, count) = self.wait_and_sample(timeout_us);
         #[cfg(feature = "poll-timing")]
         crate::poll_timing::record_read(_pt_read);
 
         if !success {
-            // No start pattern detected
+            // Bus never went neutral, or nothing answered before the timeout.
+            // Whether what did answer was a *conforming* start pattern is
+            // decided below, against the captured samples.
             return None;
         }
 
@@ -704,16 +696,22 @@ impl MapleBus {
 
         #[cfg(feature = "poll-timing")]
         let _pt_dec = crate::poll_timing::start();
-        let edges = self.find_first_edges(samples, count, 40);
-        let first_edge_idx = edges.first().map_or(0, |(idx, _, _)| *idx);
-        let skip_samples = if first_edge_idx > 100 {
-            first_edge_idx.saturating_sub(10)
-        } else {
-            0
+        // Validate the captured start pattern and take the decode offset from
+        // it. This replaces a `first_edge_idx > 100` heuristic that inferred the
+        // offset from *when* the first edge landed — a proxy for the responder's
+        // reply latency, and so calibrated to the controller. The Maple spec puts
+        // only a floor on reply time (a peripheral answers some time after 50us
+        // from the bus going neutral), so a sub-peripheral answering with
+        // different latency fell on the wrong side of the threshold and decoded
+        // as noise. Alignment now comes from the wire, not from who is talking.
+        //
+        // A missing pattern means the capture was noise, or the responder sent a
+        // non-data pattern. Fall through to the empty-bits check so the decode
+        // span is still recorded on this path.
+        let bits = match wire::find_data_start(&samples[..count], PIN_A_MASK, PIN_B_MASK) {
+            Some(data_start) => self.decode_bulk_samples(samples, count, data_start).0,
+            None => Vec::new(),
         };
-
-        let (bits, _a_falls, _b_falls, _gaps) =
-            self.decode_bulk_samples(samples, count, skip_samples);
         #[cfg(feature = "poll-timing")]
         crate::poll_timing::record_decode(_pt_dec);
 

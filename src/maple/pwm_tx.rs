@@ -54,7 +54,8 @@ use embassy_time::{Duration, Timer};
 use super::gpio_bus::MapleBus;
 use super::MaplePacket;
 
-/// PWM0 base address (nRF52840). PWM0 is unused elsewhere in this firmware
+/// PWM0 base address (nRF52840). PWM0 is reserved for this module; the
+/// pulsarv1 WS2812 strip was moved to PWM2 after sharing it broke both
 /// and is not a SoftDevice-reserved peripheral.
 const PWM0_BASE: u32 = 0x4001_C000;
 
@@ -88,7 +89,9 @@ const LOW: u16 = 0x8000;
 
 #[inline]
 fn pwm_write(offset: u32, value: u32) {
-    // SAFETY: PWM0 is owned exclusively by this module (nothing else in the
+    // SAFETY: PWM0 is reserved for this module. NOTE: this is enforced only by
+    // convention — we take no `Peri` handle, so a second user is invisible to
+    // the type system (the WS2812 driver did exactly that). (nothing else in the
     // firmware or the SoftDevice touches it); MMIO writes to it are sound.
     unsafe { core::ptr::write_volatile((PWM0_BASE + offset) as *mut u32, value) }
 }

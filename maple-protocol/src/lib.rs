@@ -21,4 +21,6 @@
 pub mod controller_state;
 pub mod guide_chord;
 pub mod packet;
+pub mod sync_hold;
+pub mod wire;
 pub mod xbox_hid;

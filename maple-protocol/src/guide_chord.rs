@@ -19,15 +19,30 @@ use crate::controller_state::ControllerState;
 pub const GUIDE_TRIGGER_THRESHOLD: u8 = 200;
 /// How long L+R+Start must be held continuously before Guide fires (ms).
 pub const GUIDE_HOLD_MS: u64 = 300;
+/// How long the synthesized Guide button stays asserted once the chord fires —
+/// a short *tap*, not a hold. Some hosts (notably the Steam Deck) treat a *held*
+/// Guide/Steam button as a shortcut-chord modifier (Steam+R1 = screenshot,
+/// Steam+L2/R2 = mouse clicks, …); a brief tap just opens the guide menu. Kept
+/// well under any host's hold/long-press threshold but long enough to register.
+pub const GUIDE_PULSE_MS: u64 = 80;
 
 /// Result of one [`GuideChord::update`] step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GuideChordOutput {
-    /// The chord has been held past [`GUIDE_HOLD_MS`]; the caller should emit
-    /// the Guide button and suppress its constituents (triggers + Start).
-    pub active: bool,
-    /// Rising edge of `active` — true on exactly the first step it becomes
-    /// active, for firing one-shot side effects (e.g. the VMU home glyph).
+    /// L+R+Start are all held right now (the chord is forming *or* has fired).
+    /// The caller should suppress the constituents — zero the triggers, clear
+    /// Start — on every such frame, starting the instant all three go down. This
+    /// is asserted from the first frame (not just after firing) so the 300ms
+    /// arming window can't leak a Start (or trigger) press to the host before the
+    /// Guide tap.
+    pub suppress: bool,
+    /// Emit the Guide button this step. True only for the short [`GUIDE_PULSE_MS`]
+    /// window right after the chord fires — a *tap*, not a hold (see
+    /// [`GUIDE_PULSE_MS`]). After the window it goes false even while the chord is
+    /// still physically held.
+    pub emit_guide: bool,
+    /// Rising edge of the pulse — true on exactly the first step Guide is
+    /// emitted, for firing one-shot side effects (e.g. the VMU home glyph).
     pub rising_edge: bool,
 }
 
@@ -38,8 +53,10 @@ pub struct GuideChordOutput {
 pub struct GuideChord {
     /// Monotonic ms when L+R+Start first became all-held; `None` while not held.
     since_ms: Option<u64>,
-    /// Latches once `active` fires so `rising_edge` is reported only once.
-    fired: bool,
+    /// Monotonic ms when the Guide pulse started (the step the chord fired);
+    /// `None` until it fires. Latches the one-shot `rising_edge` and bounds the
+    /// [`GUIDE_PULSE_MS`] tap window. Cleared on release so a re-hold re-fires.
+    fired_ms: Option<u64>,
 }
 
 impl GuideChord {
@@ -56,17 +73,27 @@ impl GuideChord {
     pub fn update(&mut self, state: &ControllerState, now_ms: u64) -> GuideChordOutput {
         if !Self::is_held(state) {
             self.since_ms = None;
-            self.fired = false;
+            self.fired_ms = None;
             return GuideChordOutput::default();
         }
         let started = *self.since_ms.get_or_insert(now_ms);
-        let active = now_ms.saturating_sub(started) >= GUIDE_HOLD_MS;
-        let rising_edge = active && !self.fired;
-        if rising_edge {
-            self.fired = true;
+        if now_ms.saturating_sub(started) < GUIDE_HOLD_MS {
+            // Forming: suppress the constituents from the first frame so the
+            // arming window can't leak a Start/trigger press, but don't fire yet.
+            return GuideChordOutput {
+                suppress: true,
+                emit_guide: false,
+                rising_edge: false,
+            };
         }
+        // Past the hold threshold. Keep suppressing, and *pulse* Guide for
+        // GUIDE_PULSE_MS — a tap, not a hold.
+        let rising_edge = self.fired_ms.is_none();
+        let fired_at = *self.fired_ms.get_or_insert(now_ms);
+        let emit_guide = now_ms.saturating_sub(fired_at) < GUIDE_PULSE_MS;
         GuideChordOutput {
-            active,
+            suppress: true,
+            emit_guide,
             rising_edge,
         }
     }
@@ -88,34 +115,80 @@ mod tests {
     }
 
     #[test]
-    fn not_held_is_inactive() {
+    fn not_held_suppresses_nothing() {
         let mut gc = GuideChord::default();
         let out = gc.update(&chord_state(false), 0);
-        assert!(!out.active);
+        assert!(!out.suppress);
+        assert!(!out.emit_guide);
         assert!(!out.rising_edge);
     }
 
     #[test]
-    fn held_below_hold_is_inactive() {
+    fn suppresses_from_the_first_frame_before_firing() {
         let mut gc = GuideChord::default();
-        assert!(!gc.update(&chord_state(true), 0).active);
-        // One ms short of the hold threshold.
+        // Suppression starts immediately — the whole point: the arming window
+        // must not leak a Start (or trigger) press to the host. But Guide hasn't
+        // fired yet.
+        let out = gc.update(&chord_state(true), 0);
+        assert!(out.suppress, "suppress the instant all three are held");
+        assert!(!out.emit_guide);
+        assert!(!out.rising_edge);
+        // One ms short of the hold threshold: still just suppressing, not firing.
         let out = gc.update(&chord_state(true), GUIDE_HOLD_MS - 1);
-        assert!(!out.active);
+        assert!(out.suppress);
+        assert!(!out.emit_guide);
         assert!(!out.rising_edge);
     }
 
     #[test]
-    fn held_past_hold_activates_and_edges_once() {
+    fn held_past_hold_fires_and_edges_once() {
         let mut gc = GuideChord::default();
         gc.update(&chord_state(true), 0);
         let out = gc.update(&chord_state(true), GUIDE_HOLD_MS);
-        assert!(out.active);
+        assert!(out.suppress);
         assert!(out.rising_edge, "first activation is a rising edge");
-        // Continued hold stays active but the one-shot edge latches off.
+        // Continued hold stays suppressed but the one-shot edge latches off.
         let out = gc.update(&chord_state(true), GUIDE_HOLD_MS + 500);
-        assert!(out.active);
+        assert!(out.suppress);
         assert!(!out.rising_edge, "edge fires only once per chord");
+    }
+
+    #[test]
+    fn guide_is_a_tap_not_a_hold() {
+        let mut gc = GuideChord::default();
+        // Arming: already suppressing, but Guide not emitted yet.
+        let out = gc.update(&chord_state(true), 0);
+        assert!(out.suppress);
+        assert!(!out.emit_guide);
+        // Fires at the hold threshold: the Guide pulse starts.
+        let out = gc.update(&chord_state(true), GUIDE_HOLD_MS);
+        assert!(out.suppress);
+        assert!(out.emit_guide, "Guide asserts at the start of the pulse");
+        assert!(out.rising_edge);
+        // Still inside the pulse window: Guide stays asserted, edge latched off.
+        let out = gc.update(&chord_state(true), GUIDE_HOLD_MS + GUIDE_PULSE_MS - 1);
+        assert!(out.emit_guide);
+        assert!(!out.rising_edge);
+        // Past the pulse window but STILL physically held: Guide releases (it's a
+        // tap), yet the constituents stay suppressed. This is the Steam Deck fix —
+        // a *held* Guide arms the Deck's shortcut layer (Steam+R1 = screenshot).
+        let out = gc.update(&chord_state(true), GUIDE_HOLD_MS + GUIDE_PULSE_MS);
+        assert!(out.suppress, "still suppressing triggers/Start while held");
+        assert!(
+            !out.emit_guide,
+            "Guide is a tap — released even though chord still held"
+        );
+        assert!(!out.rising_edge);
+        // A *sustained* hold never re-pulses Guide — the invariant that keeps us
+        // out of the Deck's hold-shortcut layer (Steam+R1 = screenshot). Constituents
+        // stay suppressed the whole time.
+        let out = gc.update(&chord_state(true), GUIDE_HOLD_MS + 1000);
+        assert!(out.suppress);
+        assert!(
+            !out.emit_guide,
+            "Guide never re-asserts during one sustained hold"
+        );
+        assert!(!out.rising_edge);
     }
 
     #[test]
@@ -123,13 +196,17 @@ mod tests {
         let mut gc = GuideChord::default();
         gc.update(&chord_state(true), 0);
         assert!(gc.update(&chord_state(true), GUIDE_HOLD_MS).rising_edge);
-        // Release clears state.
-        assert!(!gc.update(&chord_state(false), GUIDE_HOLD_MS + 10).active);
-        // Re-hold from scratch: the timer restarts and a fresh edge fires.
+        // Release clears state — suppression stops.
+        assert!(!gc.update(&chord_state(false), GUIDE_HOLD_MS + 10).suppress);
+        // Re-hold from scratch: suppressing again, but the timer restarted so it
+        // hasn't re-fired yet.
         let t = GUIDE_HOLD_MS + 20;
-        assert!(!gc.update(&chord_state(true), t).active);
+        let out = gc.update(&chord_state(true), t);
+        assert!(out.suppress);
+        assert!(!out.rising_edge);
+        // Held past the threshold again: a fresh edge fires.
         let out = gc.update(&chord_state(true), t + GUIDE_HOLD_MS);
-        assert!(out.active);
+        assert!(out.suppress);
         assert!(out.rising_edge);
     }
 
