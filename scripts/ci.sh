@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-commit quality checks for embedded_dreamcast
+# Pre-commit quality checks for pulsar-dreamcast-ble
 # Run this before committing to catch issues early.
 
 set -e
