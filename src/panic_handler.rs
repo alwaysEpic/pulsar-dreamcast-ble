@@ -4,7 +4,7 @@
 //! Panic handler that logs to flash before resetting.
 //!
 //! Writes a magic word + truncated panic message to a dedicated flash page
-//! (`0xFC000`) using raw NVMC register writes (no `SoftDevice` or async).
+//! (`0xF1000`) using raw NVMC register writes (no `SoftDevice` or async).
 //! On boot, call [`check_panic_log`] to print any stored panic via RTT
 //! and clear the page.
 
@@ -12,8 +12,10 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use core::sync::atomic::{self, Ordering};
 
-/// Flash page for panic log (one page before name preference at 0xFD000).
-const PANIC_FLASH_ADDR: u32 = 0x000F_C000;
+/// Flash page for panic log — bottom page of the app-data window
+/// (`0xF1000-0xF3FFF`, one page below the name preference at `0xF2000`).
+/// Moved 2026-08-04 from `0xFC000`, which lay inside the bootloader region.
+const PANIC_FLASH_ADDR: u32 = 0x000F_1000;
 
 /// Magic number to identify valid panic data.
 const PANIC_MAGIC: u32 = 0xDEAD_BEEF;
@@ -94,27 +96,44 @@ fn panic(info: &PanicInfo) -> ! {
     let mut buf = PanicBuf::new();
     let _ = write!(buf, "{info}");
 
+    // Only ever store the FIRST panic. A panic that reboots straight back into
+    // the same panic would otherwise erase and rewrite this page every cycle —
+    // an ~85ms NVMC page erase every couple of seconds, indefinitely.
+    //
+    // That is not a theoretical cost. A power transition during an NVMC erase
+    // (unplugging USB, where the rail hands from VIN to the IP5306 boost and
+    // dips) can corrupt flash well beyond the target page, and losing the
+    // bootloader turns a one-line bug into a module that needs SWD to revive.
+    // A reset loop must be survivable: you must always be able to double-tap
+    // into the bootloader. Bounding flash writes to one is what buys that.
+    //
+    // SAFETY: reading a known flash address; no other code is running.
+    let already_stored =
+        unsafe { core::ptr::read_volatile(PANIC_FLASH_ADDR as *const u32) } == PANIC_MAGIC;
+
     // SAFETY: Writing to a dedicated flash page that is not used by SoftDevice.
     // In a panic handler, nothing else is running, so NVMC access is safe.
-    unsafe {
-        nvmc_erase_page(PANIC_FLASH_ADDR);
+    if !already_stored {
+        unsafe {
+            nvmc_erase_page(PANIC_FLASH_ADDR);
 
-        // Write magic word
-        nvmc_write_word(PANIC_FLASH_ADDR, PANIC_MAGIC);
+            // Write magic word
+            nvmc_write_word(PANIC_FLASH_ADDR, PANIC_MAGIC);
 
-        // Write message in 4-byte words (flash requires word-aligned writes)
-        let words = buf.pos.div_ceil(4);
-        for i in 0..words {
-            let offset = i * 4;
-            let mut word_bytes = [0u8; 4];
-            for (j, byte) in word_bytes.iter_mut().enumerate() {
-                if offset + j < buf.pos {
-                    *byte = buf.buf[offset + j];
+            // Write message in 4-byte words (flash requires word-aligned writes)
+            let words = buf.pos.div_ceil(4);
+            for i in 0..words {
+                let offset = i * 4;
+                let mut word_bytes = [0u8; 4];
+                for (j, byte) in word_bytes.iter_mut().enumerate() {
+                    if offset + j < buf.pos {
+                        *byte = buf.buf[offset + j];
+                    }
                 }
+                let word = u32::from_le_bytes(word_bytes);
+                #[allow(clippy::cast_possible_truncation)]
+                nvmc_write_word(PANIC_FLASH_ADDR + 4 + (i as u32) * 4, word);
             }
-            let word = u32::from_le_bytes(word_bytes);
-            #[allow(clippy::cast_possible_truncation)]
-            nvmc_write_word(PANIC_FLASH_ADDR + 4 + (i as u32) * 4, word);
         }
     }
 
@@ -157,8 +176,16 @@ pub fn check_panic_log() {
 
     crate::log!("=== END PANIC LOG ===");
 
-    // Clear the page so we don't print the same panic every boot.
-    // Use NVMC directly since SoftDevice may not be initialized yet.
+    // Clear the page so we don't print the same panic every boot — but ONLY on
+    // `rtt` builds, where someone is attached to have actually read it.
+    //
+    // On a production build `log!` compiles to nothing, so the message above was
+    // never displayed and erasing here would only re-arm the panic handler to
+    // write again next time. A reset loop would then do *two* ~85ms page erases
+    // per cycle, forever, with a power transition during any one of them able to
+    // take out the bootloader. Leaving the page dirty costs nothing (it is
+    // unreadable without RTT anyway) and keeps a loop flash-silent.
+    #[cfg(feature = "rtt")]
     unsafe {
         nvmc_erase_page(PANIC_FLASH_ADDR);
     }

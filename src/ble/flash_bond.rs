@@ -14,11 +14,17 @@ use nrf_softdevice::Flash;
 // Compile-time guard: transmute between IdentityResolutionKey and [u8; 16] requires matching size.
 const _: () = assert!(core::mem::size_of::<IdentityResolutionKey>() == 16);
 
-/// Flash address for bonding storage (last page before 1MB boundary)
-const BOND_FLASH_ADDR: u32 = 0x000F_E000;
+/// Flash address for bonding storage. Top page of the app-data window
+/// (`0xF1000-0xF3FFF`) that sits directly below the bootloader at `0xF4000`:
+/// below Adafruit's region on dev boards, and inside the secure-DFU
+/// `NRF_DFU_APP_DATA_AREA` (so OTA updates never erase it) on retail.
+/// Moved 2026-08-04 from `0xFE000`, which was the MBR params page.
+const BOND_FLASH_ADDR: u32 = 0x000F_3000;
 
-/// Flash address for name preference storage (one page before bond data)
-const NAME_FLASH_ADDR: u32 = 0x000F_D000;
+/// Flash address for name/profile preference storage (one page below bond
+/// data). Moved 2026-08-04 from `0xFD000`, where every save erased the
+/// Adafruit bootloader's shipped info block.
+const NAME_FLASH_ADDR: u32 = 0x000F_2000;
 
 /// Flash page size
 const PAGE_SIZE: u32 = 4096;
