@@ -123,7 +123,7 @@ A 10-point LiPo discharge curve lookup table with linear interpolation is the in
 
 **Implementation notes:**
 - Must use raw NVMC register writes — the SoftDevice async flash API is not available in a panic handler
-- Use a fixed flash page well away from SoftDevice and application data (0xFC000)
+- Use a fixed flash page well away from SoftDevice and application data (0xF1000; originally 0xFC000, moved 2026-08-04 below the bootloader)
 - Always erase the page after reading to prevent stale data and limit flash wear
 - nRF52840 flash is rated for ~10,000 erase cycles per page — not a concern
 

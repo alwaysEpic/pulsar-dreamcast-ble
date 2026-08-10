@@ -2,6 +2,11 @@
 
 Power management strategy for the XIAO nRF52840 Dreamcast BLE adapter running on a single-cell LiPo (tested with 500mAh, recommended 1000mAh).
 
+> **Scope: every figure on this page was measured on a XIAO nRF52840 build.** Retail
+> Pulsar V1 hardware carries a different power topology — a separate always-on regulator
+> and an IP5306 fuel gauge in place of the XIAO's voltage-curve estimate — so its standby
+> figures are **not** the ones below and are characterized separately.
+
 ---
 
 ## Power Budget
@@ -18,7 +23,8 @@ Tested with FNB58 USB power meter, active BLE connection with occasional control
 
 - **Idle connected draw:** ~57 mA
 - **Active input draw:** ~67 mA
-- **Sleep drain:** Negligible (~2% overnight, likely self-discharge)
+- **Sleep drain:** ~2% overnight, at the resolution limit of the gauge — consistent with
+  self-discharge, but the measurement is not precise enough to separate the two.
 
 Measured draw figures yield ~7-8 hours of active gaming on 500mAh, scaling to ~14-16 hours on 1000mAh.
 
@@ -26,8 +32,13 @@ Measured draw figures yield ~7-8 hours of active gaming on 500mAh, scaling to ~1
 
 | Battery | Active Gaming | Sleep Standby |
 |---------|--------------|---------------|
-| 500 mAh | ~7-8 hours | Months |
-| 1000 mAh | ~14-16 hours (estimated) | Months |
+| 500 mAh | ~7-8 hours | weeks+ (calculated, not measured) |
+| 1000 mAh | ~14-16 hours (estimated) | weeks+ (calculated, not measured) |
+
+**On the standby column:** active-gaming hours are measured; standby is *arithmetic* from
+the ~5-8 µA System Off datasheet figure, which implies far longer than any test has run.
+Overnight testing cannot distinguish a µA-class sleep current from self-discharge, so
+treat standby as a lower bound on a correctly-configured board, not a verified result.
 
 Note: The LiPo discharge curve is nonlinear. The battery spends a long time in the 3.7-3.9V plateau then drops quickly below 3.5V. Actual runtime may vary with controller usage intensity.
 
@@ -59,7 +70,7 @@ Voltage-based percentage using a 10-point LiPo discharge curve lookup table with
 
 ### Accuracy
 
-Realistic accuracy is +/-10-15% in the flat middle region (3.7-3.9V), better at extremes. This is consistent with other voltage-based approaches and adequate for a battery indicator. A fuel gauge IC (e.g., MAX17048 ~$1.50) would improve to +/-5% but only makes sense on a custom PCB.
+Realistic accuracy is +/-10-15% in the flat middle region (3.7-3.9V), better at extremes. This is consistent with other voltage-based approaches and adequate for a battery indicator. A fuel gauge IC (e.g., MAX17048, around $2.80) would improve to +/-5% but only makes sense on a custom PCB.
 
 ---
 
@@ -121,7 +132,7 @@ RTT debug logging is gated behind an `rtt` Cargo feature. DK builds always inclu
 
 ### 11. Flash-Based Panic Logging
 
-On panic, the firmware writes the panic message to a dedicated flash page (`0xFC000`) using raw NVMC register writes (no SoftDevice dependency), then resets. On the next boot with RTT enabled, the stored panic is printed and the page is cleared. This replaces the silent `panic-reset` behavior with something debuggable.
+On panic, the firmware writes the panic message to a dedicated flash page (`0xF1000`) using raw NVMC register writes (no SoftDevice dependency), then resets. On the next boot with RTT enabled, the stored panic is printed and the page is cleared. This replaces the silent `panic-reset` behavior with something debuggable.
 
 ---
 
@@ -149,6 +160,8 @@ Our draw is dominated by the 5V boost converter + Dreamcast controller (~45 mA).
 ## Possible Next Steps
 
 - **Slave latency** — Setting BLE slave_latency to 2-4 could save ~200-300 µA during idle connected periods. Deferred due to BLE host-compatibility risk (e.g. with the iBlueControlMod Dreamcast BLE receiver adapter). Only effective if combined with skipping notifications when state is unchanged, which may break Xbox HID compatibility.
-- **Dedicated PCB** — Eliminates perfboard losses and enables SMD components: TPS61099x50 boost converter (~90% efficiency, 5µA quiescent vs 50µA on current Pololu), BAT54 Schottky diodes (~0.23V drop vs 0.3-0.4V), and integrated charging circuit.
-- **Fuel gauge IC** — MAX17048 (~$1.50, I2C) for +/-5% battery accuracy vs current +/-10-15%. Only practical on a custom PCB.
+- **Dedicated PCB** — Eliminates perfboard losses and enables SMD components. Validated part choices (corrected from earlier notes):
+  - **Boost: TPS61099DRVR** (TI TPS61099x family, WSON-6/DRV adjustable boost configured for 5.0V, 300mA class, ~1µA Iq, ~90% eff). NOTE: there is no real orderable "TPS61099x50" PN; the TPS61099x suffix matters. TI's fixed 5.0V member is TPS610997, but the datasheet orderable list shows that member as DSBGA/YFF, not WSON/DRV. Use TPS61099DRVR for the WSON package and set 5.0V with the feedback divider from TI's 5V example (~1MΩ VOUT-to-FB, 249kΩ FB-to-GND). **Critical:** the firmware's ~45mA boost-gating saving depends on true output disconnect, so the selected SMD boost must have verified shutdown disconnect behavior or the carrier must add a load switch (high-side P-FET or load-switch IC, e.g. TPS22919) on the 5V rail driven by the enable line. A load switch remains useful for controlled slew, output discharge, and protection even if the boost has true shutdown.
+  - **OR diodes: power Schottky (SS14, 1A, JLC Basic — or low-Vf PMEG2010), NOT BAT54.** BAT54 is a small-signal Schottky (Vf ≈ 0.8V @ 100mA); at the ~50mA rail load it drops *more* than the 1N5817 it would replace. Earlier "~0.23V" figure only holds at low current.
+- **Fuel gauge IC** — MAX17048 (Analog/Maxim, I2C, DFN-2x2, JLCPCB `C2682616`, ~$2.80) for +/-5% battery accuracy vs current +/-10-15%. Only practical on a custom PCB.
 - **TX power reduction** — Lowering BLE TX from 0dBm to -4dBm would save ~1mA with no perceptible range impact at gamepad distances. Deferred pending range testing through plastic enclosure.
