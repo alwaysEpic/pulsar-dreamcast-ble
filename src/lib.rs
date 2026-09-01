@@ -179,7 +179,7 @@ pub static DFU_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// protocol: Adafruit does not inspect GPREGRET2, while the Nordic secure
 /// bootloader reserves a masked `0xA9` pattern and leaves this low bit for
 /// application signalling. This remains a spike hypothesis until it is proved
-/// on both physical bootloader paths (Story 001).
+/// on both physical bootloader paths.
 const CONFIG_BOOT_MARKER: u32 = 0x04;
 
 /// Consume the one-boot configuration marker before enabling the SoftDevice.

@@ -16,7 +16,7 @@ fail() { echo -e "${RED}FAIL${NC} $1"; exit 1; }
 
 # `--check`, not a bare `cargo fmt`. The old form *rewrote* the tree as a side
 # effect of running the gate, so a "passing" run could silently differ from what
-# was staged — and an agent iterating against it never saw a formatting failure
+# was staged — and anyone iterating against it never saw a formatting failure
 # at all, because the failure fixed itself.
 echo "=== Formatting ==="
 cargo fmt --all --check && pass "cargo fmt --check" \

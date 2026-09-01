@@ -928,7 +928,7 @@ mod tests {
     }
 
     // --- Remapped conversion: typed reducers, fan-in, source-level Guide
-    // exclusion (story 002 step 2; design v2 §2.2, gates G5/G6/G7) ---
+    // exclusion (remap design v2 §2.2, gates G5/G6/G7) ---
 
     use crate::remap::{dest, flags as rflags, stick_dest, RemapTable};
 

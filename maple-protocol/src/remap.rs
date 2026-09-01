@@ -254,7 +254,7 @@ mod tests {
     }
 
     /// The exact wire bytes of the default map — the ABI clients hardcode
-    /// (the bench client's `MAP_DEFAULT`, story 003's fixtures). A change
+    /// (the bench client's `MAP_DEFAULT`, the clients' test fixtures). A change
     /// here is a protocol change, not a refactor.
     #[test]
     fn default_serializes_to_the_documented_wire_bytes() {

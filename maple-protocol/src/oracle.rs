@@ -16,7 +16,7 @@
 //!    moves to source level; `to_gamepad_report_with(&RemapTable::DEFAULT, ..)`
 //!    must match it bit-for-bit.
 //!
-//! These tests must never delegate to the new code (story 002 step 1).
+//! These tests must never delegate to the new code.
 
 extern crate std;
 

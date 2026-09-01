@@ -13,7 +13,7 @@ __pycache__/
 *.pyc
 rtt_logs/
 
-# Local agent tooling
+# Local tooling, not part of the project
 .agents/
 
 # Scratch: screen recordings, ad-hoc test files
