@@ -19,7 +19,11 @@ impl MaplePacket {
     /// Byte 0 = length, Byte 1 = sender, Byte 2 = recipient, Byte 3 = command
     #[must_use]
     pub fn frame_word(&self) -> u32 {
-        #[allow(clippy::cast_possible_truncation)] // Payload max 255 words
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "payload is a heapless Vec with capacity 32, so len() cannot \
+                      exceed u32 range; the result is masked to & 0xFF regardless"
+        )]
         let num_words = self.payload.len() as u32;
         (u32::from(self.command) << 24)
             | (u32::from(self.recipient) << 16)

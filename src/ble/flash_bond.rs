@@ -5,7 +5,10 @@
 //!
 //! Stores BLE bonding data in the last flash page so it persists across power cycles.
 
-#![allow(clippy::missing_errors_doc)]
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "internal API; the error type is the module's own and has one variant"
+)]
 
 use embedded_storage_async::nor_flash::NorFlash;
 use nrf_softdevice::ble::{Address, EncryptionInfo, IdentityKey, IdentityResolutionKey, MasterId};
@@ -20,11 +23,6 @@ const _: () = assert!(core::mem::size_of::<IdentityResolutionKey>() == 16);
 /// `NRF_DFU_APP_DATA_AREA` (so OTA updates never erase it) on retail.
 /// Moved 2026-08-04 from `0xFE000`, which was the MBR params page.
 const BOND_FLASH_ADDR: u32 = 0x000F_3000;
-
-/// Flash address for name/profile preference storage (one page below bond
-/// data). Moved 2026-08-04 from `0xFD000`, where every save erased the
-/// Adafruit bootloader's shipped info block.
-const NAME_FLASH_ADDR: u32 = 0x000F_2000;
 
 /// Flash page size
 const PAGE_SIZE: u32 = 4096;
@@ -51,11 +49,6 @@ fn bond_crc(body: &[u8]) -> u32 {
     }
     hash
 }
-
-/// Magic number to identify valid profile preference data (V2 schema).
-/// Distinct from the legacy `NAME_MAGIC` so old prefs are ignored — fresh
-/// install or post-upgrade defaults to `ProfileId::Xbox`.
-const PROFILE_MAGIC: u32 = 0xB10F_C0DE;
 
 /// Stored bonding data structure (must be 4-byte aligned for flash writes)
 #[repr(C, align(4))]
@@ -97,9 +90,18 @@ const BOND_HEADER_LEN: usize = 8;
 
 impl StoredBond {
     /// Byte view of the body — every field after the magic/crc header.
-    fn body_bytes(&self) -> &[u8] {
-        // SAFETY: repr(C, align(4)) struct viewed as raw bytes; the header
-        // offset is within the struct and the length is exact.
+    const fn body_bytes(&self) -> &[u8] {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "the offset and the slice construction are one derivation; the \
+                      layout argument above is what makes both sound"
+        )]
+        // SAFETY: `Self` is `repr(C, align(4))`, so its layout is fixed and the
+        // header occupies exactly the first `BOND_HEADER_LEN` bytes. Offsetting
+        // by that much stays within the same object, and the length is the exact
+        // remainder, so the slice cannot run past the struct. The borrow of
+        // `self` keeps the memory alive and immutable for the returned slice's
+        // lifetime, and `u8` imposes no alignment requirement.
         unsafe {
             core::slice::from_raw_parts(
                 core::ptr::from_ref(self).cast::<u8>().add(BOND_HEADER_LEN),
@@ -196,7 +198,10 @@ pub async fn save_bond(
         _pad3: 0,
         // SAFETY: IdentityResolutionKey is repr(C) containing only [u8; 16].
         irk: unsafe { core::mem::transmute::<IdentityResolutionKey, [u8; 16]>(peer_id.irk) },
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the length is clamped with .min(64) immediately before the cast, and the field it fills is a 64-byte buffer"
+        )]
         sys_attrs_len: sys_attrs.len().min(64) as u8,
         _pad4: [0u8; 3],
         sys_attrs: [0u8; 64],
@@ -225,70 +230,19 @@ pub async fn save_bond(
     // body — both rejected at load. The V1 layout wrote the magic first,
     // which let panic-interrupted saves produce valid-looking garbage bonds
     // that were re-fed to the SoftDevice on every boot.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "BOND_HEADER_LEN is a compile-time constant of 8, far inside u32"
+    )]
+    let header_len = BOND_HEADER_LEN as u32;
     flash
-        .write(
-            BOND_FLASH_ADDR + BOND_HEADER_LEN as u32,
-            &data[BOND_HEADER_LEN..],
-        )
+        .write(BOND_FLASH_ADDR + header_len, &data[BOND_HEADER_LEN..])
         .await
         .map_err(|_| ())?;
     flash
         .write(BOND_FLASH_ADDR, &data[..BOND_HEADER_LEN])
         .await
         .map_err(|_| ())?;
-
-    Ok(())
-}
-
-/// Active profile stored in flash: magic (4 bytes) + profile id (1 byte) + padding (3 bytes).
-#[repr(C, align(4))]
-struct StoredProfile {
-    magic: u32,
-    /// `ProfileId` discriminant: 0 = Xbox, 1 = Generic.
-    profile_id: u8,
-    _pad: [u8; 3],
-}
-
-/// Load active profile from flash, defaulting to `Xbox` when no valid pref is stored.
-#[must_use]
-pub fn load_profile() -> crate::ble::profile::ProfileId {
-    use crate::ble::profile::ProfileId;
-    // SAFETY: NAME_FLASH_ADDR is a valid, aligned flash address. StoredProfile is repr(C, align(4)).
-    let stored = unsafe { &*(NAME_FLASH_ADDR as *const StoredProfile) };
-    if stored.magic != PROFILE_MAGIC {
-        return ProfileId::Xbox;
-    }
-    match stored.profile_id {
-        1 => ProfileId::Generic,
-        _ => ProfileId::Xbox,
-    }
-}
-
-/// Save active profile to flash.
-pub async fn save_profile(
-    flash: &mut Flash,
-    profile_id: crate::ble::profile::ProfileId,
-) -> Result<(), ()> {
-    let stored = StoredProfile {
-        magic: PROFILE_MAGIC,
-        profile_id: profile_id as u8,
-        _pad: [0u8; 3],
-    };
-
-    flash
-        .erase(NAME_FLASH_ADDR, NAME_FLASH_ADDR + PAGE_SIZE)
-        .await
-        .map_err(|_| ())?;
-
-    // SAFETY: StoredProfile is repr(C, align(4)). Pointer is valid for struct size.
-    let data = unsafe {
-        core::slice::from_raw_parts(
-            (&raw const stored).cast::<u8>(),
-            core::mem::size_of::<StoredProfile>(),
-        )
-    };
-
-    flash.write(NAME_FLASH_ADDR, data).await.map_err(|_| ())?;
 
     Ok(())
 }

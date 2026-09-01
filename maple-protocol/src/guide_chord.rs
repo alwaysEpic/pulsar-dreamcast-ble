@@ -19,8 +19,9 @@ use crate::controller_state::ControllerState;
 pub const GUIDE_TRIGGER_THRESHOLD: u8 = 200;
 /// How long L+R+Start must be held continuously before Guide fires (ms).
 pub const GUIDE_HOLD_MS: u64 = 300;
-/// How long the synthesized Guide button stays asserted once the chord fires —
-/// a short *tap*, not a hold. Some hosts (notably the Steam Deck) treat a *held*
+/// How long the synthesized Guide button stays asserted once the chord fires.
+///
+/// A short *tap*, not a hold. Some hosts (notably the Steam Deck) treat a *held*
 /// Guide/Steam button as a shortcut-chord modifier (Steam+R1 = screenshot,
 /// Steam+L2/R2 = mouse clicks, …); a brief tap just opens the guide menu. Kept
 /// well under any host's hold/long-press threshold but long enough to register.
@@ -62,7 +63,7 @@ pub struct GuideChord {
 impl GuideChord {
     /// True when the trigger values + Start constitute the chord being held.
     #[must_use]
-    pub fn is_held(state: &ControllerState) -> bool {
+    pub const fn is_held(state: &ControllerState) -> bool {
         state.trigger_l >= GUIDE_TRIGGER_THRESHOLD
             && state.trigger_r >= GUIDE_TRIGGER_THRESHOLD
             && state.buttons.start

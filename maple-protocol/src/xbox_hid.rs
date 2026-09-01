@@ -87,14 +87,13 @@ impl GamepadReport {
     /// Trigger packing: 10 data bits in low bits of `u16`, 6 zero padding in high bits.
     /// Byte 8 = `trigger[7:0]`, Byte 9 = `000000 | trigger[9:8]`
     #[must_use]
-    pub fn to_bytes(self) -> [u8; 16] {
+    pub const fn to_bytes(self) -> [u8; 16] {
         let lx = self.left_x.to_le_bytes();
         let ly = self.left_y.to_le_bytes();
         // Triggers: mask to 10 bits, stored as LE u16 (padding is in high 6 bits)
         let lt = (self.left_trigger & TRIGGER_10BIT_MASK).to_le_bytes();
         let rt = (self.right_trigger & TRIGGER_10BIT_MASK).to_le_bytes();
 
-        #[allow(clippy::cast_possible_truncation)]
         [
             // Left Stick X (bytes 0-1, uint16 LE)
             lx[0],
@@ -142,7 +141,7 @@ impl GamepadReport {
     ///
     /// Sticks, triggers, hat, and byte 15 are identical to `to_bytes`.
     #[must_use]
-    pub fn to_bytes_ms(self) -> [u8; 16] {
+    pub const fn to_bytes_ms(self) -> [u8; 16] {
         let lx = self.left_x.to_le_bytes();
         let ly = self.left_y.to_le_bytes();
         let lt = (self.left_trigger & TRIGGER_10BIT_MASK).to_le_bytes();
@@ -208,6 +207,7 @@ impl GamepadReport {
 }
 
 /// Button bit positions in the 15-bit button field.
+///
 /// Xbox One S layout (matches HID Button Usage 1-15):
 ///   Bit 0  = Button 1  = A
 ///   Bit 1  = Button 2  = B
@@ -266,7 +266,7 @@ pub mod buttons {
 /// (0x2908), and `HidService` exposes exactly one (Report ID 1 / Input). Earlier
 /// revisions also declared Report ID 0x02 (Guide/AC Home), 0x03 (rumble Output),
 /// and 0x04 (battery) in this Report Map — but none had a backing characteristic,
-/// so strict generic-HID hosts (Apple's GameController stack / the browser
+/// so strict generic-HID hosts (Apple's `GameController` stack / the browser
 /// Gamepad API) rejected the whole map while lenient parsers (hidapi, Steam)
 /// tolerated it. Battery is reported via the dedicated Battery Service (0x180F),
 /// so it is not duplicated here.
@@ -403,9 +403,9 @@ pub const HID_REPORT_DESCRIPTOR_GENERIC: &[u8] = &[
 /// This is the *opposite* trade-off from `HID_REPORT_DESCRIPTOR_GENERIC`: the Generic
 /// descriptor uses the xpadneo convention (Rx/Ry + Generic-Desktop Z/Rz, contiguous
 /// wire via `to_bytes`) for generic hosts (Android/browsers); the Xbox descriptor
-/// mimics the real Xbox so adapters that key off it (BlueRetro) map every button correctly.
+/// mimics the real Xbox so adapters that key off it (`BlueRetro`) map every button correctly.
 ///
-/// Diverging from this layout breaks BlueRetro recognition: it then generic-HID
+/// Diverging from this layout breaks `BlueRetro` recognition: it then generic-HID
 /// parses the buttons by Usage number and X/Y/Start shift (see issue #2).
 #[rustfmt::skip]
 pub const HID_REPORT_DESCRIPTOR_XBOX: &[u8] = &[

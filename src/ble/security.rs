@@ -12,7 +12,10 @@ use nrf_softdevice::ble::security::{IoCapabilities, SecurityHandler};
 use nrf_softdevice::ble::{Connection, EncryptionInfo, IdentityKey, MasterId};
 
 /// Stored bond information for a peer.
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the shared prefix mirrors the SoftDevice's own naming for these security parameters"
+)]
 #[derive(Debug, Clone, Copy)]
 struct Peer {
     master_id: MasterId,
@@ -74,7 +77,7 @@ impl Bonder {
     }
 
     /// Check if we have bonding data that should be saved
-    pub fn has_bond(&self) -> bool {
+    pub const fn has_bond(&self) -> bool {
         self.peer.get().is_some()
     }
 
@@ -92,7 +95,6 @@ impl Default for Bonder {
     }
 }
 
-#[allow(clippy::unused_self)] // Trait requires &self on all methods
 impl SecurityHandler for Bonder {
     fn io_capabilities(&self) -> IoCapabilities {
         // No input/output - use "Just Works" pairing

@@ -11,8 +11,8 @@
 //! The two profiles are host-facing identities. `Xbox` is the faithful original
 //! Xbox One S identity/layout used by XInput, Steam, SDL, emulators, Linux,
 //! BlueRetro, and retro adapters — and the one macOS's browser Gamepad API
-//! surfaces (it only recognizes Xbox/DS4/MFi). `Generic` keeps the Dreamcast name
-//! + a contiguous layout under a neutral pid.codes identity so Windows treats it as
+//! surfaces (it only recognizes Xbox/DS4/MFi). `Generic` keeps the Dreamcast name +
+//! a contiguous layout under a neutral pid.codes identity so Windows treats it as
 //! a plain HID gamepad (DirectInput) rather than loading the Xbox/XInput driver.
 
 use crate::ble::hid::{HID_REPORT_DESCRIPTOR_GENERIC, HID_REPORT_DESCRIPTOR_XBOX};
@@ -51,7 +51,7 @@ impl ProfileId {
 
     /// Return the next profile in cycle order (currently a toggle).
     #[must_use]
-    pub fn next(self) -> Self {
+    pub const fn next(self) -> Self {
         match self {
             Self::Xbox => Self::Generic,
             Self::Generic => Self::Xbox,

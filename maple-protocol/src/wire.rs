@@ -202,7 +202,7 @@ mod tests {
 
         /// Hold the current line state for one phase.
         fn hold(&mut self) -> &mut Self {
-            let word = u32::from(self.a) * A | u32::from(self.b) * B;
+            let word = (u32::from(self.a) * A) | (u32::from(self.b) * B);
             for _ in 0..self.per_phase {
                 self.samples.push(word);
             }

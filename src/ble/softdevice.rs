@@ -25,7 +25,10 @@ pub enum ConnectionState {
     Connected = 3,
 }
 
-#[allow(clippy::match_same_arms)]
+#[expect(
+    clippy::match_same_arms,
+    reason = "the arms are distinct SoftDevice events that happen to need the same handling; merging them would hide which events are covered"
+)]
 impl From<u8> for ConnectionState {
     fn from(v: u8) -> Self {
         match v {
@@ -52,11 +55,14 @@ pub fn set_connection_state(state: ConnectionState) {
 }
 
 /// `SoftDevice` configuration for BLE peripheral mode.
-#[allow(clippy::cast_possible_truncation)] // SoftDevice FFI constants are small values
-fn softdevice_config(profile: &Profile) -> nrf_softdevice::Config {
-    let name = profile.gap_name.as_ptr();
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "SoftDevice FFI constants are small enum discriminants and length values that fit the narrower types"
+)]
+fn softdevice_config(gap_name: &'static [u8]) -> nrf_softdevice::Config {
+    let name = gap_name.as_ptr();
     // Subtract trailing NUL — SoftDevice expects unterminated length.
-    let name_len = (profile.gap_name.len() - 1) as u16;
+    let name_len = (gap_name.len() - 1) as u16;
 
     nrf_softdevice::Config {
         // LFCLK = the module's 32.768 kHz crystal. Verified against the Seeed
@@ -114,7 +120,20 @@ fn softdevice_config(profile: &Profile) -> nrf_softdevice::Config {
 /// This must be called exactly once at program start, before any BLE operations.
 #[must_use]
 pub fn init_softdevice(profile: &Profile) -> &'static mut Softdevice {
-    let config = softdevice_config(profile);
+    let config = softdevice_config(profile.gap_name);
+    Softdevice::enable(&config)
+}
+
+/// Initialize the SoftDevice for the isolated configuration personality.
+///
+/// This must be selected before enable because the GAP name is part of the
+/// SoftDevice configuration and cannot be swapped with the runtime GATT
+/// server. The alternate address is installed separately immediately after
+/// enable and before any advertising.
+#[must_use]
+pub fn init_config_softdevice() -> &'static mut Softdevice {
+    const CONFIG_GAP_NAME: &[u8] = b"Pulsar Configure\0";
+    let config = softdevice_config(CONFIG_GAP_NAME);
     Softdevice::enable(&config)
 }
 
@@ -163,8 +182,7 @@ static ADV_DATA_RECONNECT: [u8; 13] = [
 
 /// Active profile pointer, set at init and read during advertising.
 /// Defaults to `PROFILE_XBOX` so calls before `set_profile` still resolve.
-static ACTIVE_PROFILE: AtomicPtr<Profile> =
-    AtomicPtr::new(&PROFILE_XBOX as *const Profile as *mut Profile);
+static ACTIVE_PROFILE: AtomicPtr<Profile> = AtomicPtr::new((&raw const PROFILE_XBOX).cast_mut());
 
 /// Set the active profile (called once at init before advertising starts).
 pub fn set_profile(profile: &'static Profile) {

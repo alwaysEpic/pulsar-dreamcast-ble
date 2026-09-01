@@ -6,13 +6,22 @@
 //! Implements Xbox One S BLE HID format (Model 1708, PID `0x02E0`).
 //! Pure report types re-exported from `maple_protocol::xbox_hid`.
 
-#![allow(clippy::redundant_else)] // Macro-generated code
-#![allow(clippy::missing_errors_doc)] // Internal API
-#![allow(clippy::trivially_copy_pass_by_ref)] // Macro-generated _set methods
-#![allow(clippy::unnecessary_semicolon)] // Macro-generated code
-#![allow(dead_code)] // Macro-generated event enum fields
+#![expect(
+    clippy::redundant_else,
+    reason = "expanded from the nrf-softdevice #[gatt_server]/#[gatt_service] macros; \
+            the shape is not ours to change"
+)]
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "the error type is this module's own single-variant enum, and every caller \
+            is in-crate; a # Errors section would restate the signature"
+)]
+#![expect(
+    clippy::unnecessary_semicolon,
+    reason = "expanded from the nrf-softdevice #[gatt_server]/#[gatt_service] macros; \
+            the shape is not ours to change"
+)]
 
-#[allow(unused_imports)] // Re-exports for external consumers
 pub use maple_protocol::xbox_hid::{
     buttons, hat, GamepadReport, HID_REPORT_DESCRIPTOR_GENERIC, HID_REPORT_DESCRIPTOR_XBOX,
 };
@@ -32,7 +41,6 @@ pub const PROTOCOL_MODE_REPORT: u8 = 1;
 
 /// HID Service (UUID 0x1812)
 /// Security: `JustWorks` (encrypted, unauthenticated) - required by HOGP spec
-#[allow(dead_code)] // Macro-generated fields
 #[nrf_softdevice::gatt_service(uuid = "1812")]
 pub struct HidService {
     /// HID Information (UUID 0x2A4A) - Read only
@@ -80,7 +88,6 @@ pub struct HidService {
 }
 
 /// Device Information Service (UUID 0x180A)
-#[allow(dead_code)] // Macro-generated fields
 #[nrf_softdevice::gatt_service(uuid = "180A")]
 pub struct DeviceInfoService {
     /// Manufacturer Name (UUID 0x2A29)
@@ -97,7 +104,6 @@ pub struct DeviceInfoService {
 }
 
 /// Battery Service (UUID 0x180F)
-#[allow(dead_code)] // Macro-generated fields
 #[nrf_softdevice::gatt_service(uuid = "180F")]
 pub struct BatteryService {
     /// Battery Level (UUID 0x2A19) - 0-100%
@@ -106,7 +112,6 @@ pub struct BatteryService {
 }
 
 /// Combined GATT server with all services.
-#[allow(dead_code)] // Macro-generated fields
 #[nrf_softdevice::gatt_server]
 pub struct GamepadServer {
     pub hid: HidService,

@@ -17,9 +17,6 @@
 //! (cd maple-protocol && UPDATE_FIXTURES=1 cargo test --test blueretro_fixtures)
 //! ```
 
-// "BlueRetro" is a product name, not code.
-#![allow(clippy::doc_markdown)]
-
 use std::fmt::Write as _;
 
 use maple_protocol::xbox_hid::{

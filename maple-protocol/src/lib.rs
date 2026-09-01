@@ -18,9 +18,14 @@
 
 #![no_std]
 
+pub mod config_protocol;
 pub mod controller_state;
 pub mod guide_chord;
+#[cfg(test)]
+mod oracle;
 pub mod packet;
+pub mod prefs_journal;
+pub mod remap;
 pub mod sync_hold;
 pub mod wire;
 pub mod xbox_hid;

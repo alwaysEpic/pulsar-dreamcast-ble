@@ -3,9 +3,17 @@
 
 //! BLE advertising and connection handling task.
 
+#![expect(
+    clippy::too_many_lines,
+    reason = "`ble_task` is a flat connect/disconnect/event dispatch that has to be \
+              read top to bottom. The attribute is module-scoped because #[expect] \
+              cannot reach the function #[embassy_executor::task] generates."
+)]
+
 use embassy_time::{Duration, Instant, Timer};
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::security::SecurityHandler;
+use nrf_softdevice::ble::HciStatus;
 use nrf_softdevice::Softdevice;
 
 use crate::ble::{
@@ -13,9 +21,9 @@ use crate::ble::{
     GamepadServer,
 };
 use crate::maple::ControllerState;
-use crate::{CONTROLLER_STATE, PROFILE_CHANGE, SYNC_MODE, WAKE_REQUEST};
+use crate::{PROFILE_CHANGE, RAW_CONTROLLER_STATE, SYNC_MODE, WAKE_REQUEST};
 use maple_protocol::guide_chord::GuideChord;
-use maple_protocol::xbox_hid::buttons;
+use maple_protocol::remap::RemapTable;
 
 use crate::BATTERY_LEVEL;
 
@@ -26,16 +34,20 @@ use crate::BATTERY_LEVEL;
 /// - `Idle`: Continue trying bonded device (not discoverable)
 /// - `SyncMode` (60s): Discoverable to all, accepts new pairings
 /// - `Connected`: Active connection
-#[allow(clippy::items_after_statements, clippy::too_many_lines)]
 #[embassy_executor::task]
 pub async fn ble_task(
     sd: &'static Softdevice,
     server: &'static GamepadServer,
     bonder: &'static Bonder,
+    remap: RemapTable,
 ) {
     let mut flash = nrf_softdevice::Flash::take(sd);
 
     // Sync mode timeout: 60 seconds
+    #[expect(
+        clippy::items_after_statements,
+        reason = "the constant is declared beside the loop that consumes it; hoisting it to module scope would separate a tuning value from the only code it tunes"
+    )]
     const SYNC_TIMEOUT_MS: u64 = 60_000;
 
     // Tracks whether we've completed at least one successful connection during
@@ -54,7 +66,7 @@ pub async fn ble_task(
                 "PROFILE: Switching to {}",
                 core::str::from_utf8(next.profile().vmu_label).unwrap_or("?")
             );
-            let _ = crate::ble::flash_bond::save_profile(&mut flash, next).await;
+            let _ = crate::ble::prefs::save_profile(&mut flash, next).await;
             // Reset to bring up the SoftDevice with the new profile's descriptor.
             cortex_m::peripheral::SCB::sys_reset();
         }
@@ -154,7 +166,8 @@ pub async fn ble_task(
 
                 if let Some(conn) = conn {
                     set_connection_state(ConnectionState::Connected);
-                    let outcome = handle_connection(sd, server, bonder, &mut flash, conn).await;
+                    let outcome =
+                        handle_connection(sd, server, bonder, &mut flash, conn, remap).await;
                     // Every exit from a connection drops the wire-level dedup cache.
                     // The next connection is a different peer, or the same one
                     // renegotiating, so the previous session's last report must never
@@ -229,7 +242,8 @@ pub async fn ble_task(
 
                 if let Some(conn) = conn {
                     set_connection_state(ConnectionState::Connected);
-                    let outcome = handle_connection(sd, server, bonder, &mut flash, conn).await;
+                    let outcome =
+                        handle_connection(sd, server, bonder, &mut flash, conn, remap).await;
                     // Every exit from a connection drops the wire-level dedup cache.
                     // The next connection is a different peer, or the same one
                     // renegotiating, so the previous session's last report must never
@@ -286,13 +300,17 @@ fn transition_after_disconnect(bonder: &Bonder) {
 
 /// Handle an active BLE connection.
 /// Returns the reason the session ended.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a flat hardware bring-up / event-dispatch sequence; splitting it would scatter an order that must be read top to bottom"
+)]
 async fn handle_connection(
     _sd: &'static Softdevice,
     server: &'static GamepadServer,
     bonder: &'static Bonder,
     flash: &mut nrf_softdevice::Flash,
     conn: nrf_softdevice::ble::Connection,
+    remap: RemapTable,
 ) -> DisconnectOutcome {
     log!("BLE: Connected!");
 
@@ -429,38 +447,30 @@ async fn handle_connection(
 
         loop {
             // Read any pending state change promptly, then wait for send timer.
-            if CONTROLLER_STATE.signaled() {
-                current_state = CONTROLLER_STATE.wait().await;
+            if let Some(state) = RAW_CONTROLLER_STATE.try_take() {
+                current_state = state;
             }
 
             // Fixed-rate send at ~125Hz — matches Xbox cadence and BLE conn interval
             Timer::after(Duration::from_millis(crate::NOTIFY_INTERVAL_MS)).await;
 
             // Grab any state that arrived during the wait
-            if CONTROLLER_STATE.signaled() {
-                current_state = CONTROLLER_STATE.wait().await;
+            if let Some(state) = RAW_CONTROLLER_STATE.try_take() {
+                current_state = state;
             }
 
-            let mut report = current_state.to_gamepad_report();
-            // Synthesize the Guide button from the L+R+Start hold-chord.
-            // Detection runs before profile serialization, so both the Xbox and
-            // the generic profile get it. State machine lives in maple-protocol
-            // (host-tested); here we just feed it the monotonic clock and act.
-            let chord = guide_chord.update(&current_state, Instant::now().as_millis());
-            if chord.suppress {
-                // Suppress the chord's constituents from the instant all three are
-                // held (not just after it fires) so the 300ms arming window can't
-                // leak a Start/trigger press to the host before the Guide tap.
-                report.buttons &= !buttons::START;
-                report.left_trigger = 0;
-                report.right_trigger = 0;
-            }
-            if chord.emit_guide {
-                // Pulse Guide as a short tap, not a hold: a *held* Guide/Steam
-                // button puts the Steam Deck into shortcut-chord mode (Steam+R1 =
-                // screenshot). A tap just opens the guide menu. See guide_chord.rs.
-                report.buttons |= buttons::GUIDE;
-            }
+            // One conversion for the map and the Guide chord (remap design
+            // v2 §2.2): the source-keyed map is applied with typed reducers
+            // and the L+R+Start chord's constituents are excluded at source
+            // level before fan-in — the same function the config
+            // personality previews as LiveOutput. The map was loaded once
+            // before this task spawned and cannot change until a reset
+            // (§2.3): the only writer runs in the config boot.
+            let (report, chord) = current_state.to_gamepad_report_with(
+                &remap,
+                &mut guide_chord,
+                Instant::now().as_millis(),
+            );
             if chord.rising_edge {
                 // Best-effort, fire-and-forget: ask the main loop to flash the
                 // VMU home glyph. Single non-blocking atomic store; the main
@@ -506,7 +516,7 @@ async fn handle_connection(
                     "PROFILE: Switching to {}",
                     core::str::from_utf8(next.profile().vmu_label).unwrap_or("?")
                 );
-                let _ = crate::ble::flash_bond::save_profile(flash, next).await;
+                let _ = crate::ble::prefs::save_profile(flash, next).await;
                 cortex_m::peripheral::SCB::sys_reset();
             }
             Timer::after(Duration::from_millis(100)).await;
@@ -581,15 +591,14 @@ async fn handle_connection(
     // and classify. Host-initiated termination (0x13 user, 0x14 low resources,
     // 0x15 power off) means the user wants the disconnect to stick. Anything
     // else (timeout, error) is treated as accidental — eligible for auto retry.
-    use nrf_softdevice::ble::HciStatus;
     let reason = conn.disconnect_reason();
     log!("BLE: Disconnect reason = {:?}", reason);
     match reason {
-        Some(HciStatus::REMOTE_USER_TERMINATED_CONNECTION)
-        | Some(HciStatus::REMOTE_DEV_TERMINATION_DUE_TO_LOW_RESOURCES)
-        | Some(HciStatus::REMOTE_DEV_TERMINATION_DUE_TO_POWER_OFF) => {
-            DisconnectOutcome::HostIntentional
-        }
+        Some(
+            HciStatus::REMOTE_USER_TERMINATED_CONNECTION
+            | HciStatus::REMOTE_DEV_TERMINATION_DUE_TO_LOW_RESOURCES
+            | HciStatus::REMOTE_DEV_TERMINATION_DUE_TO_POWER_OFF,
+        ) => DisconnectOutcome::HostIntentional,
         _ => DisconnectOutcome::Lost,
     }
 }
