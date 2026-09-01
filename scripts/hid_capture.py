@@ -91,7 +91,7 @@ def looks_like_gamepad(d: dict) -> bool:
     )
 
 
-def list_devices() -> int:
+def list_devices(verbose: bool) -> int:
     devs = find_devices()
     if not devs:
         print("No HID devices found.")
@@ -102,6 +102,18 @@ def list_devices() -> int:
         vidpid = f"{d['vendor_id']:04x}:{d['product_id']:04x}"
         usage = f"{d.get('usage_page', 0):#06x}/{d.get('usage', 0):#04x}"
         print(f"{star} {vidpid:<12} {usage:<10} {d.get('product_string') or '?'}")
+        if verbose:
+            for key in (
+                "manufacturer_string",
+                "serial_number",
+                "release_number",
+                "interface_number",
+                "path",
+            ):
+                value = d.get(key)
+                if isinstance(value, bytes):
+                    value = value.decode(errors="replace")
+                print(f"    {key}: {value!r}")
     return 0
 
 
@@ -231,8 +243,8 @@ def append_record(path: pathlib.Path, record: dict) -> int | None:
         return None
 
 
-def print_history(path: pathlib.Path, limit: int) -> int:
-    """Print the last `limit` recorded runs as a table."""
+def print_history(path: pathlib.Path, limit: int, unit: str | None = None) -> int:
+    """Print the last `limit` recorded runs as a table, optionally one unit's only."""
     if not path.exists():
         print(f"No capture log yet at {path}")
         print("Run a capture without --no-record to start one.")
@@ -249,16 +261,25 @@ def print_history(path: pathlib.Path, limit: int) -> int:
     if not rows:
         print(f"{path} is empty")
         return 0
+    scope = ""
+    if unit:
+        # Filter before slicing, so `limit` counts this unit's runs, not all runs.
+        rows = [r for r in rows if r.get("unit") == unit]
+        scope = f" for {unit}"
+        if not rows:
+            print(f"No runs recorded{scope} — captures made before --unit existed are untagged")
+            return 0
     shown = rows[-limit:]
-    print(f"── Last {len(shown)} of {len(rows)} run(s) — {path} ──")
-    hdr = (f"{'date':<17} {'commit':<12} {'board':<9} {'Hz':>5} {'med':>5} "
+    print(f"── Last {len(shown)} of {len(rows)} run(s){scope} — {path} ──")
+    hdr = (f"{'date':<17} {'commit':<12} {'unit':<10} {'board':<9} {'Hz':>5} {'med':>5} "
            f"{'IQR':>5} {'p95':>5} {'p99':>6} {'max':>6} {'rev':>4} {'skip':>5} {'s/dir':>6}")
     print(hdr)
     print("-" * len(hdr))
     for r in shown:
         c = (r.get("commit") or "?") + ("*" if r.get("dirty") else "")
         spo = r.get("samples_per_direction")
-        print(f"{(r.get('date') or '?')[:17]:<17} {c:<12} {(r.get('board') or '-'):<9} "
+        print(f"{(r.get('date') or '?')[:17]:<17} {c:<12} {(r.get('unit') or '-'):<10} "
+              f"{(r.get('board') or '-'):<9} "
               f"{_f(r.get('hz'), 1, 5)} {_f(r.get('median_ms'), 1, 5)} "
               f"{_f(r.get('iqr_ms'), 1, 5)} {_f(r.get('p95_ms'), 1, 5)} "
               f"{_f(r.get('p99_ms'), 1, 6)} {_f(r.get('max_ms'), 1, 6)} "
@@ -520,7 +541,12 @@ def main() -> int:
     ap.add_argument("--record-file", type=pathlib.Path, default=DEFAULT_RECORD,
                     help=f"capture log path (default {DEFAULT_RECORD})")
     ap.add_argument("--board", help="board this run was captured against, e.g. pulsarv1")
+    ap.add_argument("--unit", metavar="SERIAL",
+                    help="serial of the physical unit under test, e.g. PV1-0002. Without it "
+                         "a run cannot be attributed to a board, which is what QC needs. "
+                         "With --history, shows only that unit's runs")
     ap.add_argument("--note", help="free-text label for this run, e.g. 'post ip5306 RMW fix'")
+    ap.add_argument("--verbose", action="store_true", help="with --list, print host identity fields")
     ap.add_argument("--seconds", type=float, default=10.0, help="capture duration (default 10)")
     ap.add_argument("--input", choices=["stick", "dpad"], default="stick",
                     help="rotate the analog stick (default) or the d-pad/hat")
@@ -551,10 +577,10 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.list:
-        return list_devices()
+        return list_devices(args.verbose)
 
     if args.history is not None:
-        return print_history(args.record_file, args.history)
+        return print_history(args.record_file, args.history, args.unit)
 
     h = open_device(args)
     if h is None:
@@ -799,6 +825,7 @@ def main() -> int:
             "commit": git["commit"],
             "branch": git["branch"],
             "dirty": git["dirty"],
+            "unit": args.unit,
             "board": args.board,
             "note": args.note,
             "seconds": args.seconds,

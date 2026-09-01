@@ -6,7 +6,9 @@
 // attempt looks like concentric rings rather than a continuous ribbon.
 
 use std::env;
+use std::error::Error;
 use std::f64::consts::PI;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
@@ -14,10 +16,14 @@ const WIDTH: usize = 32;
 const HEIGHT: usize = 24;
 const BYTES: usize = WIDTH * HEIGHT / 8;
 
-fn main() {
+// Returns `Result` rather than unwrapping: the workspace forbids
+// `unwrap`/`expect`/`panic` outright, and a build script gets the same
+// treatment as firmware. Cargo prints the error and fails the build, so the
+// diagnostics are no worse than a panic's — and the failure paths are explicit.
+fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
 
-    let out_dir = env::var("OUT_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR")?;
     let out_path = Path::new(&out_dir).join("glyph_dreamcast.rs");
 
     let bytes = generate_swirl();
@@ -28,12 +34,12 @@ fn main() {
     content.push_str("/// Archimedean spiral. 1.75 turns ending at upper-right, mirrored\n");
     content.push_str("/// vertically so the outer terminus lands at the lower-right.\n");
     content.push_str("#[rustfmt::skip]\n");
-    content.push_str(&format!("pub const GLYPH_DREAMCAST: [u8; {BYTES}] = [\n"));
+    writeln!(content, "pub const GLYPH_DREAMCAST: [u8; {BYTES}] = [")?;
     for row in 0..HEIGHT {
         content.push_str("    ");
         for col_byte in 0..(WIDTH / 8) {
             let b = bytes[row * (WIDTH / 8) + col_byte];
-            content.push_str(&format!("0x{b:02X}, "));
+            write!(content, "0x{b:02X}, ")?;
         }
         // Visualise as a comment for inspectability in the generated file.
         content.push_str("// ");
@@ -46,11 +52,22 @@ fn main() {
     }
     content.push_str("];\n");
 
-    fs::write(&out_path, content).unwrap();
+    fs::write(&out_path, content)?;
+    Ok(())
 }
 
 /// Plot a 3-pixel-wide ribbon along an Archimedean spiral, plus a tail that
 /// extends from the spiral's outer terminus outward to the upper-right.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "canvas coordinates are loop indices bounded by WIDTH=32 / HEIGHT=24, \
+              far inside f64's exactly-representable integer range"
+)]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "mul_add would obscure the parametric spiral formula, for a rasterizer \
+              that runs once at build time"
+)]
 fn generate_swirl() -> [u8; BYTES] {
     let mut frame = [0u8; BYTES];
 
@@ -70,7 +87,7 @@ fn generate_swirl() -> [u8; BYTES] {
         for x in 0..WIDTH {
             let dx = x as f64 - cx;
             let dy = y as f64 - cy;
-            let r = (dx * dx + dy * dy).sqrt();
+            let r = dx.hypot(dy);
             // atan2 returns (-π, π]; normalise to [0, 2π).
             let theta = {
                 let t = dy.atan2(dx);
@@ -94,8 +111,15 @@ fn generate_swirl() -> [u8; BYTES] {
                 let twopi = 2.0 * PI;
                 ((s % twopi) + twopi) % twopi
             };
-            for k in 0..=(turns.ceil() as i32 + 1) {
-                let t_k = theta_shifted + 2.0 * PI * k as f64;
+            // `turns` is a compile-time constant (1.75), so this bound is 3.
+            // Kept parametric so changing `turns` still sweeps enough arms.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "turns.ceil() is a small positive constant; i32 cannot overflow"
+            )]
+            let k_max = turns.ceil() as i32 + 1;
+            for k in 0..=k_max {
+                let t_k = theta_shifted + 2.0 * PI * f64::from(k);
                 if t_k < 0.0 || t_k > max_t {
                     continue;
                 }

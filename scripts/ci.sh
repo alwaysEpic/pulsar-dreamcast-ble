@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-commit quality checks for pulsar-dreamcast-ble
+# Pre-commit quality checks for embedded_dreamcast
 # Run this before committing to catch issues early.
 
 set -e
@@ -14,20 +14,36 @@ NC='\033[0m'
 pass() { echo -e "${GREEN}PASS${NC} $1"; }
 fail() { echo -e "${RED}FAIL${NC} $1"; exit 1; }
 
+# `--check`, not a bare `cargo fmt`. The old form *rewrote* the tree as a side
+# effect of running the gate, so a "passing" run could silently differ from what
+# was staged — and an agent iterating against it never saw a formatting failure
+# at all, because the failure fixed itself.
 echo "=== Formatting ==="
-cargo fmt --all && pass "cargo fmt"
+cargo fmt --all --check && pass "cargo fmt --check" \
+    || fail "cargo fmt --check (run 'cargo fmt --all' to fix)"
 
 echo ""
 echo "=== maple-protocol tests ==="
 (cd maple-protocol && cargo test) && pass "cargo test" || fail "cargo test"
 
-echo ""
-echo "=== Clippy (main crate, default features) ==="
-cargo clippy -- -W clippy::all -W clippy::pedantic && pass "clippy (dk)" || fail "clippy (dk)"
-
+# No -W flags here any more: the lint policy lives in [workspace.lints] in
+# Cargo.toml, so this sees exactly what a bare `cargo clippy` sees on anyone's
+# machine. `--all-targets` so tests and build scripts are linted too — build.rs
+# was previously never checked at all.
 echo ""
 echo "=== Clippy (maple-protocol) ==="
-(cd maple-protocol && cargo clippy -- -W clippy::all -W clippy::pedantic) && pass "clippy (maple-protocol)" || fail "clippy (maple-protocol)"
+(cd maple-protocol && cargo clippy --all-targets -- -D warnings) \
+    && pass "clippy (maple-protocol)" || fail "clippy (maple-protocol)"
+
+# Every board, not just the default. The boards select mutually exclusive
+# feature sets (ADR-013), so a lint clean on `dk` says nothing about the code
+# behind `board-pulsarv1`.
+for b in dk xiao pulsarv1; do
+    echo ""
+    echo "=== Clippy (board-$b) ==="
+    cargo clippy --no-default-features --features "board-$b" -- -D warnings \
+        && pass "clippy (board-$b)" || fail "clippy (board-$b)"
+done
 
 ELF="target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble"
 

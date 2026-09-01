@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan or strip location/identity metadata in images before they are published.
+"""Scan or strip location/identity metadata in images and video before publishing.
 
 Why this exists: the v0.4.0 release verified "EXIF stripped" with
 `mdls -name kMDItemLatitude`. `mdls` reads the Spotlight index, not the file, and
@@ -7,8 +7,12 @@ returns `(null)` for anything Spotlight has not indexed — so it reported clean
 files that still carried full GPS. Eighteen photos reached the public mirror with
 sub-arcsecond home coordinates. Parse the container; never trust an indexer.
 
-    python3 scripts/image_metadata.py scan  docs/images      # exit 1 if any GPS
+    python3 scripts/image_metadata.py scan  docs            # exit 1 if any GPS
     python3 scripts/image_metadata.py strip docs/images      # rewrite in place
+
+Handles JPEG, PNG, WebP, and QuickTime/MP4 video. Video location is blanked in
+place rather than removed: shortening `moov` would shift `mdat` and invalidate
+every chunk offset in the sample tables.
 
 Camera-named `IMG_*` files are skipped by default: they are the private originals,
 never published, and the `pre-push` hook blocks them by name. Pass `--include-raw`
@@ -20,6 +24,7 @@ location, and dropping ICC shifts colour). A non-default Orientation is preserve
 by re-emitting a minimal Exif block holding that one tag, so images do not rotate.
 """
 
+import re
 import struct
 import sys
 import pathlib
@@ -177,9 +182,69 @@ def scan_webp(d):
     return hits
 
 
+ISO6709 = re.compile(rb"[+-]\d{2}\.\d+[+-]\d{3}\.\d+([+-]\d+\.\d+)?/?")
+
+
+def _moov(d):
+    """Byte range of the top-level `moov` atom, or None."""
+    i = 0
+    while i + 8 <= len(d):
+        sz = struct.unpack_from(">I", d, i)[0]
+        typ = d[i + 4:i + 8]
+        hdr = 8
+        if sz == 1:
+            sz = struct.unpack_from(">Q", d, i + 8)[0]
+            hdr = 16
+        elif sz == 0:
+            sz = len(d) - i
+        if sz < hdr or i + sz > len(d):
+            return None
+        if typ == b"moov":
+            return i, i + sz
+        i += sz
+    return None
+
+
+def scan_mov(d):
+    """QuickTime/MP4: look for a location only inside `moov`, never in `mdat`."""
+    hits = {}
+    rng = _moov(d)
+    if not rng:
+        return hits
+    region = bytes(d[rng[0]:rng[1]])
+    if ISO6709.search(region):
+        hits["GPSInfo"] = True            # same key images use, so `scan` fails alike
+    if b"com.apple.quicktime.location" in region:
+        hits["QuickTimeLocationKey"] = True
+    if b"com.apple.quicktime.model" in region:
+        hits["Model"] = True
+    return hits
+
+
+def strip_mov(d):
+    """Blank location payloads in place.
+
+    Same-length overwrite on purpose: removing bytes from `moov` would shift
+    `mdat` and invalidate every chunk offset in the sample tables. Zeroing keeps
+    the file byte-for-byte the same size, so the atom tree stays valid.
+    """
+    rng = _moov(d)
+    if not rng:
+        return bytes(d)
+    lo, hi = rng
+    out = bytearray(d)
+    for m in ISO6709.finditer(bytes(out[lo:hi])):
+        s = lo + m.start()
+        out[s:s + len(m.group())] = b"\x00" * len(m.group())
+    assert len(out) == len(d), "video size changed — offsets would be invalid"
+    return bytes(out)
+
+
 HANDLERS = {
     ".jpg": (scan_jpeg, strip_jpeg), ".jpeg": (scan_jpeg, strip_jpeg),
     ".png": (scan_png, strip_png), ".webp": (scan_webp, None),
+    ".mov": (scan_mov, strip_mov), ".mp4": (scan_mov, strip_mov),
+    ".m4v": (scan_mov, strip_mov),
 }
 
 
