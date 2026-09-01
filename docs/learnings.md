@@ -127,6 +127,34 @@ A 10-point LiPo discharge curve lookup table with linear interpolation is the in
 - Always erase the page after reading to prevent stale data and limit flash wear
 - nRF52840 flash is rated for ~10,000 erase cycles per page — not a concern
 
+## 15. Poll/Connection-Interval Beat Makes Short Captures Lie
+
+The poll cadence (~15 ms, device crystal) and the BLE connection interval
+(~15 ms, host clock) are nominally equal, so their relative phase slides at
+ppm-scale drift — and the doubled-interval fraction (a poll's notify missing
+its connection event) swings with that phase. Measured on one binary, within
+one connection, in 5 s windows over 180 s: **2.5% to 18.5%**, wandering on a
+~30-60 s quasi-period (crystal drift is temperature-wandering, so the beat is
+not a crisp frequency). The user-visible symptom is the issue #5 one: a 30 ms
+gap at ~2.5 rot/s skips an octant.
+
+**Consequences:**
+- A 10 s capture samples one random slice of the beat and cannot compare
+  builds — an afternoon of A/B ladder flashes (v228-v232, 2026-08-10) produced
+  "differences" from 2.9% to 12.2% that were entirely this process. Validation
+  captures need ≥120 s, and the number that matters is the windowed timeline,
+  not one aggregate.
+- The radio-quiet gate reduces collisions but has a recurring adverse-phase
+  band it cannot dodge by skipping alone. Candidate fixes: re-phase the poll
+  anchor when the skip rate runs hot, or detune the poll period off the
+  connection interval so the adverse band sweeps through quickly instead of
+  lingering.
+- Confounders priced during the same session: back cover on ≈ +1.5-2.5 points
+  (RF attenuation, and it is the shipping config), VMU docked ≈ +1.3 points
+  (LCD animation traffic). The 1.3-4.0% "baseline band" printed by
+  `hid_capture.py` predates all three effects and reads as cover-off,
+  clean-phase luck.
+
 ---
 
 ## Quick Reference

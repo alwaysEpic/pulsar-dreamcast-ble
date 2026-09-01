@@ -15,11 +15,16 @@ Consolidated from three sources:
 |-----|------|-------|----------|
 | 1 | SDCKA | Red | Clock/Data line A |
 | 2 | +5V | Blue | Power |
-| 3 | GND | Green | Ground (also sense) |
-| 4 | GND | Black | Ground |
+| 3 | GND | Black | Ground (cable shield ties here) |
+| 4 | Sense | Green | Tied to GND |
 | 5 | SDCKB | White | Clock/Data line B |
 
-*Pin/color mapping from physical inspection and community sources*
+Pinout per the canonical Maple-bus reference ([mc.pp.se](https://mc.pp.se/dc/controller.html)),
+matching the KiCad symbol. See `pin_mapping.md`, which is authoritative for this table.
+
+**Wire colours vary on third-party cables — meter your actual cable before trusting
+them.** Pins 3 and 4 are both at ground potential either way, so a 5 V measurement
+against either is valid; pins 1 and 5 are data lines and carry no power.
 
 ### Voltage Levels
 

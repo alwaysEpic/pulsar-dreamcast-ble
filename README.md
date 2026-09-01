@@ -8,6 +8,19 @@
 
 Use your Dreamcast controller wirelessly with any Bluetooth device. Pulsar speaks the Dreamcast's Maple Bus protocol natively and presents itself as a standard Xbox One S BLE gamepad — just plug in, pair, and play.
 
+### ⚡ [**Buy Pulsar — Dreamcast wireless controller adapter**](https://pulsar.alwaysagog.com/buy)
+
+A complete wireless Dreamcast controller, Pulsar on its own, or the parts to build one —
+at **[pulsar.alwaysagog.com](https://pulsar.alwaysagog.com/)**. Prefer to build it
+yourself? [Start here](docs/build/xiao.md); everything you need is in this repo.
+
+> **Where to get Pulsar firmware.** The only official sources are this repository's
+> [Releases](https://github.com/alwaysEpic/pulsar-dreamcast-ble/releases) page and the
+> updater at [pulsar.alwaysagog.com/update](https://pulsar.alwaysagog.com/update).
+> Firmware ships as `.uf2`, `.hex`, or a signed OTA package — never as a `.zip`, `.exe`, or
+> anything you run on a PC. Copies of this repo on other GitHub accounts that offer a
+> "download" have been found carrying malware. Don't run them.
+
 ## Features
 
 - All Dreamcast inputs: A/B/X/Y, Start, D-pad, analog stick, analog triggers
@@ -55,10 +68,24 @@ fabrication files are not published, but the design is described in the
 [bill of materials](docs/bill_of_materials.md) and all three boards' pin assignments are in
 [pin mapping](docs/pin_mapping.md).
 
+## Three paths — pick yours
+
+Each board has its own guide, written to be followed start to finish.
+
+| | Guide | For |
+|---|---|---|
+| 🔧 | **[Build the XIAO adapter](docs/build/xiao.md)** | The hand-wired DIY build. Perfboard, a boost converter, two resistors and two diodes. Soldering required, and it permanently modifies a controller |
+| 🧪 | **[Bench setup on an nRF52840-DK](docs/build/dk.md)** | Development and debugging. No soldering, and no permanent change to a controller if you cut an extension cable instead |
+| 📦 | **[Install an assembled Pulsar v1](docs/build/pulsar-v1.md)** | You bought one. Photo-by-photo: open the controller, fit Pulsar, route the cable, close it up |
+
+Once it is together, the [user guide](docs/users_guide.md) covers all three boards, and
+Pulsar v1 owners have a dedicated [owner's manual](docs/pulsar_v1_manual.md).
+
 ## Build Your Own
 
-This section covers the **XIAO** build — the one you can make yourself with parts off the
-shelf. Everything after Wiring assumes that board unless stated.
+A summary of the **XIAO** build. The step-by-step version — cable identification, the 5 V
+diode-OR, pre-power checks and first-boot behaviour — is in
+**[docs/build/xiao.md](docs/build/xiao.md)**.
 
 ### What You Need
 
@@ -76,6 +103,13 @@ See the full [bill of materials](docs/bill_of_materials.md) for details.
 ![Wiring Diagram](docs/wiring/dc_wiring_bb.png)
 
 Connect SDCKA and SDCKB from the controller cable to the XIAO with 10kΩ pull-ups to 3.3V. The controller needs 5V power via a diode OR circuit (USB + boost converter). See [pin mapping](docs/pin_mapping.md) for the complete wiring reference.
+
+> **Meter your cable before you solder.** The colour-to-pin table is the canonical Maple
+> pinout, not a promise about the cable in your hand — third-party and later-revision
+> controllers differ, and getting it wrong puts 5 V on a data line. The
+> [build guide](docs/build/xiao.md#2-identify-the-cable-conductors) walks through checking
+> it with a multimeter, and explains why the diode OR is there and which way round the
+> diodes go.
 
 ### Flash
 
@@ -105,6 +139,8 @@ If you need RTT debug logging, flash via SWD instead. The SoftDevice must be fla
 - Short press → wake / request reconnect
 - Hold 2s → clear bond and start pairing
 - Hold 3.5s **while holding the controller's Start** → firmware update (OTA) mode
+- Tap, tap, then hold 3.5s → the same update mode, no controller needed
+- **Tap once, then hold 3.5s → browser configuration mode ([remap your buttons](docs/users_guide.md#remapping-buttons-from-your-browser))**
 - Hold 7s → sleep (`BYE` splash, then powers off)
 - Triple-press → switch profile (Xbox ⇄ Dreamcast identity)
 
@@ -202,6 +238,11 @@ Pre-built firmware is available on the [Releases](https://github.com/alwaysEpic/
 - **`pulsar-dreamcast-ble-dk.hex`** — DK firmware, for flashing via J-Link
 
 3D scan archives are also attached to releases.
+
+Pulsar v1 units update over the air from
+[pulsar.alwaysagog.com/update](https://pulsar.alwaysagog.com/update); the packages are signed
+and the device refuses anything else. There are no other download locations. If a copy of this
+repo somewhere else offers a `.zip` or a Windows program, it isn't ours — see the note at the top.
 
 ## Contributing
 

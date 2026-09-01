@@ -17,19 +17,27 @@ it says so.
 | What it is | The designed carrier board, with a XIAO nRF52840 module mounted on it | A XIAO nRF52840 wired up by hand on perfboard or a breadboard | Nordic nRF52840-DK dev kit |
 | Status light | 5-LED bar: LED 0 status, LEDs 1–4 battery | The XIAO's onboard RGB (one LED) | Discrete kit LEDs |
 | Battery gauge | IP5306 fuel gauge, four levels | Voltage estimate from the battery ADC | None — no battery |
-| Rumble | Yes, ERM motor | No | No |
+| Rumble | Motor output (CN3), **no motor fitted as shipped** | No | No |
 | Charging | Onboard, USB-C | Onboard, via the XIAO's USB-C | Not applicable |
 | Firmware update | Wireless (OTA) | USB drag-and-drop (UF2) | Debug probe |
 | Sleep | Deep sleep (System Off) | Deep sleep (System Off) | Halts instead of sleeping |
 
 Pulsar v1 and the DIY build share the same XIAO module, so they run the same silicon — the
-carrier adds power management, the LED bar, and the rumble motor around it.
+carrier adds power management, the LED bar, and the motor output around it.
 
 ## First-Time Pairing
 
 1. **Power on** the adapter. The status light blinks briefly, then shows *searching* while it
    looks for the controller — red on Pulsar v1 and XIAO, LED4 on the DK.
 2. Once the controller is detected, the status light turns green (LED3 on the DK).
+
+> **Pulsar v1 waits for your host before it powers the controller.** The adapter only
+> switches on the controller's 5 V supply once a Bluetooth host is connected, so that a
+> plugged-in adapter sitting idle charges its battery instead of running the controller.
+> Until you pair, the controller is unpowered and a docked VMU is blank — that is normal.
+> The moment your host connects, the VMU chirps as it powers up and the status light goes
+> green. So on this board, expect to pair *first* and see the controller come alive
+> *after*, which is the reverse of steps 1 and 2 above.
 3. The adapter automatically enters **pairing mode** on first boot (since no device is bonded yet). It will be discoverable for 60 seconds.
 4. On your host device, open Bluetooth settings and look for **"Xbox Wireless Controller"**.
 5. Select it to pair. The LED will turn solid to indicate a connection.
@@ -79,12 +87,21 @@ The Dreamcast pad has no Guide button, so it's a chord: **pull Left Trigger + Ri
 | Short press | Wake / request reconnect |
 | Hold 2s | Pairing mode (60s) — clears the current bond |
 | Hold 3.5s **+ controller Start** | Firmware update mode (OTA) — *Pulsar v1 only* |
+| Tap, tap, then hold 3.5s | Same update mode, **no controller needed** — *Pulsar v1 only* |
+| **Tap once, then hold 3.5s** | **Browser configuration mode** — [remap buttons](#remapping-buttons-from-your-browser) |
 | Hold 7s | Sleep — shows `BYE`, releases into deep sleep (the DK halts instead) |
 | Triple-press | Switch profile (Xbox ⇄ Dreamcast) and reboot |
 
+The three tap-then-hold gestures are told apart by the **number of taps before the hold**:
+one tap is configuration, two is controller-free update, three short presses (no hold at
+all) is the profile toggle. Begin the hold within about two seconds of the first tap, or it
+counts as an ordinary hold.
+
 The sync LED blinks faster once you pass 2s, so you can see the next step coming before you reach it. Release at that point to pair; keep holding to sleep.
 
-**Firmware update** needs both hands: hold the sync button past 3.5s *while* the Dreamcast controller's **Start** button is held. Three fast flashes confirm it. Requiring the controller means it cannot fire from pairing mode or with nothing plugged in. It is refused on a low battery unless you are charging — the display shows `CHRG` if so. Holding past 3.5s with Start down does **not** clear your pairing.
+**Firmware update** has two routes. The usual one needs both hands: hold the sync button past 3.5s *while* the Dreamcast controller's **Start** button is held. Three fast flashes confirm it. It is refused **below 50% battery** unless you are charging — the display shows `CHRG` if so. Holding past 3.5s with Start down does **not** clear your pairing.
+
+The second route needs no controller at all: **tap the sync button twice, then hold it past 3.5s**. Begin the hold within about two seconds of the first tap, or it counts as an ordinary hold. Two taps rather than three keeps it distinct from the profile toggle, which is three *short* presses. This exists so an adapter with nothing plugged in — or with a controller that has stopped responding — can still be updated.
 
 This gesture is for **Pulsar v1**, which updates wirelessly. On a XIAO or DK build the gesture does nothing useful — those boards are reflashed over USB or a probe instead. See [Updating the firmware](#updating-the-firmware).
 
@@ -102,6 +119,41 @@ The **Dreamcast** profile is **not** a Dreamcast-controller emulation — it's j
 | **Dreamcast** | A plain, generic BLE HID gamepad (neutral identity — only the Bluetooth name is Dreamcast-branded) — Android, simple HID consumers, or hosts where you'd rather not present as Xbox | Dreamcast Wireless Controller |
 
 After switching, forget the adapter on your host and pair again so it picks up the new HID layout. The profile is saved to flash.
+
+## Remapping Buttons From Your Browser
+
+**Firmware 243 or later.** You can change what every Dreamcast control sends. The saved map
+lives on the adapter, applies to **both profiles**, and follows the controller to every host
+you pair with — there is nothing to install on the host and nothing to re-do when you switch
+computers.
+
+### Entering configuration mode
+
+**Tap sync once, then press it again and hold through 3.5 seconds**, until the adapter
+resets. It disconnects from your host and advertises as **`Pulsar Configure`** for 60
+seconds.
+
+This is a separate, unbonded identity: while it is in configuration mode the adapter is not
+a gamepad, has no bond, and will not appear as a controller. Anything that ends the session
+— finishing, disconnecting, letting the 60 seconds lapse, or losing power — resets it
+straight back to normal operation with your existing pairing intact.
+
+### Making changes
+
+Open the configure page in **Chrome or Edge on a computer, or Chrome on Android** (it uses
+Web Bluetooth, which Safari and Firefox do not implement), connect to `Pulsar Configure`,
+and you get a live view of the controller: press a button and you see it register. Changes
+**preview live** on the adapter before you commit them, so you can try a layout and feel it
+working. Nothing is written to flash until you choose to save.
+
+> **Only the durable map survives.** A preview is exactly that — if the session ends while
+> you are previewing, the adapter reverts to the last map you saved. Save before you walk
+> away.
+
+### On the other boards
+
+Remapping is board-independent — it is the same firmware, and a XIAO or DK build enters
+configuration mode with the same gesture and is configured the same way.
 
 ## VMU Display
 
@@ -122,14 +174,16 @@ The adapter draws on the VMU LCD while connected — a profile splash on every c
 
 The profile splash holds for ~30 seconds after connect, then transitions to the rotating pulsar with battery indicator.
 
-> **Battery note:** the VMU updates ~6 times per second to animate the pulsar, plus extra writes on splash transitions. This costs roughly 5–10% of battery life vs. running with no LCD activity. Worth it for the visual feedback, but worth knowing.
+> **Battery note:** the VMU advances the pulsar animation about 4 times per second (every
+> ~260 ms), plus extra writes on splash transitions. This costs roughly 5–10% of battery life vs. running with no LCD activity. Worth it for the visual feedback, but worth knowing.
 
 ## Battery & Charging
 
 The adapter monitors the LiPo battery and reports the level over Bluetooth (visible in your host device's Bluetooth settings or supported games), and draws it on the VMU.
 
-- **Full charge:** 4.2V
-- **Empty:** 3.0V
+A single-cell LiPo runs from about 4.2 V charged down to about 3.3 V empty. The firmware's
+own curve treats **≥ 4.10 V as 100% and ≤ 3.30 V as 0%**, the measured cutoff — so the
+reported level reaches empty a little above the cell's absolute floor, deliberately.
 
 How the level is measured depends on the board:
 
@@ -147,16 +201,31 @@ rather than sliding down gradually. That's the gauge, not a fault.
 *The USB-C port faces out through the slot opening on the controller's underside — the
 adapter charges in place, and a VMU in the second slot is unaffected.*
 
+### The charging bolt
+
+While a charger is attached, the VMU's battery icon shows a **lightning bolt inside the
+outline instead of the level bars**. It is not an extra level — it replaces the reading, and
+the level returns the moment charging stops.
+
+This is deliberate. A charging pack's terminal voltage is pulled up by the charger, so the
+level read while charging is optimistic — a battery reading "full" that empties as soon as
+you unplug. Showing the bolt says *the reading is not meaningful right now* rather than
+quietly showing a wrong one.
+
+When the battery is genuinely critical the icon empties completely, which is the cue to
+plug in.
+
 Charge the battery over USB-C — on Pulsar v1 that's the carrier's own port, on a DIY build it's the XIAO's. A USB power brick or phone charger is recommended. **Note:** Some laptops (especially MacBooks) have smart USB ports that may reduce or cut power when the adapter is in deep sleep, since the USB peripheral is off and the laptop doesn't detect a device. If you notice the battery not charging from a laptop, either use a standard USB charger or keep the adapter awake while plugged in.
 
 ## Rumble
 
-**Pulsar v1 only.** The carrier drives an ERM motor, so games and hosts that send rumble
-commands over Bluetooth will make it buzz. Intensity follows what the host asks for.
+**No board rumbles at this revision.** Pulsar v1's carrier has a motor output (CN3) and the
+firmware drives it, but **no motor is fitted to units as shipped** — CN3 is left empty.
+Rumble commands from the host arrive and are ignored, which is harmless.
 
-The XIAO and DK builds have no motor — rumble commands arrive and are ignored, which is
-harmless. It does mean the Xbox profile advertises rumble support on every board, because the
-report is part of the profile the host expects, not a per-board capability.
+The XIAO and DK builds have no motor output at all. On every board the Xbox profile still
+advertises rumble support, because the report is part of the identity the host expects, not
+a per-board capability.
 
 ## Sleep & Wake
 
@@ -168,7 +237,10 @@ The adapter enters deep sleep to save battery in these situations:
 4. **Controller disconnected** for 60 seconds while BLE is connected (re-detect timeout).
 5. **No controller input** for 10 minutes while connected (inactivity timeout).
 
-When asleep, the adapter draws minimal power (~5 microamps). The battery charges normally from USB while asleep.
+When asleep, the nRF52840 itself draws microamps, but **the board around it draws more** —
+the LED rail and the power path stay powered, and the figure has not been characterized on
+Pulsar v1 yet. Treat deep sleep as low power, not as zero: expect a unit left for weeks to
+need charging. The battery charges normally from USB while asleep.
 
 **To wake up:** Press the sync button. The adapter performs a full restart and will reconnect to your paired device.
 
@@ -187,8 +259,8 @@ How you update depends on the board:
 
 **Pulsar v1 — wireless.** Hold sync past 3.5s with the controller's **Start** held; three fast
 flashes confirm it and the adapter reboots into update mode advertising as `PulsarDFU`. It is
-refused on a low battery unless you're charging, showing `CHRG` on the VMU — charge first and
-retry. The update is signed, so the adapter only accepts official firmware.
+refused **below 50% battery** unless you're charging, showing `CHRG` on the VMU — charge first
+and retry. The update is signed, so the adapter only accepts official firmware.
 
 > **There is no reset-button route into update mode on Pulsar v1, and no USB drive.**
 > Double-tapping reset does nothing, holding a button while powering on does nothing, and no
@@ -197,8 +269,10 @@ retry. The update is signed, so the adapter only accepts official firmware.
 >
 > Two consequences worth knowing before you need them:
 >
-> - **The gesture needs the controller attached**, because it checks that Start is held. With
->   no controller plugged in there is no way to enter update mode by hand.
+> - **You do not need the controller attached.** The sync + Start gesture checks that Start is
+>   held, but the tap-tap-hold chord — two taps, then hold past 3.5s — reaches update mode on
+>   its own. Older firmware had only the first route, so an adapter with nothing plugged in
+>   could not be updated by hand at all.
 > - **A failed or interrupted update is not a brick.** If the firmware is missing or
 >   incomplete, the adapter enters update mode on its own at power-on and waits to be
 >   re-flashed. Plug it in, reload the update page, and try again.
@@ -250,7 +324,7 @@ colours are deliberately dim to avoid glare through the shell window.
 |---|---|
 | Dim red | Searching for controller |
 | Dim green | Controller found / connected |
-| All dark | Sleeping or idle |
+| All dark | Sleeping, or idle and waiting for a host to connect |
 
 <p align="center"><img src="images/pulsar/edited/controller-back-led-bar.jpg" width="360" alt="Adapter in the VMU slot, status LED lighting the shell green"></p>
 
@@ -279,6 +353,12 @@ status light, on the DK it's LED1.
 
 ## Troubleshooting
 
+**Controller and VMU are dead until I connect a host (Pulsar v1)**
+- Expected. The adapter only powers the controller once a Bluetooth host is connected, so an
+  idle adapter charges instead of running the controller. Connect your host: the VMU chirps as
+  it powers up and the status light goes green. If it stays dark *after* connecting, work
+  through the entry below.
+
 **Controller not detected (status stays on *searching* — red, or LED4 on the DK)**
 - Check that the controller cable is securely connected to the adapter.
 - Make sure the controller is receiving 5V power.
@@ -295,7 +375,7 @@ status light, on the DK it's LED1.
 - Expected, and not fixable from your side. A DIY XIAO runs the Adafruit bootloader, whose update service Chrome blocks by policy. Update it over USB with the `.uf2` file instead.
 
 **I can't get into update mode — no controller attached (Pulsar v1)**
-- The gesture checks that the controller's Start is held, so it needs a controller plugged in. Attach one and retry. If the firmware itself is broken or missing, the adapter enters update mode on its own at power-on without any gesture.
+- Use the controller-free chord instead: tap sync twice, then hold it past 3.5s, starting the hold within about two seconds of the first tap. If the firmware itself is broken or missing, the adapter enters update mode on its own at power-on without any gesture.
 
 **It won't reconnect after a firmware update**
 - Expected when coming from v0.3.0 or earlier — the pairing does not survive that update. Forget the adapter on your host, hold sync for 2 seconds, and pair fresh. See [Updating the firmware](#updating-the-firmware).
@@ -304,7 +384,9 @@ status light, on the DK it's LED1.
 - Normal. The IP5306 gauge reports four levels, so the bar moves 100 → 75 → 50 → 25 rather than sliding down continuously.
 
 **Rumble does nothing**
-- Only Pulsar v1 has a motor. XIAO and DK builds accept rumble commands and ignore them.
+- Expected on every board at this revision. Pulsar v1 has a motor output but ships with no
+  motor fitted; XIAO and DK have no motor output at all. Rumble commands are accepted and
+  ignored. See [Rumble](#rumble).
 
 **Can't find "Xbox Wireless Controller" in Bluetooth**
 - The adapter may not be in pairing mode. Hold the sync button for 2 seconds to enter pairing mode.
