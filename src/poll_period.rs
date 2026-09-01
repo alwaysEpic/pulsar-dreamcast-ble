@@ -170,7 +170,10 @@ pub fn mark_loop_top() {
     let now = embassy_time::Instant::now().as_micros();
     let a = acc();
     if a.have_top {
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the value is clamped with .min(u32::MAX) immediately before the cast, so the narrowing saturates by construction"
+        )]
         let period_us = now.saturating_sub(a.last_top).min(u64::from(u32::MAX)) as u32;
         if period_us > DISCONTINUITY_US {
             // Re-detect / goodbye / other stall — drop the sample, keep the
@@ -210,7 +213,10 @@ pub fn record_gc(start: u32) {
 /// whole point (see [`mark_loop_top`]).
 pub fn record_sleep(start: u64) {
     let now = embassy_time::Instant::now().as_micros();
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the value is clamped with .min(u32::MAX) immediately before the cast, so the narrowing saturates by construction"
+    )]
     let us = now.saturating_sub(start).min(u64::from(u32::MAX)) as u32;
     acc().sleep_sum += us;
 }
@@ -241,13 +247,19 @@ pub fn inject(b: &mut [u8; 16]) {
         // event); a low or bursty rate means the gate is starving at the
         // source, upstream of any classification logic.
         _ => {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a debug telemetry counter; wrapping at 16 bits is intended, since the field is two bytes on the HID side-channel"
+            )]
             let n = crate::maple::radio_notify::notification_count() as u16;
             n
         }
     };
     b[4..6].copy_from_slice(&val.to_le_bytes());
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a debug window sequence counter; wrapping at 8 bits is intended, since the field is one byte on the HID side-channel"
+    )]
     {
         b[6] = WINDOW_SEQ.load(Ordering::Relaxed) as u8;
     }

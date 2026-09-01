@@ -30,9 +30,11 @@ pub const PIN_B_BIT: u32 = 3; // P0.03 (D1)
 /// This board deep-sleeps via System Off.
 pub const SUPPORTS_SLEEP: bool = true;
 
+/// This board can run the controller rail straight off USB.
+///
 /// The discrete carrier feeds USB 5 V to the controller rail through a Schottky
-/// diode, so while VBUS is present the boost can stay off and the controller
-/// runs straight off USB. This is the *only* board with that path.
+/// diode, so while VBUS is present the boost can stay off. This is the *only*
+/// board with that path.
 pub const HAS_USB_PASSTHROUGH: bool = true;
 
 /// Onboard-RGB status indicator (searching = red solid, connected = green solid).
@@ -43,7 +45,8 @@ pub struct StatusIndicator {
 
 impl StatusIndicator {
     /// Build from the configured R and G channel outputs (active LOW).
-    pub fn new(led_r: Output<'static>, led_g: Output<'static>) -> Self {
+    #[must_use]
+    pub const fn new(led_r: Output<'static>, led_g: Output<'static>) -> Self {
         Self { led_r, led_g }
     }
 
@@ -76,16 +79,13 @@ impl StatusIndicator {
     }
 
     /// Battery gauge — no-op. Onboard RGB is a single LED — no room for a gauge.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn set_battery(&mut self, _percent: Option<u8>) {}
+    pub const fn set_battery(&mut self, _percent: Option<u8>) {}
 
     /// TX activity indicator — no-op on XIAO (avoids flicker).
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn tx_activity_on(&mut self) {}
+    pub const fn tx_activity_on(&mut self) {}
 
     /// TX activity indicator off — no-op.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn tx_activity_off(&mut self) {}
+    pub const fn tx_activity_off(&mut self) {}
 }
 
 embassy_nrf::bind_interrupts!(struct SaadcIrqs {
@@ -113,28 +113,32 @@ impl Power {
     }
 
     /// No configuration to re-assert. Discrete boost has no I²C config to drift.
-    #[allow(clippy::unused_self, clippy::unused_async)] // uniform contract API
+    #[expect(
+        clippy::unused_async,
+        reason = "the board contract (ADR-013) fixes this signature so all three boards expose \
+              one API; this board answers without awaiting"
+    )]
     pub async fn refresh_config(&mut self) -> bool {
         false
     }
 
     /// Boost-off for sleep is handled inside [`enter_sleep`] (P0.28 SHDN held LOW
     /// through System Off), so there is nothing extra to do here.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn prepare_for_sleep(&mut self) {}
+    pub const fn prepare_for_sleep(&mut self) {}
 
     /// USB VBUS present → controller can run off USB 5V (boost not needed).
-    #[allow(clippy::unused_self)] // uniform contract API (state-free on XIAO)
+    #[must_use]
     pub fn is_externally_powered(&self) -> bool {
         is_usb_connected()
     }
 
     /// BQ25101 STAT: LOW = charging.
+    #[must_use]
     pub fn is_charging(&self) -> bool {
         self.charge_stat.is_low()
     }
 
-    /// Sample the battery. Returns voltage, SoC %, and charge state.
+    /// Sample the battery. Returns voltage, `SoC` %, and charge state.
     pub async fn battery(&mut self) -> Option<BatteryStatus> {
         let charging = self.charge_stat.is_low();
         let (millivolts, percent) = self.battery.read(charging).await;
@@ -151,8 +155,7 @@ pub struct Rumble;
 
 impl Rumble {
     /// No motor on the XIAO carrier.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn set(&mut self, _intensity: u8) {}
+    pub const fn set(&mut self, _intensity: u8) {}
 }
 
 /// Initialized board pins, ready for use by the main task.
@@ -167,7 +170,7 @@ pub struct BoardPins {
 }
 
 /// Board-specific Embassy config: enable the DC/DC regulator (REG1).
-pub fn configure_embassy(config: &mut embassy_nrf::config::Config) {
+pub const fn configure_embassy(config: &mut embassy_nrf::config::Config) {
     xiao_common::configure_dcdc(config);
 }
 
@@ -175,21 +178,36 @@ pub fn configure_embassy(config: &mut embassy_nrf::config::Config) {
 /// boost-SHDN pin), then park the onboard QSPI flash in Deep Power Down.
 ///
 /// # Safety
-/// Writes directly to PIN_CNF/GPIO registers; call once at early boot before
+/// Writes directly to `PIN_CNF/GPIO` registers; call once at early boot before
 /// any Embassy pin peripherals are configured.
 pub unsafe fn early_init() {
-    // Skip P0.28 (boost SHDN) so its LOW state survives — a Hi-Z here lets the
-    // Pololu's pull-up momentarily enable 5V.
-    xiao_common::disconnect_all_pins(Some(28));
-    xiao_common::sense_peripherals_off();
-    xiao_common::qspi_flash_deep_power_down();
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "one early-boot housekeeping sequence, ordered: pins are parked \
+                  before the QSPI lines are bit-banged into deep power down"
+    )]
+    // SAFETY: each callee requires that it run at early boot before Embassy
+    // claims any pin, which is exactly this function's own `# Safety` contract
+    // above — so the obligation passes straight through to our caller. P0.28 is
+    // skipped deliberately: a Hi-Z there lets the Pololu's pull-up re-enable 5V.
+    unsafe {
+        // Skip P0.28 (boost SHDN) so its LOW state survives — a Hi-Z here lets the
+        // Pololu's pull-up momentarily enable 5V.
+        xiao_common::disconnect_all_pins(Some(28));
+        xiao_common::sense_peripherals_off();
+        xiao_common::qspi_flash_deep_power_down();
+    }
 }
 
 /// Initialize all board pins and peripherals from the HAL singletons.
 ///
 /// The boost starts OFF (enabled later on BLE connect). Charge current is set
 /// to 100 mA (P0.13 LOW). The blue LED channel becomes `sync_led`.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "sdcka/sdckb are the Maple Bus signal names from the protocol spec; renaming them would break the correspondence to the wiring"
+)]
+#[must_use]
 pub fn init(p: Peripherals) -> BoardPins {
     let sdcka = Flex::new(p.P0_05);
     let sdckb = Flex::new(p.P0_03);
@@ -229,8 +247,14 @@ pub fn init(p: Peripherals) -> BoardPins {
 /// # Safety
 /// Does not return. The `SoftDevice` must be initialized.
 pub unsafe fn enter_sleep() -> ! {
-    // early_off: P0.28 boost off before teardown; hold: P0.28 + P0.13 LOW.
-    xiao_common::enter_system_off(&[28], &[(28, false), (13, false)])
+    // SAFETY: `enter_system_off` requires an initialised SoftDevice and pin lists
+    // valid for this board — the former is this function's own `# Safety`
+    // contract, and P0.28 (boost) / P0.13 are the carrier's boost-SHDN and
+    // charge-ISET nets, which must be driven LOW across sleep.
+    unsafe {
+        // early_off: P0.28 boost off before teardown; hold: P0.28 + P0.13 LOW.
+        xiao_common::enter_system_off(&[28], &[(28, false), (13, false)])
+    }
 }
 
 /// USB VBUS presence via the nRF52840 POWER peripheral.
@@ -277,7 +301,11 @@ impl BatteryReader {
     ///
     /// When `charging` is false the percentage is monotonic-decreasing to hide
     /// voltage-recovery bounces; it resets while charging.
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "SAADC counts are non-negative once the divider settles, and the percentage returned by lipo_voltage_to_percent is 0-100 by construction"
+    )]
     async fn read(&mut self, charging: bool) -> (u32, u8) {
         self.enable.set_low(); // enable divider
         Timer::after(Duration::from_micros(100)).await;
@@ -292,12 +320,12 @@ impl BatteryReader {
         let v_bat_mv = (u64::from(raw) * 10_663 / 4095) as u32;
 
         let mut percent = lipo_voltage_to_percent(v_bat_mv);
-        if charging {
-            self.last_percent = percent;
-        } else {
+        if !charging {
+            // Discharge is monotonic: never let the reported level climb back up
+            // on a noisy read. Charging is allowed to move it either way.
             percent = percent.min(self.last_percent);
-            self.last_percent = percent;
         }
+        self.last_percent = percent;
 
         crate::log!("BAT: {}mV {}%", v_bat_mv, percent);
         (v_bat_mv, percent)
@@ -305,7 +333,10 @@ impl BatteryReader {
 }
 
 /// LiPo voltage (mV) → percentage. 100% ≥ 4100mV, 0% ≤ 3300mV (measured cutoff).
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "every percentage in TABLE is 0-100, so the interpolated result fits u8"
+)]
 fn lipo_voltage_to_percent(mv: u32) -> u8 {
     const TABLE: [(u32, u8); 9] = [
         (4100, 100),

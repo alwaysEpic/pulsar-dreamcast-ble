@@ -13,7 +13,7 @@ use crate::{PROFILE_CHANGE, SYNC_MODE};
 // thresholds live and where the release rules are unit-tested off-target. This
 // file supplies the clock and performs the side effects; it does not re-derive
 // the decision. See `maple_protocol::sync_hold`.
-use maple_protocol::sync_hold::{Release, SyncHold, Tick};
+use maple_protocol::sync_hold::{Release, SyncHold, Tick, DFU_MS};
 const BLINK_INTERVAL_MS: u64 = 100;
 const TRIPLE_PRESS_WINDOW_MS: u64 = 2000;
 
@@ -25,23 +25,43 @@ enum HoldResult {
     SyncMode,
     /// Held 7s — goodbye splash + System Off in progress.
     Goodbye,
+    /// The DFU gesture was taken. Distinct from `ShortPress` on purpose: the
+    /// caller must **not** count this as a press. `main`'s battery gate can
+    /// refuse the update after the fact, and with the tap-tap-hold chord the
+    /// press counter is already at 2 — counting the release would make it 3 and
+    /// fire the profile toggle as a parting gift for a refused update.
+    DfuRequested,
+    /// The one-tap-then-hold configuration gesture was taken. Kept distinct
+    /// so a failed marker write cannot fall through into pairing and erase the
+    /// game-host bond.
+    ConfigRequested,
 }
 
-/// Wait while button is held, blinking LED and checking for sync (2s) /
-/// OTA DFU (3.5s + controller Start) / sleep (7s).
+/// Wait while button is held, blinking LED and checking for sync (2s), isolated
+/// configuration (tap-hold at 3.5s), OTA DFU (3.5s, armed by controller Start
+/// or the tap-tap-hold chord, with priority over configuration), or sleep (7s).
 ///
 /// Returns `ShortPress` if released early, `SyncMode` if held past 2s but released
 /// before 7s. If held 7s, enters System Off directly (never returns on XIAO).
-/// If held past 3.5s while the controller's Start button is down, reboots into
-/// the bootloader's BLE OTA DFU mode (never returns). Sync mode is only
-/// signaled on release — holding through to sleep skips sync so the bond is
-/// preserved and the device reconnects on wake.
-async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) -> HoldResult {
+/// If held past 3.5s while DFU is armed, requests the bootloader's BLE OTA DFU
+/// mode. Sync mode is only signaled on release — holding through to sleep skips
+/// sync so the bond is preserved and the device reconnects on wake.
+///
+/// `dfu_chord_armed` is the caller's tap-tap-hold determination. It is OR'd with
+/// the controller's Start mirror, so either arms DFU — see
+/// [`maple_protocol::sync_hold`] for why the controller-independent path exists.
+async fn handle_button_hold(
+    button: &Input<'static>,
+    led: &mut Output<'static>,
+    dfu_chord_armed: bool,
+    config_chord_armed: bool,
+) -> HoldResult {
     let press_start = Instant::now();
     let mut led_state = false;
     let mut last_blink = Instant::now();
     let mut gesture = SyncHold::default();
     let mut past_sync_threshold = false;
+    let mut config_requested = false;
 
     while button.is_low() {
         let elapsed = press_start.elapsed().as_millis();
@@ -62,10 +82,9 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
             last_blink = Instant::now();
         }
 
-        let tick = gesture.tick(
-            elapsed,
-            crate::MAPLE_START_HELD.load(core::sync::atomic::Ordering::Relaxed),
-        );
+        let dfu_armed =
+            dfu_chord_armed || crate::MAPLE_START_HELD.load(core::sync::atomic::Ordering::Relaxed);
+        let tick = gesture.tick(elapsed, dfu_armed);
 
         if tick == Tick::CommitSleep {
             log!("SYNC: 7s hold — sleep committed, rendering goodbye");
@@ -92,13 +111,19 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
             log!("SYNC: Past sync threshold, release for pairing or keep holding for sleep");
         }
 
-        // OTA DFU gesture: sync held past 3.5s WITH the controller's Start button
-        // down. Checked every iteration of the 3.5s..7s window (not just at the
-        // crossing) so Start pressed mid-hold still counts, and a transient
-        // failed poll clearing the mirror only delays the trigger by one 20ms
-        // tick. `MAPLE_START_HELD` is only ever true while a controller is
-        // being polled, so this can't fire from sync mode or Phase 1 — and a
-        // 3.5s two-board chord can't fire by accident.
+        // OTA DFU gesture: sync held past 3.5s with DFU armed — either by the
+        // controller's Start button, or by the tap-tap-hold chord. Checked every
+        // iteration of the 3.5s..7s window (not just at the crossing) so Start
+        // pressed mid-hold still counts, and a transient failed poll clearing the
+        // mirror only delays the trigger by one 20ms tick.
+        //
+        // The Start path cannot fire from sync mode or Phase 1, because
+        // `MAPLE_START_HELD` is only ever true while a controller is being polled.
+        // That was originally stated as a safety property; it is really a
+        // limitation, and it locked out exactly the units that most needed an
+        // update — no controller docked, or a Maple side that had stopped
+        // answering. The chord reaches those, and needs two deliberate taps
+        // immediately before a 3.5s hold, so it cannot fire by accident either.
         //
         // This only *requests* the reboot (see `DFU_PENDING`): the main task
         // owns the bus, so it lands a BOOT splash on the VMU and resets
@@ -107,7 +132,10 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
         // dropped (BLE falls over in the same instant), holding through to
         // 7s still sleeps — no stuck state.
         if tick == Tick::RequestDfu {
-            log!("SYNC: DFU gesture (sync+Start 3.5s) — requesting OTA bootloader");
+            log!(
+                "SYNC: DFU gesture at 3.5s (chord={}) — requesting OTA bootloader",
+                dfu_chord_armed
+            );
             crate::DFU_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
             // Distinct confirmation: a fast triple flash (the reset usually
             // lands mid-flash — that's fine, the flag is already set).
@@ -119,6 +147,24 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
             }
         }
 
+        // Browser configuration: one short tap followed by a hold through the
+        // same 3.5 s threshold. DFU is evaluated above and wins whenever Start
+        // or the tap-tap chord arms it. A failed marker write is latched as a
+        // configuration attempt so release cannot enter sync mode and clear the
+        // existing game-host bond.
+        if elapsed >= DFU_MS
+            && config_chord_armed
+            && !dfu_armed
+            && !gesture.dfu_requested()
+            && !config_requested
+        {
+            config_requested = true;
+            log!("SYNC: configuration gesture — requesting isolated personality");
+            if !crate::reboot_into_config() {
+                log!("SYNC: GPREGRET2 configuration marker write failed");
+            }
+        }
+
         Timer::after(Duration::from_millis(20)).await;
     }
 
@@ -127,6 +173,10 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
     // the user asking to update firmware has not asked to be unpaired; without
     // this guard, a DFU request that the low-battery check refuses still costs
     // them their pairing on release.
+    if config_requested {
+        return HoldResult::ConfigRequested;
+    }
+
     match gesture.release() {
         Release::SyncMode => {
             log!("SYNC: Entering pairing mode (60s)");
@@ -136,13 +186,33 @@ async fn handle_button_hold(button: &Input<'static>, led: &mut Output<'static>) 
         // Deliberately not SyncMode: pairing clears the bond, and asking for a
         // firmware update is not asking to be unpaired. Covered by
         // `sync_hold::tests::dfu_gesture_does_not_clear_the_bond`.
-        Release::DfuRequested | Release::ShortPress => HoldResult::ShortPress,
+        Release::DfuRequested => HoldResult::DfuRequested,
+        Release::ShortPress => HoldResult::ShortPress,
     }
+}
+
+/// Sleep up to `ms`, returning `true` early the moment the button goes down.
+///
+/// Sync mode blinks on a 200 ms cadence and used to sleep straight through both
+/// halves, so a press was only noticed every ~400 ms. That is far too coarse for
+/// the tap-tap-hold chord, whose whole run has to fit inside
+/// `DFU_CHORD_WINDOW_MS` — two taps at 400 ms granularity can eat the entire
+/// window before the hold even starts. Poll at the same 20 ms cadence the hold
+/// machine uses.
+async fn blink_wait(button: &Input<'static>, ms: u64) -> bool {
+    let start = Instant::now();
+    while start.elapsed().as_millis() < ms {
+        if button.is_low() {
+            return true;
+        }
+        Timer::after(Duration::from_millis(20)).await;
+    }
+    button.is_low()
 }
 
 /// Handle triple-press detection and profile toggle.
 async fn handle_triple_press(led: &mut Output<'static>) {
-    let current = crate::ble::flash_bond::load_profile();
+    let current = crate::ble::prefs::load_prefs().profile_id;
     let next = current.next();
     log!(
         "PROFILE: Triple-press! Switching {} -> {}",
@@ -165,6 +235,8 @@ async fn handle_triple_press(led: &mut Output<'static>) {
 ///
 /// - Hold 2 seconds: enter pairing/sync mode
 /// - Hold 3.5 seconds with controller Start held: reboot into OTA DFU mode
+/// - **Tap, tap, then hold 3.5 seconds: same OTA DFU mode, no controller needed**
+/// - **Tap once, then hold 3.5 seconds: reboot into isolated browser configuration**
 /// - Hold 7 seconds: enter System Off (manual sleep)
 /// - Triple-press within 2 seconds: toggle BLE profile (Xbox <-> Generic) and reset
 ///
@@ -190,9 +262,11 @@ pub async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) 
             }
             ConnectionState::SyncMode => {
                 led.set_low();
-                Timer::after(Duration::from_millis(200)).await;
-                led.set_high();
-                Timer::after(Duration::from_millis(200)).await;
+                let mut pressed = blink_wait(&button, 200).await;
+                if !pressed {
+                    led.set_high();
+                    pressed = blink_wait(&button, 200).await;
+                }
 
                 // A press while advertising must still be measured as a hold
                 // gesture. This previously just spun until release and threw the
@@ -205,8 +279,41 @@ pub async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) 
                 // work inside: `Goodbye` set the flag (Phase 1 renders BYE and
                 // sleeps), `SyncMode` re-signals a mode we are already in, and
                 // `ShortPress` is a no-op here — matching the old drain.
-                if button.is_low() {
-                    let _ = handle_button_hold(&button, &mut led).await;
+                // The press counter is maintained here too, so the DFU chord can
+                // arm while advertising. It previously could not: this branch
+                // discarded the result and passed `chord = false`, which made
+                // "advertising, not yet paired" — a normal state to want to
+                // reflash from — the one state the controller-free gesture was
+                // unusable in. Found the hard way on 2026-08-17, when the chord
+                // appeared not to work at all.
+                if pressed {
+                    if press_count > 0
+                        && first_press_time.elapsed().as_millis() >= TRIPLE_PRESS_WINDOW_MS
+                    {
+                        press_count = 0;
+                    }
+                    let since_first = first_press_time.elapsed().as_millis();
+                    let chord =
+                        maple_protocol::sync_hold::dfu_chord_armed(press_count, since_first);
+                    let config_chord =
+                        maple_protocol::sync_hold::config_chord_armed(press_count, since_first);
+                    match handle_button_hold(&button, &mut led, chord, config_chord).await {
+                        HoldResult::ShortPress => {
+                            if press_count == 0 {
+                                first_press_time = Instant::now();
+                            }
+                            press_count += 1;
+                        }
+                        // Goodbye already set its flag, SyncMode re-signals a mode
+                        // we are already in, and DfuRequested must not count as a
+                        // press — all three just reset the run.
+                        HoldResult::SyncMode
+                        | HoldResult::Goodbye
+                        | HoldResult::DfuRequested
+                        | HoldResult::ConfigRequested => {
+                            press_count = 0;
+                        }
+                    }
                     Timer::after(Duration::from_millis(100)).await;
                 }
                 continue;
@@ -225,9 +332,24 @@ pub async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) 
             continue;
         }
 
-        // Button pressed — detect hold gesture
-        match handle_button_hold(&button, &mut led).await {
-            HoldResult::SyncMode | HoldResult::Goodbye => {
+        // Button pressed — detect hold gesture. Any taps already counted in this
+        // window arm the controller-free DFU chord: "tap, tap, hold" reaches here
+        // with `press_count == 2`, because the hold itself is the third press and
+        // so was never counted as a short one.
+        let since_first = first_press_time.elapsed().as_millis();
+        let chord = maple_protocol::sync_hold::dfu_chord_armed(press_count, since_first);
+        let config_chord = maple_protocol::sync_hold::config_chord_armed(press_count, since_first);
+
+        match handle_button_hold(&button, &mut led, chord, config_chord).await {
+            // `DfuRequested` belongs here rather than with `ShortPress`: it must
+            // reset the counter without signalling wake or counting a press.
+            // `main` may still refuse on the battery gate, and with the chord the
+            // counter is already at 2 — counting this release would make it 3 and
+            // toggle the profile as a parting gift for a refused update.
+            HoldResult::SyncMode
+            | HoldResult::Goodbye
+            | HoldResult::DfuRequested
+            | HoldResult::ConfigRequested => {
                 press_count = 0;
             }
             HoldResult::ShortPress => {

@@ -40,8 +40,13 @@ pub const PIN_B_BIT: u32 = 3; // P0.03 (D1)
 pub const SUPPORTS_SLEEP: bool = true;
 
 /// No USB passthrough: +5 V is the IP5306's own boost, up whether or not
-/// anything is plugged into the USB-C port. There is no external supply for the
-/// controller rail to fall back on, so `rail_on`/`rail_off` have nothing to do.
+/// anything is plugged into the USB-C port.
+///
+/// There is no external supply for the controller rail to fall back on, so
+/// `main.rs` never gates `rail_on`/`rail_off` on VBUS here — but the pair is
+/// real all the same: it switches the IP5306 boost on BLE connect/disconnect
+/// (ADR-005), which is what lets a plugged-in unit charge while idle instead
+/// of feeding the controller.
 pub const HAS_USB_PASSTHROUGH: bool = false;
 
 // ── Status indicator: 5-LED WS2812 bar with Xbox-style player number ─────────
@@ -88,7 +93,8 @@ pub struct StatusIndicator {
 
 impl StatusIndicator {
     /// Build from the configured WS2812 driver.
-    pub fn new(leds: Ws2812) -> Self {
+    #[must_use]
+    pub const fn new(leds: Ws2812) -> Self {
         Self {
             leds,
             status: Rgb::OFF,
@@ -162,19 +168,20 @@ impl StatusIndicator {
     }
 
     /// TX activity — no-op (the bar shows status/player, not per-poll flicker).
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn tx_activity_on(&mut self) {}
+    pub const fn tx_activity_on(&mut self) {}
 
     /// TX activity off — no-op.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn tx_activity_off(&mut self) {}
+    pub const fn tx_activity_off(&mut self) {}
 }
 
 // ── Power: IP5306 I²C (charge + boost + coarse fuel gauge) ────────────────────
 
-/// Power subsystem backed by the IP5306-I²C IC. The 5 V boost is autonomous
-/// (enabled at init and periodically re-asserted), so there is no rail to
-/// toggle; charge state and battery level are read over I²C.
+/// Power subsystem backed by the IP5306-I²C IC.
+///
+/// The 5 V boost is switched over I²C — up only while a BLE host is connected
+/// (`rail_on`/`rail_off`, ADR-005), re-asserted periodically while up, and
+/// down again for System Off. Charge state and battery level are read over
+/// the same bus.
 pub struct Power {
     ip5306: Ip5306,
     /// Charge/power state cached from the last `battery()` read, so the frequent,
@@ -185,18 +192,33 @@ pub struct Power {
 }
 
 impl Power {
-    /// IP5306 auto-boosts; nothing to toggle (rail stays up via init config).
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn rail_on(&mut self) {}
+    /// Enable the IP5306 boost (on BLE connect, and ahead of the Phase 1 VMU
+    /// splashes). Blocking RMW — a phase-transition write, never per poll.
+    ///
+    /// Until 2026-08-18 this was a no-op and the boost ran from `blocking_init`
+    /// onward, so a plugged-in unit fed the controller instead of the pack and
+    /// charging while awake was effectively broken. The rail is not USB-gated
+    /// here (`HAS_USB_PASSTHROUGH` is false) — it is BLE-gated, per ADR-005.
+    pub fn rail_on(&mut self) {
+        self.ip5306.blocking_boost_on();
+    }
 
-    /// IP5306 auto-boosts; nothing to toggle.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn rail_off(&mut self) {}
+    /// Disable the IP5306 boost (on BLE disconnect). Charger stays on, so an
+    /// idle plugged-in unit charges the pack rather than the controller.
+    ///
+    /// The VMU is unpowered while the rail is down: any Phase 1 splash (BYE,
+    /// DFU BOOT) has to `rail_on()` and settle first — see `main.rs`.
+    pub fn rail_off(&mut self) {
+        self.ip5306.blocking_boost_off();
+    }
 
     /// Power the 5 V boost down before System Off so it can't drain the battery
     /// while asleep (the deep-discharge path). The XIAO keeps running off LDO1,
-    /// so this only powers down the controller rail; the boost is re-enabled on
-    /// wake by `init` → `blocking_init`. Charger stays on for charge-while-asleep.
+    /// so this only powers down the controller rail. Charger stays on for
+    /// charge-while-asleep. Same write as `rail_off` — usually already landed
+    /// (sleep is entered from Phase 1, or from Phase 3 after `rail_off`), but
+    /// the Phase 1 goodbye path brings the rail up for the BYE splash, so this
+    /// is not redundant.
     pub fn prepare_for_sleep(&mut self) {
         self.ip5306.blocking_boost_off();
     }
@@ -210,19 +232,22 @@ impl Power {
     /// Kept for board-contract conformance. Note the `is_full()` I²C read that
     /// maintains `self.powered` is therefore only feeding diagnostics — prune it
     /// once the `0x78` characterization is done (needs a timing capture).
-    pub fn is_externally_powered(&self) -> bool {
+    #[must_use]
+    pub const fn is_externally_powered(&self) -> bool {
         self.powered
     }
 
-    /// Re-assert the IP5306 configuration; `true` if it had actually drifted.
-    /// See [`Ip5306::refresh_config`] — the registers are otherwise written once
-    /// at boot and never checked again.
+    /// Re-assert the rail-up IP5306 configuration; `true` if it had actually
+    /// drifted. See [`Ip5306::refresh_config`] — the register is otherwise
+    /// written at connect/disconnect and never checked between. **Phase 2/3
+    /// only**: it asserts the boost, so it would undo `rail_off` in Phase 1.
     pub async fn refresh_config(&mut self) -> bool {
         self.ip5306.refresh_config().await
     }
 
     /// Charge state, cached from the last `battery()` read (no I²C on this path).
-    pub fn is_charging(&self) -> bool {
+    #[must_use]
+    pub const fn is_charging(&self) -> bool {
         self.charging
     }
 
@@ -281,6 +306,7 @@ pub struct Rumble {
 
 impl Rumble {
     /// Configure PWM1 on the rumble pin (starts off).
+    #[must_use]
     pub fn new(
         pwm: Peri<'static, PWM1>,
         pin: Peri<'static, embassy_nrf::peripherals::P0_29>,
@@ -316,6 +342,10 @@ impl Rumble {
     /// audible; small ERMs whine at 1 kHz, and rumble drivers normally sit at
     /// 20–30 kHz to stay above hearing. Decide this deliberately before shipping
     /// a motor. (`ch0_idle_level: Level::Low` is correct — motor off when idle.)
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the product is bounded by max_duty, which the PWM peripheral caps at 15 bits"
+    )]
     pub fn set(&mut self, intensity: u8) {
         let duty = (u32::from(intensity) * u32::from(self.max_duty) / 255) as u16;
         self.pwm.set_duty(0, DutyCycle::inverted(duty));
@@ -334,7 +364,7 @@ pub struct BoardPins {
 }
 
 /// Board-specific Embassy config: enable the DC/DC regulator (REG1).
-pub fn configure_embassy(config: &mut embassy_nrf::config::Config) {
+pub const fn configure_embassy(config: &mut embassy_nrf::config::Config) {
     xiao_common::configure_dcdc(config);
 }
 
@@ -342,19 +372,33 @@ pub fn configure_embassy(config: &mut embassy_nrf::config::Config) {
 /// the onboard QSPI flash in Deep Power Down. No boost-EN pin to preserve.
 ///
 /// # Safety
-/// Writes directly to PIN_CNF/GPIO registers; call once at early boot before
+/// Writes directly to `PIN_CNF/GPIO` registers; call once at early boot before
 /// any Embassy pin peripherals are configured.
 pub unsafe fn early_init() {
-    xiao_common::disconnect_all_pins(None);
-    xiao_common::sense_peripherals_off();
-    xiao_common::qspi_flash_deep_power_down();
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "one early-boot housekeeping sequence, ordered: pins are parked \
+                  before the QSPI lines are bit-banged into deep power down"
+    )]
+    // SAFETY: each callee requires that it run at early boot before Embassy
+    // claims any pin, which is exactly this function's own `# Safety` contract
+    // (above) — so the obligation is passed straight through to our caller.
+    unsafe {
+        xiao_common::disconnect_all_pins(None);
+        xiao_common::sense_peripherals_off();
+        xiao_common::qspi_flash_deep_power_down();
+    }
 }
 
 /// Initialize the Phase-1 board pins from the HAL singletons.
 ///
 /// Maple on D0/D1, sync on D10, status on the onboard RGB. The I²C / NeoPixel /
 /// rumble pins are left in `p` for their drivers to claim in later phases.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "sdcka/sdckb are the Maple Bus signal names from the protocol spec; renaming them would break the correspondence to the wiring"
+)]
+#[must_use]
 pub fn init(p: Peripherals) -> BoardPins {
     let sdcka = Flex::new(p.P0_02);
     let sdckb = Flex::new(p.P0_03);
@@ -365,9 +409,10 @@ pub fn init(p: Peripherals) -> BoardPins {
     // 5-LED WS2812 status bar on P0.28 (D2), driven by PWM2 (PWM0 is the Maple TX).
     let leds = Ws2812::new(p.PWM2, p.P0_28);
 
-    // IP5306 power IC on I²C (SDA P0.04, SCL P0.05). Enable the 5 V boost and the
-    // charger immediately, preserving every other bit (the datasheet requires
-    // read-modify-write; `SYS_CTL0` has reserved bits with non-zero resets).
+    // IP5306 power IC on I²C (SDA P0.04, SCL P0.05). Charger on, 5 V boost off
+    // until a BLE host connects (`rail_on`), preserving every other bit (the
+    // datasheet requires read-modify-write; `SYS_CTL0` has reserved bits with
+    // non-zero resets).
     let mut ip5306 = Ip5306::new(p.TWISPI0, p.P0_04, p.P0_05);
     ip5306.blocking_init();
 
@@ -389,12 +434,19 @@ pub fn init(p: Peripherals) -> BoardPins {
     }
 }
 
-/// Enter System Off. No boost/charge pins to hold — the 5 V boost is powered
+/// Enter System Off.
+///
+/// No boost/charge pins to hold — the 5 V boost is powered
 /// down over I²C by [`Power::prepare_for_sleep`] just before this is called, and
 /// the IP5306 keeps managing charge/battery independently. Does not return.
 ///
 /// # Safety
 /// Does not return. The `SoftDevice` must be initialized.
 pub unsafe fn enter_sleep() -> ! {
-    xiao_common::enter_system_off(&[], &[])
+    // SAFETY: `enter_system_off` requires an initialised SoftDevice and pin
+    // lists valid for this board — the former is this function's own `# Safety`
+    // contract, and pulsarv1 has no pins to force off or hold (the 5 V boost is
+    // powered down over I2C by `Power::prepare_for_sleep` beforehand), so the
+    // empty slices are correct rather than merely convenient.
+    unsafe { xiao_common::enter_system_off(&[], &[]) }
 }

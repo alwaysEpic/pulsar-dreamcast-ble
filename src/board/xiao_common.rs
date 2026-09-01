@@ -14,7 +14,7 @@
 //! Only compiled for XIAO-module boards; see `mod.rs`.
 
 /// Enable the DC/DC regulator (REG1) — same inductor on every XIAO-module board.
-pub fn configure_dcdc(config: &mut embassy_nrf::config::Config) {
+pub const fn configure_dcdc(config: &mut embassy_nrf::config::Config) {
     config.dcdc.reg1 = true;
 }
 
@@ -27,19 +27,32 @@ pub fn configure_dcdc(config: &mut embassy_nrf::config::Config) {
 /// pull-up momentarily enable 5V); boards without that hazard pass `None`.
 ///
 /// # Safety
-/// Writes directly to PIN_CNF registers; call before Embassy pin init.
+/// Writes directly to `PIN_CNF` registers; call before Embassy pin init.
 pub unsafe fn disconnect_all_pins(skip_p0: Option<usize>) {
     const P0_PIN_CNF_BASE: *mut u32 = (0x5000_0000 + 0x700) as *mut u32;
     const P1_PIN_CNF_BASE: *mut u32 = (0x5000_0300 + 0x700) as *mut u32;
     const DISCONNECT: u32 = 0x0000_0002;
-    for pin in 0..32 {
-        if Some(pin) == skip_p0 {
-            continue;
+
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "one GPIO teardown sweep; every write is the same operation against \
+                  a different pin index and shares a single justification"
+    )]
+    // SAFETY: P0 and P1 `PIN_CNF` are fixed, word-aligned register arrays in the
+    // nRF52840 memory map. The loop bounds match the hardware — P0 has 32 pins
+    // and P1 has 16 — so every `.add()` stays inside its own register block.
+    // The caller's contract (see `# Safety` above) is that this runs before
+    // Embassy pin init, so no driver holds a conflicting view of these pins.
+    unsafe {
+        for pin in 0..32 {
+            if Some(pin) == skip_p0 {
+                continue;
+            }
+            core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), DISCONNECT);
         }
-        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), DISCONNECT);
-    }
-    for pin in 0..16 {
-        core::ptr::write_volatile(P1_PIN_CNF_BASE.add(pin), DISCONNECT);
+        for pin in 0..16 {
+            core::ptr::write_volatile(P1_PIN_CNF_BASE.add(pin), DISCONNECT);
+        }
     }
 }
 
@@ -73,9 +86,22 @@ pub unsafe fn sense_peripherals_off() {
     const P1_PIN_CNF_BASE: *mut u32 = (0x5000_0300 + 0x700) as *mut u32;
     const OUTPUT_CFG: u32 = 0x0000_0003; // DIR=output, INPUT=disconnected
 
-    for pin in SENSE_ENABLE_P1 {
-        core::ptr::write_volatile(P1_OUTCLR, 1 << pin);
-        core::ptr::write_volatile(P1_PIN_CNF_BASE.add(pin), OUTPUT_CFG);
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "drive-LOW-then-configure-as-output is one sequence per pin, and the \
+                  order is the point: configuring first would briefly drive the \
+                  rail enable at whatever level OUT happened to hold"
+    )]
+    // SAFETY: `P1_OUTCLR` and the P1 `PIN_CNF` array are fixed, word-aligned
+    // registers. `SENSE_ENABLE_P1` holds pins 8 and 10, both inside P1's 16-pin
+    // block, so the shifts and `.add()` offsets are in range. As the doc comment
+    // explains, neither net is routed to a pad on either module variant, so
+    // driving them cannot fight an external source.
+    unsafe {
+        for pin in SENSE_ENABLE_P1 {
+            core::ptr::write_volatile(P1_OUTCLR, 1 << pin);
+            core::ptr::write_volatile(P1_PIN_CNF_BASE.add(pin), OUTPUT_CFG);
+        }
     }
 }
 
@@ -95,34 +121,48 @@ pub unsafe fn qspi_flash_deep_power_down() {
     const IO0: u32 = 20; // P0.20 (MOSI)
     const CNF_OUTPUT: u32 = 0x0000_0003;
 
-    core::ptr::write_volatile(P0_OUTSET, 1 << CS);
-    core::ptr::write_volatile(P0_OUTCLR, 1 << SCK);
-    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(CS as usize), CNF_OUTPUT);
-    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(SCK as usize), CNF_OUTPUT);
-    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(IO0 as usize), CNF_OUTPUT);
-
-    core::ptr::write_volatile(P0_OUTCLR, 1 << CS); // assert CS
-
     const DPD_CMD: u8 = 0xB9;
-    for i in (0..8).rev() {
-        if (DPD_CMD >> i) & 1 == 1 {
-            core::ptr::write_volatile(P0_OUTSET, 1 << IO0);
-        } else {
-            core::ptr::write_volatile(P0_OUTCLR, 1 << IO0);
-        }
-        cortex_m::asm::nop();
-        cortex_m::asm::nop();
-        core::ptr::write_volatile(P0_OUTSET, 1 << SCK);
-        cortex_m::asm::nop();
-        cortex_m::asm::nop();
-        core::ptr::write_volatile(P0_OUTCLR, 1 << SCK);
-    }
-
-    core::ptr::write_volatile(P0_OUTSET, 1 << CS); // deassert → enter DPD
-
     const DISCONNECT: u32 = 0x0000_0002;
-    for pin in [SCK, IO0, 22, 23, 24] {
-        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin as usize), DISCONNECT);
+
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "one bit-banged SPI transaction: the whole point is the ordering of \
+                  CS, SCK and IO0 edges, so the writes are only sound as a sequence \
+                  and cannot be justified individually"
+    )]
+    // SAFETY: every address here is a fixed, word-aligned P0 GPIO register.
+    // CS/SCK/IO0 are compile-time pin numbers below 32, so the shifts and the
+    // `PIN_CNF` offsets stay inside P0's register block. The caller's contract
+    // (`# Safety` above) is that this runs before Embassy claims these pins, so
+    // no driver is concurrently driving the QSPI lines.
+    unsafe {
+        core::ptr::write_volatile(P0_OUTSET, 1 << CS);
+        core::ptr::write_volatile(P0_OUTCLR, 1 << SCK);
+        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(CS as usize), CNF_OUTPUT);
+        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(SCK as usize), CNF_OUTPUT);
+        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(IO0 as usize), CNF_OUTPUT);
+
+        core::ptr::write_volatile(P0_OUTCLR, 1 << CS); // assert CS
+
+        for i in (0..8).rev() {
+            if (DPD_CMD >> i) & 1 == 1 {
+                core::ptr::write_volatile(P0_OUTSET, 1 << IO0);
+            } else {
+                core::ptr::write_volatile(P0_OUTCLR, 1 << IO0);
+            }
+            cortex_m::asm::nop();
+            cortex_m::asm::nop();
+            core::ptr::write_volatile(P0_OUTSET, 1 << SCK);
+            cortex_m::asm::nop();
+            cortex_m::asm::nop();
+            core::ptr::write_volatile(P0_OUTCLR, 1 << SCK);
+        }
+
+        core::ptr::write_volatile(P0_OUTSET, 1 << CS); // deassert → enter DPD
+
+        for pin in [SCK, IO0, 22, 23, 24] {
+            core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin as usize), DISCONNECT);
+        }
     }
     log!("QSPI: Flash in Deep Power Down");
 }
@@ -149,63 +189,80 @@ pub unsafe fn enter_system_off(early_off_p0: &[usize], hold_p0: &[(usize, bool)]
     const P1_PIN_CNF_BASE: *mut u32 = (0x5000_0300 + 0x700) as *mut u32;
     const P1_IN: *const u32 = 0x5000_0810 as *const u32;
 
-    // Wait for the wake button release so re-arming SENSE LOW doesn't latch
-    // immediately and refuse System Off.
-    while core::ptr::read_volatile(P1_IN) & (1 << 15) == 0 {
-        cortex_m::asm::nop();
-    }
-
-    // Drive board-specific pins LOW early (e.g. boost SHDN — kill 5V before the
-    // disconnect Hi-Z window where a pull-up could re-enable it).
-    for &pin in early_off_p0 {
-        core::ptr::write_volatile(P0_OUTCLR, 1 << pin);
-    }
-
-    // Onboard RGB off (active low: HIGH = off): P0.26 (R), P0.30 (G), P0.06 (B)
-    core::ptr::write_volatile(P0_OUTSET, (1 << 26) | (1 << 30) | (1 << 6));
-
-    log!("SLEEP: Entering System Off");
-
-    // Disconnect ALL GPIO, then reconfigure only the pins that must hold state.
     const DISCONNECT: u32 = 0x0000_0002;
-    for pin in 0..32 {
-        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), DISCONNECT);
-    }
-    for pin in 0..16 {
-        core::ptr::write_volatile(P1_PIN_CNF_BASE.add(pin), DISCONNECT);
-    }
-
-    // P0.25: QSPI CS — output HIGH (keeps flash in Deep Power Down)
     const OUTPUT_CFG: u32 = 0x0000_0003; // DIR=output, INPUT=disconnected
-    core::ptr::write_volatile(P0_OUTSET, 1 << 25);
-    core::ptr::write_volatile(P0_PIN_CNF_BASE.add(25), OUTPUT_CFG);
-
-    // Board-specific held pins (e.g. boost SHDN LOW, charge ISET LOW).
-    for &(pin, drive_high) in hold_p0 {
-        if drive_high {
-            core::ptr::write_volatile(P0_OUTSET, 1 << pin);
-        } else {
-            core::ptr::write_volatile(P0_OUTCLR, 1 << pin);
-        }
-        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), OUTPUT_CFG);
-    }
-
-    // Re-assert the Sense IMU/mic enables LOW: the disconnect loop above just
-    // put them back to Hi-Z, and System Off is the longest stretch we'd be
-    // paying for a rail that floated on.
-    sense_peripherals_off();
-
-    // P1.15: Wake button — input + pullup + SENSE LOW (0x0003_000C).
     const WAKE_INPUT_SENSE: u32 = 0x0003_000C;
-    core::ptr::write_volatile(P1_PIN_CNF_BASE.add(15), WAKE_INPUT_SENSE);
-
-    // Clear LATCH bits — sd_power_system_off() refuses if any are pending.
     const P0_LATCH: *mut u32 = 0x5000_0520 as *mut u32;
     const P1_LATCH: *mut u32 = 0x5000_0820 as *mut u32;
-    core::ptr::write_volatile(P0_LATCH, 0xFFFF_FFFF);
-    core::ptr::write_volatile(P1_LATCH, 0xFFFF_FFFF);
 
-    nrf_softdevice::raw::sd_power_system_off();
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "the System Off teardown is one ordered sequence — kill 5V, tear \
+                  down GPIO, re-establish only the held pins, clear LATCH, then \
+                  power off. Each step is sound only in this order, so they share \
+                  one justification rather than admitting individual ones"
+    )]
+    // SAFETY: every address is a fixed, word-aligned P0/P1 GPIO register, and
+    // all pin indices are in range — the sweeps use the hardware's own 32/16 pin
+    // counts, and `early_off_p0`/`hold_p0` are board constants supplied by the
+    // caller, whose `# Safety` contract requires them to be valid for the board.
+    // The caller also guarantees the SoftDevice is initialised, which is what
+    // makes the `sd_power_system_off` SVC legal. This diverges, so no later code
+    // can observe the torn-down pin state.
+    unsafe {
+        // Wait for the wake button release so re-arming SENSE LOW doesn't latch
+        // immediately and refuse System Off.
+        while core::ptr::read_volatile(P1_IN) & (1 << 15) == 0 {
+            cortex_m::asm::nop();
+        }
+
+        // Drive board-specific pins LOW early (e.g. boost SHDN — kill 5V before
+        // the disconnect Hi-Z window where a pull-up could re-enable it).
+        for &pin in early_off_p0 {
+            core::ptr::write_volatile(P0_OUTCLR, 1 << pin);
+        }
+
+        // Onboard RGB off (active low: HIGH = off): P0.26 (R), P0.30 (G), P0.06 (B)
+        core::ptr::write_volatile(P0_OUTSET, (1 << 26) | (1 << 30) | (1 << 6));
+
+        log!("SLEEP: Entering System Off");
+
+        // Disconnect ALL GPIO, then reconfigure only the pins that must hold state.
+        for pin in 0..32 {
+            core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), DISCONNECT);
+        }
+        for pin in 0..16 {
+            core::ptr::write_volatile(P1_PIN_CNF_BASE.add(pin), DISCONNECT);
+        }
+
+        // P0.25: QSPI CS — output HIGH (keeps flash in Deep Power Down)
+        core::ptr::write_volatile(P0_OUTSET, 1 << 25);
+        core::ptr::write_volatile(P0_PIN_CNF_BASE.add(25), OUTPUT_CFG);
+
+        // Board-specific held pins (e.g. boost SHDN LOW, charge ISET LOW).
+        for &(pin, drive_high) in hold_p0 {
+            if drive_high {
+                core::ptr::write_volatile(P0_OUTSET, 1 << pin);
+            } else {
+                core::ptr::write_volatile(P0_OUTCLR, 1 << pin);
+            }
+            core::ptr::write_volatile(P0_PIN_CNF_BASE.add(pin), OUTPUT_CFG);
+        }
+
+        // Re-assert the Sense IMU/mic enables LOW: the disconnect loop above just
+        // put them back to Hi-Z, and System Off is the longest stretch we'd be
+        // paying for a rail that floated on.
+        sense_peripherals_off();
+
+        // P1.15: Wake button — input + pullup + SENSE LOW (0x0003_000C).
+        core::ptr::write_volatile(P1_PIN_CNF_BASE.add(15), WAKE_INPUT_SENSE);
+
+        // Clear LATCH bits — sd_power_system_off() refuses if any are pending.
+        core::ptr::write_volatile(P0_LATCH, 0xFFFF_FFFF);
+        core::ptr::write_volatile(P1_LATCH, 0xFFFF_FFFF);
+
+        nrf_softdevice::raw::sd_power_system_off();
+    }
 
     loop {
         cortex_m::asm::wfi();

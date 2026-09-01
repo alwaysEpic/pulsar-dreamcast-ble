@@ -7,7 +7,7 @@
 //! built but NOT wired in — it works on the DK but bricks Maple I/O on the
 //! XIAO, while this same engine drives the VMU LCD fine on both boards. So the
 //! controller poll TX is bit-banged (`gpio_bus::write_packet`) for now. See
-//! xiao_debug_log.md 2026-06-13 (bisect + two failed fix trials + punt).
+//! `xiao_debug_log.md` 2026-06-13 (bisect + two failed fix trials + punt).
 //!
 //! CPU bit-banging is wrong on this chip twice over:
 //! 1. Radio interrupts stretch the driven waveform mid-frame (debug log
@@ -51,7 +51,7 @@
 
 use embassy_time::{Duration, Timer};
 
-use super::gpio_bus::MapleBus;
+use super::gpio_bus::{MapleBus, LCD_PAYLOAD_WORDS};
 use super::MaplePacket;
 
 /// PWM0 base address (nRF52840). PWM0 is reserved for this module; the
@@ -112,7 +112,7 @@ struct WaveformBuilder {
 }
 
 impl WaveformBuilder {
-    fn new(buf: &'static mut [u16]) -> Self {
+    const fn new(buf: &'static mut [u16]) -> Self {
         Self {
             buf,
             n: 0,
@@ -205,7 +205,7 @@ fn update_crc(word: u32, crc: &mut u8) {
     }
 }
 
-/// Build the LCD BLOCK_WRITE waveform (mirrors `gpio_bus::write_lcd` exactly,
+/// Build the LCD `BLOCK_WRITE` waveform (mirrors `gpio_bus::write_lcd` exactly,
 /// including the pixel byte-swap) and play it via PWM0 + EasyDMA.
 ///
 /// Fire-and-forget: returns after the waveform has finished on the wire and
@@ -225,7 +225,8 @@ pub async fn write_lcd_dma(bus: &mut MapleBus, sender: u8, dest: u8, framebuffer
     let mut phase = true;
     let mut crc: u8 = 0;
 
-    let frame: u32 = (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | 50;
+    let frame: u32 =
+        (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | LCD_PAYLOAD_WORDS;
     w.write_word(frame, &mut phase);
     update_crc(frame, &mut crc);
 
@@ -250,7 +251,10 @@ pub async fn write_lcd_dma(bus: &mut MapleBus, sender: u8, dest: u8, framebuffer
     let steps = halfwords / 2;
     let buf_ptr = w.buf.as_ptr() as u32;
     // Wire time: steps × 0.5µs.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "steps is bounded by the waveform buffer length, which is far inside u32"
+    )]
     let duration_us = (steps as u32) / 2;
 
     start_playback(bus, buf_ptr, halfwords);
@@ -280,8 +284,8 @@ pub async fn write_lcd_dma(bus: &mut MapleBus, sender: u8, dest: u8, framebuffer
 /// (`gpio_bus::write_packet`) instead. This path works on the DK but on the
 /// XIAO the controller never returns a valid response, even though the SAME
 /// PWM/EasyDMA engine drives the VMU LCD correctly on both boards via
-/// [`write_lcd_dma`]. So the fault is specific to THIS function (command TX
-/// + its busy-wait/RX hand-off), not the DMA engine. Root cause open (debug
+/// [`write_lcd_dma`]. So the fault is specific to THIS function (command TX +
+/// its busy-wait/RX hand-off), not the DMA engine. Root cause open (debug
 /// log 2026-06-13). Kept for the in-progress fix; re-wire the `host.rs` call
 /// sites once it's confirmed working on the XIAO.
 ///
@@ -296,7 +300,7 @@ pub async fn write_lcd_dma(bus: &mut MapleBus, sender: u8, dest: u8, framebuffer
 /// Blocking, not async: the controller starts answering ~50µs after the end
 /// pattern, so the caller must be sampling immediately — timer-granularity
 /// wakeups (~30µs + executor latency) could miss the response start. The
-/// spin is short: a GET_CONDITION command is ~170 steps ≈ 85µs on the wire,
+/// spin is short: a `GET_CONDITION` command is ~170 steps ≈ 85µs on the wire,
 /// less than a quarter of the old ~390µs bit-bang.
 ///
 /// Returns with the bus in output mode, both lines driven high (the end
@@ -367,7 +371,10 @@ fn start_playback(bus: &mut MapleBus, buf_ptr: u32, halfwords: usize) {
     pwm_write(REG_DECODER, 1); // LOAD=Grouped, MODE=RefreshCount
     pwm_write(REG_LOOP, 0);
     pwm_write(SEQ0_PTR, buf_ptr);
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "halfwords is bounded by the waveform buffer length, which is far inside u32"
+    )]
     pwm_write(SEQ0_CNT, halfwords as u32);
     pwm_write(SEQ0_REFRESH, 0); // new sample every period
     pwm_write(SEQ0_ENDDELAY, 0);

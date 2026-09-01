@@ -28,7 +28,7 @@ use nrf_softdevice_s140::{
     NRF_RADIO_SIGNAL_CALLBACK_ACTION_NRF_RADIO_SIGNAL_CALLBACK_ACTION_END, NRF_SUCCESS,
 };
 
-use super::gpio_bus::{HALF_BIT_NOPS, PIN_STABILIZE_NOPS};
+use super::gpio_bus::{HALF_BIT_NOPS, LCD_PAYLOAD_WORDS, PIN_STABILIZE_NOPS};
 
 /// P0 OUTSET register — write 1 to set pin high.
 const P0_OUTSET: *mut u32 = 0x5000_0508 as *mut u32;
@@ -45,15 +45,15 @@ const BOTH_MASK: u32 = PIN_A_MASK | PIN_B_MASK;
 
 /// Maximum waveform entries.
 ///
-/// VMU LCD write: start pattern (~20 half-bits) + 50 words × 32 bits × 2 half-bits
-/// + CRC (8 bits × 2) + end pattern (~14 half-bits) ≈ 3250 entries.
+/// VMU LCD write: start pattern (~20 half-bits) + 50 words × 32 bits × 2 half-bits +
+/// CRC (8 bits × 2) + end pattern (~14 half-bits) ≈ 3250 entries.
 ///
 /// Must fit within the shared `SAMPLE_BUFFER` (24,576 u32s = 12,288 `PinAction`s).
 /// Each bit uses 3 waveform entries (data + clock + restore), so a 50-word
 /// packet = 50×32×3 + start(11) + end(7) + crc(24) + idle(2) ≈ 4844 entries.
 const MAX_WAVEFORM_LEN: usize = 5000;
 
-/// Each waveform entry: (set_mask, clr_mask) for OUTSET/OUTCLR registers.
+/// Each waveform entry: (`set_mask`, `clr_mask`) for OUTSET/OUTCLR registers.
 /// This avoids read-modify-write; we just write the masks directly.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -74,11 +74,24 @@ struct PinAction {
 /// any RX bulk capture uses the same memory.
 #[inline]
 unsafe fn tx_waveform() -> &'static mut [PinAction] {
-    let ptr = core::ptr::addr_of_mut!(super::gpio_bus::SAMPLE_BUFFER) as *mut PinAction;
-    core::slice::from_raw_parts_mut(ptr, MAX_WAVEFORM_LEN)
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "taking the address and building the slice are one derivation, \
+                  justified by the single exclusivity argument above"
+    )]
+    // SAFETY: the caller's `# Safety` contract above establishes exclusivity —
+    // the waveform is fully written before the timeslot callback reads it, and
+    // that callback finishes before any RX capture reuses the buffer. The
+    // reinterpretation fits: `MAX_WAVEFORM_LEN` entries of `PinAction` are sized
+    // to stay within `SAMPLE_BUFFER`, and `addr_of_mut!` avoids forming an
+    // intermediate reference to the static.
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(super::gpio_bus::SAMPLE_BUFFER).cast::<PinAction>();
+        core::slice::from_raw_parts_mut(ptr, MAX_WAVEFORM_LEN)
+    }
 }
 
-/// Length of the current waveform (number of valid entries in TX_WAVEFORM).
+/// Length of the current waveform (number of valid entries in `TX_WAVEFORM`).
 static TX_WAVEFORM_LEN: AtomicU32 = AtomicU32::new(0);
 
 /// Set to true when a timeslot TX completes.
@@ -93,7 +106,7 @@ static SESSION_OPEN: AtomicBool = AtomicBool::new(false);
 /// Static return parameter for the signal callback.
 ///
 /// Initialized at runtime in the callback since the union fields are
-/// not const-constructible. We only use ACTION_END.
+/// not const-constructible. We only use `ACTION_END`.
 static mut RETURN_PARAM: core::mem::MaybeUninit<sd::nrf_radio_signal_callback_return_param_t> =
     core::mem::MaybeUninit::zeroed();
 
@@ -104,6 +117,10 @@ pub fn open_session() -> bool {
     if SESSION_OPEN.load(Ordering::Relaxed) {
         return true;
     }
+    // SAFETY: a SoftDevice SVC call taking a `'static` function pointer by
+    // value. The SoftDevice must be enabled, which the doc comment above makes
+    // the caller's contract, and the `SESSION_OPEN` guard above ensures we never
+    // open a second session over a live one. The return code is checked below.
     let ret = unsafe { sd::sd_radio_session_open(Some(timeslot_callback)) };
     if ret == NRF_SUCCESS {
         SESSION_OPEN.store(true, Ordering::Release);
@@ -116,6 +133,9 @@ pub fn open_session() -> bool {
 /// Close the radio session. Call after the timeslot TX completes.
 pub fn close_session() {
     if SESSION_OPEN.load(Ordering::Relaxed) {
+        // SAFETY: a SoftDevice SVC call taking no arguments. The
+        // `SESSION_OPEN` guard above guarantees a session is actually open, so
+        // this cannot close one that was never opened.
         unsafe { sd::sd_radio_session_close() };
         SESSION_OPEN.store(false, Ordering::Release);
     }
@@ -131,6 +151,10 @@ pub fn close_session() {
 /// * `sender` — Maple Bus sender address
 /// * `dest` — Maple Bus destination address
 /// * `framebuffer` — 192-byte VMU LCD data
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the request-type/hfclk/priority constants are small enum discriminants, and the waveform length is bounded by MAX_WAVEFORM_LEN"
+)]
 pub fn request_lcd_tx(sender: u8, dest: u8, framebuffer: &[u8; 192]) -> bool {
     if !SESSION_OPEN.load(Ordering::Relaxed) {
         return false;
@@ -156,7 +180,12 @@ pub fn request_lcd_tx(sender: u8, dest: u8, framebuffer: &[u8; 192]) -> bool {
         },
     };
 
-    let ret = unsafe { sd::sd_radio_request(&request) };
+    // SAFETY: a SoftDevice SVC call taking a pointer to `request`, which lives
+    // on this stack frame and stays valid for the duration of the call — the
+    // SoftDevice copies the descriptor before returning. A session is open
+    // (checked by the caller), which is the call's precondition. The return code
+    // is checked below.
+    let ret = unsafe { sd::sd_radio_request(&raw const request) };
     if ret != NRF_SUCCESS {
         TX_FAILED.store(true, Ordering::Release);
         return false;
@@ -164,9 +193,13 @@ pub fn request_lcd_tx(sender: u8, dest: u8, framebuffer: &[u8; 192]) -> bool {
     true
 }
 
-/// Build a TX waveform for a Maple Bus DEVICE_INFO request and request a timeslot.
+/// Build a TX waveform for a Maple Bus `DEVICE_INFO` request and request a timeslot.
 ///
 /// Much shorter than LCD write (~5 bytes), but using timeslot for consistency.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the request-type/hfclk/priority constants are small enum discriminants, and the waveform length is bounded by MAX_WAVEFORM_LEN"
+)]
 pub fn request_device_info_tx(sender: u8, dest: u8) -> bool {
     if !SESSION_OPEN.load(Ordering::Relaxed) {
         return false;
@@ -190,7 +223,12 @@ pub fn request_device_info_tx(sender: u8, dest: u8) -> bool {
         },
     };
 
-    let ret = unsafe { sd::sd_radio_request(&request) };
+    // SAFETY: a SoftDevice SVC call taking a pointer to `request`, which lives
+    // on this stack frame and stays valid for the duration of the call — the
+    // SoftDevice copies the descriptor before returning. A session is open
+    // (checked by the caller), which is the call's precondition. The return code
+    // is checked below.
+    let ret = unsafe { sd::sd_radio_request(&raw const request) };
     if ret != NRF_SUCCESS {
         TX_FAILED.store(true, Ordering::Release);
         return false;
@@ -213,46 +251,81 @@ pub fn is_tx_failed() -> bool {
 /// # Safety
 /// Called by the SoftDevice. Must not use Embassy async, RTT, or anything
 /// requiring lower-priority interrupts.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "SoftDevice callback-action and signal-type constants are small enum discriminants that fit u8"
+)]
 unsafe extern "C" fn timeslot_callback(
     signal_type: u8,
 ) -> *mut sd::nrf_radio_signal_callback_return_param_t {
     if signal_type == NRF_RADIO_CALLBACK_SIGNAL_TYPE_NRF_RADIO_CALLBACK_SIGNAL_TYPE_START as u8 {
-        // Set pins as output
-        core::ptr::write_volatile(P0_DIRSET, BOTH_MASK);
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "this is the timeslot TX blast: direction-set, the waveform \
+                      writes, and direction-clear are one bus transaction whose \
+                      ordering IS the wire protocol. Splitting it would invite \
+                      reordering the very thing that must not move"
+        )]
+        // SAFETY: P0 DIRSET/DIRCLR/OUTSET/OUTCLR are fixed, word-aligned GPIO
+        // registers. We hold the bus exclusively here: the SoftDevice has
+        // granted a timeslot and this runs at priority 0, so no interrupt and no
+        // other Maple code can touch these lines mid-frame. `tx_waveform()` is
+        // sound for the same reason — its `# Safety` contract requires the
+        // waveform to be fully written before the callback reads it, which the
+        // request path guarantees — and `len` comes from `TX_WAVEFORM_LEN`,
+        // which the builder stores only after filling that many entries, so the
+        // slice cannot exceed the initialised prefix.
+        unsafe {
+            // Set pins as output
+            core::ptr::write_volatile(P0_DIRSET, BOTH_MASK);
 
-        // Small stabilization delay
-        for _ in 0..PIN_STABILIZE_NOPS {
-            cortex_m::asm::nop();
-        }
-
-        // Blast the pre-computed waveform
-        let len = TX_WAVEFORM_LEN.load(Ordering::Acquire) as usize;
-        let waveform = &tx_waveform()[..len];
-
-        for action in waveform {
-            if action.set != 0 {
-                core::ptr::write_volatile(P0_OUTSET, action.set);
-            }
-            if action.clr != 0 {
-                core::ptr::write_volatile(P0_OUTCLR, action.clr);
-            }
-            for _ in 0..HALF_BIT_NOPS {
+            // Small stabilization delay
+            for _ in 0..PIN_STABILIZE_NOPS {
                 cortex_m::asm::nop();
             }
-        }
 
-        // Set pins back to input (release bus)
-        core::ptr::write_volatile(P0_DIRCLR, BOTH_MASK);
+            // Blast the pre-computed waveform
+            let len = TX_WAVEFORM_LEN.load(Ordering::Acquire) as usize;
+            let waveform = &tx_waveform()[..len];
+
+            for action in waveform {
+                if action.set != 0 {
+                    core::ptr::write_volatile(P0_OUTSET, action.set);
+                }
+                if action.clr != 0 {
+                    core::ptr::write_volatile(P0_OUTCLR, action.clr);
+                }
+                for _ in 0..HALF_BIT_NOPS {
+                    cortex_m::asm::nop();
+                }
+            }
+
+            // Set pins back to input (release bus)
+            core::ptr::write_volatile(P0_DIRCLR, BOTH_MASK);
+        }
 
         TX_COMPLETE.store(true, Ordering::Release);
     }
 
     // End the timeslot
-    let ret = core::ptr::addr_of_mut!(RETURN_PARAM)
-        .cast::<sd::nrf_radio_signal_callback_return_param_t>();
-    (*ret).callback_action =
-        NRF_RADIO_SIGNAL_CALLBACK_ACTION_NRF_RADIO_SIGNAL_CALLBACK_ACTION_END as u8;
-    ret
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "taking the address and writing through it are one initialisation \
+                  of the return parameter the SoftDevice is about to read"
+    )]
+    // SAFETY: `RETURN_PARAM` is a zeroed static this callback alone writes, and
+    // the SoftDevice calls us non-reentrantly, so there is no aliasing.
+    // `addr_of_mut!` avoids forming a reference to the `MaybeUninit` static;
+    // writing `callback_action` initialises the only field the SoftDevice reads
+    // for an END action. The pointer stays valid after return because the static
+    // has `'static` lifetime.
+    unsafe {
+        let ret = core::ptr::addr_of_mut!(RETURN_PARAM)
+            .cast::<sd::nrf_radio_signal_callback_return_param_t>();
+        (*ret).callback_action =
+            NRF_RADIO_SIGNAL_CALLBACK_ACTION_NRF_RADIO_SIGNAL_CALLBACK_ACTION_END as u8;
+        ret
+    }
 }
 
 // ── Waveform builders ───────────────────────────────────────────────────────
@@ -265,7 +338,7 @@ struct WaveformBuilder {
 }
 
 impl WaveformBuilder {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             pos: 0,
             phase: true,
@@ -277,6 +350,10 @@ impl WaveformBuilder {
     #[inline]
     fn emit(&mut self, set: u32, clr: u32) {
         if self.pos < MAX_WAVEFORM_LEN {
+            // SAFETY: `tx_waveform()` reinterprets the shared sample buffer,
+            // which is exclusively ours while a TX waveform is being built — TX
+            // and RX never overlap (see `gpio_bus::tx_waveform_buf`). The index
+            // is bounded by the `self.pos < MAX_WAVEFORM_LEN` test above.
             unsafe {
                 tx_waveform()[self.pos] = PinAction { set, clr };
             }
@@ -362,20 +439,21 @@ impl WaveformBuilder {
         }
     }
 
-    fn finish(self) -> usize {
+    const fn finish(self) -> usize {
         self.pos
     }
 }
 
-/// Build the waveform for a VMU LCD BLOCK_WRITE packet.
+/// Build the waveform for a VMU LCD `BLOCK_WRITE` packet.
 fn build_lcd_waveform(sender: u8, dest: u8, framebuffer: &[u8; 192]) -> usize {
     let mut wb = WaveformBuilder::new();
 
     wb.emit_idle();
     wb.emit_start_pattern();
 
-    // Frame word: 50 payload words, sender, dest, command=0x0C
-    let frame: u32 = (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | 50;
+    // Frame word: payload word count, sender, dest, command=0x0C
+    let frame: u32 =
+        (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | LCD_PAYLOAD_WORDS;
     wb.emit_word(frame);
 
     // Function type: FUNC_LCD = 0x0000_0004
@@ -402,14 +480,17 @@ fn build_lcd_waveform(sender: u8, dest: u8, framebuffer: &[u8; 192]) -> usize {
     wb.finish()
 }
 
-/// Build the waveform for a short Maple Bus packet (DEVICE_INFO, GET_CONDITION, etc.).
+/// Build the waveform for a short Maple Bus packet (`DEVICE_INFO`, `GET_CONDITION`, etc.).
 fn build_short_packet_waveform(sender: u8, dest: u8, command: u8, payload_words: &[u32]) -> usize {
     let mut wb = WaveformBuilder::new();
 
     wb.emit_idle();
     wb.emit_start_pattern();
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "payload length is masked to & 0xFF in the same expression, so the discarded bits are provably zero"
+    )]
     let frame: u32 = (u32::from(command) << 24)
         | (u32::from(dest) << 16)
         | (u32::from(sender) << 8)

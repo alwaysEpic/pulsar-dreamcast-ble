@@ -74,8 +74,8 @@
 //!
 //! So: `INT_ON_BOTH` (the empirically assert-free config), with edges
 //! classified by the gap *preceding* them instead of a persistent flag. An
-//! INACTIVE notification follows its ACTIVE partner by ~1-3ms (800µs warning
-//! + connection event); an ACTIVE notification follows ~12ms of quiet. A
+//! INACTIVE notification follows its ACTIVE partner by ~1-3ms (800µs warning +
+//! connection event); an ACTIVE notification follows ~12ms of quiet. A
 //! pre-gap under [`GAP_CLASSIFY_CYC`] therefore marks an INACTIVE edge.
 //! Classification is stateless per notification: a coalesced interrupt
 //! misclassifies one edge (costing at most one corrupted frame, which the
@@ -89,7 +89,7 @@
 //! # Usage
 //!
 //! 1. Call [`init`] once after the SoftDevice is enabled.
-//! 2. Before a long Maple TX, check [`idle_age_ms`]`.is_some_and(|a| a <= 3)`
+//! 2. Before a long Maple TX, check that [`idle_age_ms`] returns `Some(a)` with `a <= 3`
 //!    — start only in the fresh part of the quiet window. If stale, skip and
 //!    retry next poll.
 
@@ -139,7 +139,7 @@ const RTC_MASK: u32 = 0x00FF_FFFF;
 /// ~12ms at the measured ~15ms connection interval. 5ms sits between.
 const GAP_CLASSIFY_TICKS: u32 = 5 * RTC_HZ / 1000;
 
-/// nRF52840 IRQ number for SWI1_EGU1.
+/// nRF52840 IRQ number for `SWI1_EGU1`.
 const SWI1_EGU1_IRQN: u32 = 21;
 
 #[inline]
@@ -152,19 +152,25 @@ fn rtc_ticks() -> u32 {
 
 /// 24-bit wrapping tick delta.
 #[inline]
-fn tick_delta(now: u32, prev: u32) -> u32 {
+const fn tick_delta(now: u32, prev: u32) -> u32 {
     now.wrapping_sub(prev) & RTC_MASK
 }
 
 /// Initialize radio notifications. Call once after SoftDevice is enabled.
 ///
 /// Configures `INT_ON_BOTH` with 800µs advance warning, enables the DWT
-/// cycle counter used for edge timestamps, and enables the SWI1_EGU1
+/// cycle counter used for edge timestamps, and enables the `SWI1_EGU1`
 /// interrupt at priority 2 (same as Embassy, below SoftDevice).
 ///
 /// Returns `true` on success.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the notification type and distance constants are small enum discriminants that fit u8"
+)]
 pub fn init() -> bool {
+    // SAFETY: a SoftDevice SVC call taking two enum discriminants by value; it
+    // dereferences nothing. The SoftDevice is enabled before any caller reaches
+    // `init()`, and the return code is checked below rather than assumed.
     let ret = unsafe {
         sd::sd_radio_notification_cfg_set(
             NRF_RADIO_NOTIFICATION_TYPES_NRF_RADIO_NOTIFICATION_TYPE_INT_ON_BOTH as u8,
@@ -178,8 +184,24 @@ pub fn init() -> bool {
 
     INACTIVE_SEEN.store(false, Ordering::Release);
 
-    // Enable SWI1_EGU1 in the NVIC at priority 2
+    // Enable `SWI1_EGU1` in the NVIC at priority 2
     // nRF52840 uses 3 priority bits in the upper bits of the priority register
+    //
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "priority-then-enable is one NVIC configuration sequence and the \
+                  order matters: enabling before the priority is set could take an \
+                  interrupt at the reset-default priority"
+    )]
+    // SAFETY: both writes target fixed Cortex-M NVIC registers at
+    // architecturally-defined addresses (IPR base `0xE000_E400`, one byte per
+    // IRQ; ISER0 base `0xE000_E100`), so the pointers are valid by construction
+    // and correctly aligned — IPR is byte-addressed and ISER0 is word-aligned.
+    // `SWI1_EGU1_IRQN` (21) is below the 32-IRQ span of ISER0, so the shift
+    // cannot overflow. These registers belong to the application, not the
+    // SoftDevice, which reserves only priorities 0 and 1 — we set 2, matching
+    // Embassy. `write_volatile` is required so the writes are not reordered or
+    // elided.
     unsafe {
         // Set priority: NVIC_IPR base = 0xE000_E400, each IRQ gets 1 byte
         let pri_reg = (0xE000_E400u32 + SWI1_EGU1_IRQN) as *mut u8;
@@ -240,7 +262,12 @@ unsafe extern "C" fn swi1_irq_handler() {
     on_radio_notification();
 }
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "no Rust caller: the NVIC dispatches through the exported symbol, which \
+              is also what keeps the function in the binary. Kept under this second \
+              PAC spelling of the IRQ name for compatibility (see comment above)"
+)]
 #[export_name = "SWI1_EGU1"]
 unsafe extern "C" fn old_swi1_irq_handler() {
     on_radio_notification();

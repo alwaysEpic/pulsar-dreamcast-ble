@@ -85,7 +85,7 @@ const PIN_CNF_OUTPUT: u32 = 0x0000_0003;
 // addressing is not reachable with the polarity wrong.
 const COUNTERTOP: u32 = 20;
 const T0H: u16 = 0x8000 | 6; // ~0.375 µs high
-const T1H: u16 = 0x8000 | 13; // ~0.81 µs high
+const T1H: u16 = 0x8000 | 0x0D; // ~0.81 µs high
 
 /// A pixel color. WS2812 wire order is GRB; conversion happens in `encode`.
 #[derive(Clone, Copy)]
@@ -96,7 +96,7 @@ pub struct Rgb {
 }
 
 impl Rgb {
-    pub const OFF: Rgb = Rgb { r: 0, g: 0, b: 0 };
+    pub const OFF: Self = Self { r: 0, g: 0, b: 0 };
 
     #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
@@ -114,8 +114,19 @@ pub struct Ws2812 {
 impl Ws2812 {
     /// Configure PWM2 for WS2812 on the given pin (must be P0.28 on this board).
     pub fn new(pwm: Peri<'static, PWM2>, _pin: Peri<'static, impl Pin>) -> Self {
-        // SAFETY: one-time configuration of the PWM2 peripheral and the LED pin,
-        // both of which we now own.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "one peripheral bring-up sequence whose ordering is the safety \
+                      argument: the pin is driven LOW before its output buffer is \
+                      enabled, so the line never glitches out of WS2812 reset"
+        )]
+        // SAFETY: every address written below is a fixed nRF52840 peripheral
+        // register (P0 GPIO and PWM2), valid and correctly aligned by
+        // construction. We own both resources for the driver's lifetime — `pwm`
+        // is a `Peri<PWM2>` handle moved into the struct and the pin is
+        // exclusively ours — so nothing else can be touching these registers.
+        // `NEOPIXEL_PIN` is a compile-time constant below 32, so the shift and
+        // the `PIN_CNF` index stay in range.
         unsafe {
             // Drive the pin LOW *before* enabling the output buffer, so the line
             // comes up in the WS2812 idle/reset state with no start-up glitch.
@@ -158,6 +169,10 @@ impl Ws2812 {
     /// The buffer lives in `self` (RAM) and EasyDMA reads it for the duration of
     /// the sequence, which this call waits out — so the buffer is never reused
     /// while the DMA is still walking it.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "BITS is a compile-time constant (5 LEDs x 24 bits), far inside u32"
+    )]
     pub fn write(&mut self, colors: &[Rgb; LED_COUNT]) {
         self.encode(colors);
         // Full re-arm on every write, mirroring `maple::pwm_tx` — the one PWM
@@ -166,7 +181,17 @@ impl Ws2812 {
         // makes a second write possible. Re-arming the setup alone was tried and
         // changed nothing.
         //
-        // SAFETY: buf is a RAM field; EasyDMA reads it while the sequence plays.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "one PWM re-arm sequence; the ordering — and the compiler fence \
+                      before SEQSTART — is exactly what makes handing the buffer to \
+                      EasyDMA sound, so these writes cannot be justified separately"
+        )]
+        // SAFETY: all writes target fixed PWM2 registers this driver owns
+        // exclusively. `self.buf` is a RAM field of this struct (EasyDMA cannot
+        // address flash), and `&mut self` guarantees nothing else touches it
+        // while the sequence plays; the wait loop below runs to SEQEND before
+        // `write` returns, so the buffer outlives the transfer.
         unsafe {
             core::ptr::write_volatile(PWM_ENABLE, 0);
             core::ptr::write_volatile(PWM_PSEL_OUT0, NEOPIXEL_PSEL);
@@ -200,6 +225,10 @@ impl Ws2812 {
         // Bound: 120 bits × 1.25 µs ≈ 150 µs ≈ 9.6k cycles at 64 MHz. The guard
         // is far past that, so a wedged peripheral can't hang the poll loop.
         let mut guard = 0u32;
+        // SAFETY: `PWM_EVENTS_SEQEND0` is a fixed, word-aligned PWM2 event
+        // register owned by this driver. A volatile read of a peripheral event
+        // register has no side effects and cannot fail; the guard below bounds
+        // the loop so a wedged peripheral cannot stall the poll loop.
         while unsafe { core::ptr::read_volatile(PWM_EVENTS_SEQEND0) } == 0 {
             guard += 1;
             if guard > 1_000_000 {
@@ -207,7 +236,18 @@ impl Ws2812 {
             }
         }
 
-        // SAFETY: the sequence is finished; releasing the peripheral we own.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "disconnect-then-disable is one teardown sequence and the order \
+                      matters: disabling first would release the pin while it is \
+                      still routed to the PWM output"
+        )]
+        // SAFETY: fixed PWM2 registers owned by this driver. The loop above has
+        // observed SEQEND (or timed out), so EasyDMA is no longer reading
+        // `self.buf` and tearing the peripheral down cannot abort a live
+        // transfer. Handing the pin back to GPIO is sound because `new`
+        // configured it as a driven-LOW output, so the line parks in the WS2812
+        // reset state rather than floating.
         unsafe {
             core::ptr::write_volatile(PWM_PSEL_OUT0, PSEL_DISCONNECTED);
             core::ptr::write_volatile(PWM_ENABLE, 0);

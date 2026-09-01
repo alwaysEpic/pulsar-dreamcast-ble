@@ -51,8 +51,38 @@ const REG_BAT_LEVEL: u8 = 0x78;
 const SYS_CTL0_BOOST_EN: u8 = 1 << 5;
 /// `SYS_CTL0` bit 4 — charger enable. Reset 1.
 const SYS_CTL0_CHARGER_EN: u8 = 1 << 4;
-/// The two bits this driver owns; everything else in `SYS_CTL0` is left as found.
-const SYS_CTL0_OWNED: u8 = SYS_CTL0_BOOST_EN | SYS_CTL0_CHARGER_EN;
+/// `SYS_CTL0` bit 1 — *BOOST output always-on*. Reset 1.
+///
+/// Set, the 5 V output never auto-shuts-down; clear, it drops once the load
+/// falls below the part's light-load threshold for the `SYS_CTL2[3:2]` dwell
+/// (as short as 8 s). Both states are wanted, at different times — see
+/// [`Ip5306::blocking_boost_off`].
+const SYS_CTL0_BOOST_ALWAYS_ON: u8 = 1 << 1;
+/// The bits this driver owns; everything else in `SYS_CTL0` is left as found.
+///
+/// Always-on is owned rather than merely preserved. Preserving it at the reset
+/// value of 1 meant the rail could never be brought down at all: `boost_off`
+/// cleared the enable bit while always-on kept the output up, so the controller
+/// and VMU drew from the cell continuously — including through System Off. A
+/// unit left plugged in then failed to charge, because the input current was
+/// feeding that load instead of the pack (2026-08-17).
+///
+/// The rail has exactly two states, and every write lands one of them whole:
+/// [`SYS_CTL0_RAIL_ON`] (all three set) or [`ctl0_rail_off`] (charger set,
+/// boost and always-on clear). Nothing sets the enable without always-on, and
+/// nothing clears one without the other.
+const SYS_CTL0_OWNED: u8 = SYS_CTL0_BOOST_EN | SYS_CTL0_CHARGER_EN | SYS_CTL0_BOOST_ALWAYS_ON;
+/// The owned bits as they read while the 5 V rail is up: boost enabled and held
+/// always-on so the light-load timer cannot drop an idle-but-attached
+/// controller mid-session, charger on.
+const SYS_CTL0_RAIL_ON: u8 = SYS_CTL0_OWNED;
+/// `SYS_CTL0` with the 5 V rail brought down: boost enable and always-on both
+/// clear, charger kept on so a plugged-in unit charges whether it is idle in
+/// Phase 1 or asleep. Clearing the enable alone is not enough — always-on holds
+/// the output up regardless (see [`SYS_CTL0_OWNED`]).
+const fn ctl0_rail_off(v: u8) -> u8 {
+    (v & !(SYS_CTL0_BOOST_EN | SYS_CTL0_BOOST_ALWAYS_ON)) | SYS_CTL0_CHARGER_EN
+}
 /// Documented power-on reset value of `SYS_CTL0`: reserved 7:6 = `10`, boost,
 /// charger, reserved bit 3, insert-load auto-power-on and boost-always-on all 1,
 /// key-shutdown 0. Used only as the blind-write fallback in
@@ -71,7 +101,10 @@ pub struct Ip5306 {
 
 impl Ip5306 {
     /// Bring up the I²C peripheral on the IP5306 lines (SDA, SCL).
-    #[allow(clippy::items_after_statements)] // function-local StaticCell for the DMA buffer
+    #[expect(
+        clippy::items_after_statements,
+        reason = "function-local StaticCell for the DMA buffer"
+    )]
     pub fn new(
         twspi: Peri<'static, TWISPI0>,
         sda: Peri<'static, impl Pin>,
@@ -106,9 +139,22 @@ impl Ip5306 {
     }
 
     /// One-time boot configuration (blocking, so it runs immediately at startup):
-    /// ensure the 5 V boost and the charger are enabled, preserving every other
-    /// bit. Best-effort — I²C errors are swallowed (nothing to recover to before
-    /// the board exists), but they are reported rather than papered over.
+    /// charger enabled, **5 V boost off**, preserving every other bit. The rail
+    /// comes up only when a BLE host connects — [`Ip5306::blocking_boost_on`]
+    /// from `Power::rail_on` — and goes back down on disconnect, which is
+    /// ADR-005 ("boot → advertise with boost OFF") applied to this carrier. It
+    /// matters here for charging rather than for idle draw: with the boost held
+    /// up the whole time the board runs, a plugged-in unit feeds the controller
+    /// instead of the pack, so charging while awake was effectively broken
+    /// until the rail was gated (2026-08-18).
+    ///
+    /// The power-on reset value has the boost *on*, so on a cold boot (cell
+    /// insertion) this genuinely brings the rail down; on a wake from System
+    /// Off it is a no-op re-assertion of what [`Ip5306::blocking_boost_off`]
+    /// already left. Best-effort — I²C errors are swallowed (nothing to recover
+    /// to before the board exists), but they are reported rather than papered
+    /// over, and the Phase 2 `rail_on` + `refresh_config` pair retries the
+    /// write that actually matters at the first moment it can land.
     ///
     /// **No longer touches `SYS_CTL1`.** It used to clear `0x01` bit 1, believed
     /// to be the light-load (~<45 mA, ~32 s) auto-shutdown enable. Both source
@@ -116,24 +162,22 @@ impl Ip5306 {
     /// clearing an already-clear reserved bit: a no-op dressed up as the one
     /// setting that "must be right for the device to stay powered". Light-load
     /// behaviour is actually governed by `SYS_CTL0` bit 1 (*BOOST output
-    /// always-on*, reset **1**) with the dwell in `SYS_CTL2[3:2]`. The old blind
-    /// `SYS_CTL0 = 0x35` cleared that bit, so the firmware was plausibly *arming*
-    /// the very shutdown this function claimed to disable. Preserving it now
-    /// restores the reset default. `SYS_CTL1` bit 0 — the Batlow 3.0 V
-    /// low-battery shutdown — is reset-enabled and deliberately left alone.
+    /// always-on*, reset **1**) with the dwell in `SYS_CTL2[3:2]`; it is now
+    /// owned outright, set with the enable and cleared with it. `SYS_CTL1`
+    /// bit 0 — the Batlow 3.0 V low-battery shutdown — is reset-enabled and
+    /// deliberately left alone.
     pub fn blocking_init(&mut self) {
         // Retry: the XIAO runs off LDO1 straight from +BATT, so it boots the
         // instant a battery is connected — potentially before the IP5306 has
         // finished its own power-on and can answer I2C. The previous version
-        // swallowed that error and logged success anyway, leaving the 5 V boost
-        // OFF with nothing to ever turn it on: no rail, no controller on the
-        // Maple bus, no VMU, and a board that looks alive over BLE because the
-        // XIAO is not powered from the boost. Observed 2026-07-25 on a battery
-        // hot-plug.
+        // swallowed that error and logged success anyway, leaving the chip in
+        // whatever state it woke in and the log claiming otherwise. Observed
+        // 2026-07-25 on a battery hot-plug (back when this write was the one
+        // that enabled the boost; a silent failure then meant no rail at all).
         const ATTEMPTS: usize = 10;
         let mut ok = false;
         for _ in 0..ATTEMPTS {
-            if self.blocking_update_ctl0(|v| v | SYS_CTL0_OWNED) {
+            if self.blocking_update_ctl0(ctl0_rail_off) {
                 ok = true;
                 break;
             }
@@ -142,48 +186,90 @@ impl Ip5306 {
         }
 
         // Report what actually happened. A failure here is not fatal — the
-        // periodic `refresh_config` will keep trying — but silently claiming
-        // success cost an evening of debugging.
+        // Phase 2 `rail_on` and the periodic `refresh_config` will keep trying —
+        // but silently claiming success cost an evening of debugging.
         if ok {
-            crate::log!("IP5306: init OK (boost + charger enabled)");
+            crate::log!("IP5306: init OK (charger on, boost off until BLE connects)");
         } else {
             crate::log!("IP5306: init FAILED after {} attempts — no I2C", ATTEMPTS);
         }
     }
 
-    /// Power the 5 V boost down for System Off, keeping the charger enabled so a
-    /// board left plugged in still charges while asleep. Blocking, best-effort
-    /// (I²C errors swallowed — we're about to power off regardless).
+    /// Bring the 5 V rail up: boost enabled and always-on, charger on. Blocking
+    /// RMW, so it can sit behind the synchronous `Power::rail_on` in the board
+    /// contract; it fires at phase transitions (BLE connect, the Phase 1 VMU
+    /// splashes), never per poll, so a few tens of µs on the I²C bus is fine.
+    ///
+    /// Best-effort: on I²C failure the log says so. On the connect path the
+    /// Phase 2 `refresh_config` — which asserts the same bits — retries within
+    /// the detect loop, so a transient NAK there does not strand a connection
+    /// with no rail; the Phase 1 splash paths have no such retry and simply
+    /// fail to render, which is their contract.
+    pub fn blocking_boost_on(&mut self) {
+        if self.blocking_update_ctl0(|v| v | SYS_CTL0_RAIL_ON) {
+            crate::log!("IP5306: 5V boost on");
+        } else {
+            crate::log!("IP5306: 5V boost on FAILED — I2C error");
+        }
+    }
+
+    /// Bring the 5 V rail down, keeping the charger enabled so a plugged-in
+    /// board charges — whether it is idle in Phase 1 (`Power::rail_off` on BLE
+    /// disconnect) or asleep (`Power::prepare_for_sleep` ahead of System Off).
+    /// Blocking, best-effort (I²C errors swallowed; a failed disconnect-time
+    /// write is retried by the next transition, and on the sleep path we're
+    /// about to power off regardless).
     ///
     /// Safe to drop the 5 V rail: it only feeds the Dreamcast controller + rumble
     /// motor; the XIAO itself runs off LDO1 straight from the battery, so cutting
-    /// the boost never removes MCU power. Re-enabled automatically on wake — a
-    /// System-Off wake resets the chip, which re-runs [`Ip5306::blocking_init`].
+    /// the boost never removes MCU power. Re-enabled by [`Ip5306::blocking_boost_on`]
+    /// when the next BLE host connects.
+    ///
+    /// **Clears [`SYS_CTL0_BOOST_ALWAYS_ON`] as well as the enable bit**, and that
+    /// is the whole point. Clearing the enable alone did not bring the rail down:
+    /// always-on holds the output up regardless, so the controller and VMU kept
+    /// drawing from the cell right through System Off. A unit left plugged in
+    /// then charged nothing, because the input current went to that load instead
+    /// of the pack — while an older build, which blind-wrote `0x35` and so
+    /// happened to leave always-on clear, charged normally. Diagnosed 2026-08-17
+    /// by comparing the two units directly.
+    ///
+    /// `blocking_boost_on` and `refresh_config` set it again with the enable
+    /// (both assert [`SYS_CTL0_RAIL_ON`]), so the rail is always-on whenever it
+    /// is up at all — which is what keeps an idle-but-attached controller from
+    /// being dropped by the light-load timer mid-session.
     pub fn blocking_boost_off(&mut self) {
-        if self.blocking_update_ctl0(|v| (v & !SYS_CTL0_BOOST_EN) | SYS_CTL0_CHARGER_EN) {
-            crate::log!("IP5306: 5V boost off (sleep)");
+        if self.blocking_update_ctl0(ctl0_rail_off) {
+            crate::log!("IP5306: 5V boost off");
             return;
         }
-        // The read failed and we are on our way into System Off, where a live
-        // boost drains the pack for however long the board sleeps. That outcome
-        // is worse than a blind write, so fall back to one — but to the
-        // documented reset value with the boost bit cleared, which at least
-        // lands the correct reserved bits rather than zeros.
+        // The read failed. On the sleep path that means going into System Off
+        // with a live boost draining the pack for however long the board
+        // sleeps; on the disconnect path it means charging keeps competing with
+        // the controller until the next transition. Both are worse than a blind
+        // write, so fall back to one — but to the documented reset value with
+        // the boost bits cleared, which at least lands the correct reserved
+        // bits rather than zeros.
         let _ = self
             .twim
-            .blocking_write(ADDR, &[REG_SYS_CTL0, SYS_CTL0_RESET & !SYS_CTL0_BOOST_EN]);
-        crate::log!("IP5306: 5V boost off (sleep) — blind fallback, I2C read failed");
+            .blocking_write(ADDR, &[REG_SYS_CTL0, ctl0_rail_off(SYS_CTL0_RESET)]);
+        crate::log!("IP5306: 5V boost off — blind fallback, I2C read failed");
     }
 
-    /// Re-assert the boot configuration, and report whether it had drifted.
+    /// Re-assert the rail-up configuration, and report whether it had drifted.
     ///
-    /// [`Ip5306::blocking_init`] writes `SYS_CTL0` exactly once at startup and
+    /// **Only meaningful while the rail should be up** — Phase 2 and Phase 3,
+    /// which is where `main.rs` calls it. It asserts [`SYS_CTL0_RAIL_ON`], so a
+    /// call from Phase 1 would silently undo `rail_off` and put the boost back
+    /// in competition with the charger.
+    ///
+    /// [`Ip5306::blocking_boost_on`] writes `SYS_CTL0` once at BLE connect and
     /// nothing ever verifies it again. Anything that perturbs the chip —
     /// VIN insertion or removal being the obvious candidate — then leaves us
     /// running with unknown config indefinitely, with no path back to a good
     /// state. That is the failure mode this exists to close.
     ///
-    /// Returns `true` if the boost or charger bit had actually been cleared —
+    /// Returns `true` if any of the boost, always-on or charger bits had actually been cleared —
     /// i.e. the config really had drifted. That distinguishes "this fixed it"
     /// from "this was never the problem", which matters when the alternative is
     /// guessing.
@@ -203,12 +289,12 @@ impl Ip5306 {
         {
             return false;
         }
-        if cur[0] & SYS_CTL0_OWNED == SYS_CTL0_OWNED {
+        if cur[0] & SYS_CTL0_RAIL_ON == SYS_CTL0_RAIL_ON {
             return false; // nothing to do; leave the register untouched
         }
         let _ = self
             .twim
-            .write(ADDR, &[REG_SYS_CTL0, cur[0] | SYS_CTL0_OWNED])
+            .write(ADDR, &[REG_SYS_CTL0, cur[0] | SYS_CTL0_RAIL_ON])
             .await;
         true
     }

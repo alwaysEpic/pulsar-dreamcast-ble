@@ -51,11 +51,10 @@ pub enum MapleResult<T> {
     /// No response (timeout).
     Timeout,
     /// Unexpected response command.
-    UnexpectedResponse(#[allow(dead_code)] u8),
+    UnexpectedResponse(u8),
 }
 
 /// Device information returned by Device Info Request.
-#[allow(dead_code)] // Fields populated but not yet consumed
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     /// Function type bitmap.
@@ -110,7 +109,7 @@ impl MapleHost {
     /// retry burst costs ≤ ~10ms (one connection interval) instead of the
     /// old 25-36ms (2-3 intervals of delivery gap, the 45-60ms stalls).
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { timeout_us: 2_000 }
     }
 
@@ -138,7 +137,10 @@ impl MapleHost {
             return MapleResult::UnexpectedResponse(pkt.command);
         }
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "region and direction are byte fields extracted from a device-info word; the shifts leave only the intended byte"
+        )]
         let info = DeviceInfo {
             functions: pkt.payload[0],
             sub_functions: [pkt.payload[1], pkt.payload[2], pkt.payload[3]],
@@ -312,7 +314,6 @@ impl MapleHost {
     ///
     /// Guarantees interrupt-free TX but disrupts BLE connections.
     /// Kept for reference — use [`write_vmu_lcd`] for now.
-    #[allow(dead_code)]
     pub fn write_vmu_lcd_timeslot(&self, bus: &mut MapleBus, framebuffer: &[u8; 192]) -> bool {
         use super::timeslot_tx;
 

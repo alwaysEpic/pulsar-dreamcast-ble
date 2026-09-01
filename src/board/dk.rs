@@ -66,8 +66,7 @@ impl StatusIndicator {
     }
 
     /// Battery gauge — no-op. DK LEDs are discrete status only; no battery gauge.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn set_battery(&mut self, _percent: Option<u8>) {}
+    pub const fn set_battery(&mut self, _percent: Option<u8>) {}
 
     /// TX activity indicator on (LED2).
     pub fn tx_activity_on(&mut self) {
@@ -85,37 +84,42 @@ pub struct Power;
 
 impl Power {
     /// No boost rail on the DK.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn rail_on(&mut self) {}
+    pub const fn rail_on(&mut self) {}
 
     /// No boost rail on the DK.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn rail_off(&mut self) {}
+    pub const fn rail_off(&mut self) {}
 
     /// No configuration to re-assert. No power IC on the DK.
-    #[allow(clippy::unused_self, clippy::unused_async)] // uniform contract API
+    #[expect(
+        clippy::unused_async,
+        reason = "the board contract (ADR-013) fixes this signature so all three boards expose \
+              one API; this board answers without awaiting"
+    )]
     pub async fn refresh_config(&mut self) -> bool {
         false
     }
 
     /// No boost rail on the DK — nothing to power down for sleep.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn prepare_for_sleep(&mut self) {}
+    pub const fn prepare_for_sleep(&mut self) {}
 
     /// The DK runs from the debugger USB; report not externally battery-gated.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn is_externally_powered(&self) -> bool {
+    #[must_use]
+    pub const fn is_externally_powered(&self) -> bool {
         false
     }
 
     /// No charge circuit on the DK.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn is_charging(&self) -> bool {
+    #[must_use]
+    pub const fn is_charging(&self) -> bool {
         false
     }
 
     /// No battery gauge on the DK.
-    #[allow(clippy::unused_self, clippy::unused_async)] // uniform contract API
+    #[expect(
+        clippy::unused_async,
+        reason = "the board contract (ADR-013) fixes this signature so all three boards expose \
+              one API; this board answers without awaiting"
+    )]
     pub async fn battery(&mut self) -> Option<BatteryStatus> {
         None
     }
@@ -126,8 +130,7 @@ pub struct Rumble;
 
 impl Rumble {
     /// No motor on the DK.
-    #[allow(clippy::unused_self)] // uniform contract API
-    pub fn set(&mut self, _intensity: u8) {}
+    pub const fn set(&mut self, _intensity: u8) {}
 }
 
 /// Initialized board pins, ready for use by the main task.
@@ -142,19 +145,26 @@ pub struct BoardPins {
 }
 
 /// No board-specific Embassy config on the DK.
-#[allow(clippy::missing_const_for_fn)] // uniform contract API (other boards mutate config)
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "uniform contract API (other boards mutate config)"
+)]
 pub fn configure_embassy(_config: &mut embassy_nrf::config::Config) {}
 
 /// No silicon housekeeping needed on the DK.
 ///
 /// # Safety
 /// No-op; the signature mirrors the board contract.
-pub unsafe fn early_init() {}
+pub const unsafe fn early_init() {}
 
 /// Initialize all board pins from the HAL singletons.
 ///
 /// The sync LED (LED1) is separated so it can be moved into the sync button task.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "sdcka/sdckb are the Maple Bus signal names from the protocol spec; renaming them would break the correspondence to the wiring"
+)]
+#[must_use]
 pub fn init(p: Peripherals) -> BoardPins {
     let sdcka = Flex::new(p.P0_05);
     let sdckb = Flex::new(p.P0_06);

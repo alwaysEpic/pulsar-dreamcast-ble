@@ -24,7 +24,9 @@
 //!   controller rail directly (a Schottky USB passthrough), so `main.rs` can
 //!   leave `rail_off()` while plugged in. False where the rail is always
 //!   locally generated; `main.rs` then never consults `is_externally_powered()`
-//!   for rail decisions, and `rail_on`/`rail_off` stay pure no-ops.
+//!   for rail decisions. Independent of `rail_on`/`rail_off` being real: they
+//!   are BLE-gated on every board that has a switchable rail (ADR-005) and
+//!   no-ops only where there is nothing to switch (dk).
 //!
 //! ## Lifecycle
 //! - `pub fn configure_embassy(config: &mut embassy_nrf::config::Config)` —
@@ -50,13 +52,21 @@
 //! - `fn tx_activity_on(&mut self)` · `fn tx_activity_off(&mut self)`
 //!
 //! ## `Power` (rail + gauge; no-op / `None` where a board has neither)
-//! - `fn rail_on(&mut self)` · `fn rail_off(&mut self)`
+//! - `fn rail_on(&mut self)` · `fn rail_off(&mut self)` — synchronous, and
+//!   called at phase transitions only (BLE connect/disconnect, the Phase 1 VMU
+//!   splashes), so a board may spend tens of µs of blocking I/O here (pulsarv1's
+//!   I²C RMW). Boot state is rail **off** on every board (ADR-005).
 //! - `fn prepare_for_sleep(&mut self)` — power the 5 V rail down before
 //!   `enter_sleep()` so it can't drain the battery in System Off. `main.rs`
 //!   calls it from its `sleep_now` helper ahead of every `enter_sleep()`.
 //!   No-op where a board has no rail, or (XIAO) handles rail-off inside
 //!   `enter_sleep` itself.
-//! - `fn is_externally_powered(&self) -> bool`
+//! - `fn is_externally_powered(&self) -> bool` · `fn is_charging(&self) -> bool`
+//! - `async fn refresh_config(&mut self) -> bool` — re-assert whatever rail-up
+//!   configuration the board's power IC holds; `true` if it had drifted.
+//!   **Rail-up phases only** (Phase 2/3): it asserts the rail-on state, so a
+//!   call while disconnected would undo `rail_off`. `false` and no-op where
+//!   there is nothing to drift (xiao, dk).
 //! - `async fn battery(&mut self) -> Option<BatteryStatus>` — `None` = no gauge.
 //!
 //! Everything is compile-time monomorphized through the one selected module, so
@@ -91,7 +101,6 @@ pub use xiao::*;
 /// synthetic value, so `main.rs` can treat "no battery" and "battery present"
 /// uniformly (the reporting/low-cutoff logic simply skips when `None`).
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // fields consumed per-board; not all boards read all fields
 pub struct BatteryStatus {
     /// Battery terminal voltage in millivolts.
     pub millivolts: u32,

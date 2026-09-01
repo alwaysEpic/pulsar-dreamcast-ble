@@ -29,7 +29,7 @@ pub const HALF_BIT_NOPS: u32 = 32;
 /// The old `HALF_BIT_NOPS = 32` loop works on the production XIAO, but its
 /// actual duration is a codegen artifact: with fat LTO, unrelated code changes
 /// can re-inline the TX path and move the wire timing. POLLPHASE data from that
-/// working build puts a GET_CONDITION TX around 395us. That frame contains 163
+/// working build puts a `GET_CONDITION` TX around 395us. That frame contains 163
 /// calls to `delay_half_bit` (idle + start + frame + one payload word + CRC +
 /// end), so the known-good XIAO center is about 155 CPU cycles per half-bit.
 const HALF_BIT_CYCLES: u32 = 155;
@@ -43,6 +43,11 @@ const CPU_MHZ: u32 = 64;
 
 /// NOP iterations for pin stabilization after output mode set.
 pub const PIN_STABILIZE_NOPS: u32 = 100;
+
+/// Payload word count of a VMU LCD `BLOCK_WRITE` packet: one LCD function
+/// word + one block/phase word + 48 words of pixel data. Lands in the low
+/// byte of the frame word.
+pub const LCD_PAYLOAD_WORDS: u32 = 50;
 
 /// NOP iterations for pull-up stabilization after input mode set.
 const PULLUP_STABILIZE_NOPS: u32 = 200;
@@ -61,7 +66,7 @@ const MIN_DECODE_BITS: usize = 32;
 /// packet is rejected as "incomplete" with nothing indicating a buffer ran out.
 ///
 /// The previous value of 960 (120 bytes) sat 3 bytes above the 117 a 28-word
-/// DEVICE_INFO response needs (`4 + 28*4 + 1`). That margin is now load-bearing:
+/// `DEVICE_INFO` response needs (`4 + 28*4 + 1`). That margin is now load-bearing:
 /// VMU presence is read from the controller's device-info reply every 3s
 /// ([`crate::maple::host::MapleHost::sub_peripheral_mask`]), so this path takes
 /// a full-length response continuously rather than only at controller detect.
@@ -95,6 +100,17 @@ pub(crate) static mut SAMPLE_BUFFER: [u32; SAMPLE_BUFFER_LEN] = [0; SAMPLE_BUFFE
 /// bulk sampling — the same exclusivity argument as `wait_and_sample`. The
 /// buffer is in RAM, as EasyDMA requires.
 pub(crate) fn tx_waveform_buf() -> &'static mut [u16] {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "taking the address and building the slice are one derivation, \
+                  justified by the single exclusivity argument above"
+    )]
+    // SAFETY: as the doc comment above states — single-core, and TX waveform
+    // building/playback never overlaps RX bulk sampling, so no second live
+    // reference to `SAMPLE_BUFFER` can exist. `addr_of_mut!` avoids creating an
+    // intermediate reference to the static. Reinterpreting as `u16` is sound:
+    // it has weaker alignment than `u32`, and the doubled length covers exactly
+    // the same bytes. The buffer is in RAM, as EasyDMA requires.
     unsafe {
         core::slice::from_raw_parts_mut(
             core::ptr::addr_of_mut!(SAMPLE_BUFFER).cast::<u16>(),
@@ -114,11 +130,20 @@ const GPIO_IN_OFFSET: u32 = 0x510;
 /// Read P0 IN register directly.
 #[inline]
 fn read_p0_in() -> u32 {
-    // MMIO register access requires integer-to-pointer cast
+    // SAFETY: MMIO register access requires an integer-to-pointer cast. P0's IN
+    // register sits at a fixed, word-aligned address defined by the nRF52840
+    // memory map, so the pointer is always valid. IN is read-only and
+    // side-effect free, so a volatile read cannot disturb the peripheral or
+    // race anything.
     unsafe { core::ptr::read_volatile((P0_BASE + GPIO_IN_OFFSET) as *const u32) }
 }
 
 /// Read the DWT cycle counter. Enabled once in `MapleBus::new`.
+#[expect(
+    clippy::inline_always,
+    reason = "the half-bit schedule is measured in CPU cycles, so a call/return in this path is a timing error, not \
+              an optimiser preference (see HALF_BIT_CYCLES)"
+)]
 #[inline(always)]
 fn cyccnt() -> u32 {
     // SAFETY: CYCCNT is a free-running read-only counter; reading is always safe.
@@ -133,6 +158,11 @@ fn cyccnt() -> u32 {
 static mut TX_DEADLINE: u32 = 0;
 
 /// Reset the half-bit schedule to "now" at the start of each TX frame.
+#[expect(
+    clippy::inline_always,
+    reason = "the half-bit schedule is measured in CPU cycles, so a call/return in this path is a timing error, not \
+              an optimiser preference (see HALF_BIT_CYCLES)"
+)]
 #[inline(always)]
 fn tx_timing_reset() {
     // SAFETY: single TX context (see `TX_DEADLINE`).
@@ -145,10 +175,26 @@ fn tx_timing_reset() {
 /// Rust `for` loop. If the wait is late by more than normal read/branch
 /// overshoot, resync to the delivered edge so we stretch one half-bit rather
 /// than compressing the next one.
+#[expect(
+    clippy::inline_always,
+    reason = "the half-bit schedule is measured in CPU cycles, so a call/return in this path is a timing error, not \
+              an optimiser preference (see HALF_BIT_CYCLES)"
+)]
 #[inline(always)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "the wrap is the point: the signed difference of two wrapping cycle counters is how the deadline comparison stays correct across CYCCNT rollover"
+)]
 fn delay_half_bit() {
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: single TX context (see `TX_DEADLINE`).
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "read-modify-write of TX_DEADLINE is one update; splitting it would \
+                  imply the halves can be reasoned about independently"
+    )]
+    // SAFETY: single TX context (see `TX_DEADLINE`). Only one transmit runs at a
+    // time and TX is never re-entered from an interrupt, so this
+    // read-modify-write of the static cannot race.
     let deadline = unsafe {
         let d = TX_DEADLINE.wrapping_add(HALF_BIT_CYCLES);
         TX_DEADLINE = d;
@@ -178,7 +224,7 @@ impl MapleBus {
     ///
     /// Initializes pins in idle state (SDCKA high, SDCKB low).
     #[must_use]
-    #[allow(clippy::similar_names)] // sdcka/sdckb are protocol names
+    #[expect(clippy::similar_names, reason = "sdcka/sdckb are protocol names")]
     pub fn new(mut sdcka: Flex<'static>, mut sdckb: Flex<'static>) -> Self {
         // Start in output mode with idle state
         sdcka.set_as_output(embassy_nrf::gpio::OutputDrive::HighDrive);
@@ -267,16 +313,16 @@ impl MapleBus {
             last = val;
         }
 
-        let final_val = read_p0_in();
-        let _final_a = (final_val & PIN_A_MASK) != 0;
-        let _final_b = (final_val & PIN_B_MASK) != 0;
+        let _final_val = read_p0_in();
+        // Computed inside `log!` rather than bound first: `log!` compiles to
+        // nothing without `rtt`, so bindings here would be dead in production.
         log!(
             "DIAG: A_low={}/1000 B_low={}/1000 trans={} final A={} B={}",
             _a_low_count,
             _b_low_count,
             _transitions,
-            u8::from(_final_a),
-            u8::from(_final_b)
+            u8::from((_final_val & PIN_A_MASK) != 0),
+            u8::from((_final_val & PIN_B_MASK) != 0)
         );
 
         // Restore output idle
@@ -442,7 +488,10 @@ impl MapleBus {
 
         let mut crc: u8 = 0;
 
-        let frame: u32 = (0x0C_u32 << 24) | (u32::from(dest) << 16) | (u32::from(sender) << 8) | 50;
+        let frame: u32 = (0x0C_u32 << 24)
+            | (u32::from(dest) << 16)
+            | (u32::from(sender) << 8)
+            | LCD_PAYLOAD_WORDS;
         self.write_word(frame, &mut phase);
         Self::update_crc(frame, &mut crc);
 
@@ -510,8 +559,16 @@ impl MapleBus {
     pub fn wait_and_sample(&mut self, timeout_us: u32) -> (bool, u32, usize) {
         self.set_input_mode();
 
-        // SAFETY: Single-core, interrupts disabled during sampling. Only one
-        // mutable reference exists at a time — no concurrent access possible.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "the reborrow and the never-None unwrap are one derivation of the \
+                      buffer reference, sound for the same reason"
+        )]
+        // SAFETY: single-core, and interrupts are disabled for the duration of
+        // sampling, so only one mutable reference to `SAMPLE_BUFFER` is live at
+        // a time — no concurrent access is possible. `addr_of_mut!` on a static
+        // always yields a non-null, well-aligned, initialised pointer, so
+        // `as_mut()` cannot return `None` and `unwrap_unchecked` is discharged.
         let samples = unsafe {
             core::ptr::addr_of_mut!(SAMPLE_BUFFER)
                 .as_mut()
@@ -552,6 +609,15 @@ impl MapleBus {
                 // the encoding is byte-identical (14 bytes) in every build,
                 // and `.p2align 2` pins the branch target word-aligned.
                 compiler_fence(Ordering::SeqCst);
+                // SAFETY: the asm only reads P0 IN through r12 and writes words
+                // into the `SAMPLE_BUFFER` region addressed by r2, bounded by
+                // the `end` operand — it stays inside the buffer proved
+                // exclusive above and touches no other memory. All registers it
+                // clobbers are declared in the operand list, and it neither
+                // calls nor branches outside its own loop label. Do not edit the
+                // body: the exact 5-instruction encoding and the `.p2align 2`
+                // branch target are load-bearing (see the comment above and
+                // scripts/check_timing_invariants.sh).
                 unsafe {
                     core::arch::asm!(
                         ".p2align 2",
@@ -581,7 +647,6 @@ impl MapleBus {
 
     /// Decode bits from bulk samples.
     #[must_use]
-    #[allow(clippy::unused_self)] // Method on bus for API consistency
     pub fn decode_bulk_samples(
         &self,
         samples: &[u32],
@@ -670,6 +735,10 @@ impl MapleBus {
     }
 
     /// Read a complete response packet using bulk sampling.
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "the if/let reads as the decode fallback it is; map_or_else would bury both branches in closures"
+    )]
     pub fn read_packet_bulk(&mut self, timeout_us: u32) -> Option<MaplePacket> {
         // poll-timing spans are taken here, around whole calls — never inside
         // wait_and_sample, whose wait/capture loops are timing-critical.
@@ -686,8 +755,16 @@ impl MapleBus {
             return None;
         }
 
-        // SAFETY: Single-core, interrupts disabled during sampling. The mutable
-        // reference from `wait_and_sample` has been dropped before this read.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "the reborrow and the never-None unwrap are one derivation of the \
+                      buffer reference, sound for the same reason"
+        )]
+        // SAFETY: single-core, and the mutable reference handed out by
+        // `wait_and_sample` has already been dropped, so this shared reference
+        // to `SAMPLE_BUFFER` cannot alias a live `&mut`. `addr_of!` on a static
+        // always yields a non-null, well-aligned, initialised pointer, so
+        // `as_ref()` cannot return `None` and `unwrap_unchecked` is discharged.
         let samples = unsafe {
             core::ptr::addr_of!(SAMPLE_BUFFER)
                 .as_ref()
@@ -738,11 +815,8 @@ impl MapleBus {
         // Parse frame word (LSB byte first)
         let frame = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
-        #[allow(clippy::cast_possible_truncation)]
         let command = ((frame >> 24) & 0xFF) as u8;
-        #[allow(clippy::cast_possible_truncation)]
         let recipient = ((frame >> 16) & 0xFF) as u8;
-        #[allow(clippy::cast_possible_truncation)]
         let sender = ((frame >> 8) & 0xFF) as u8;
         let length = (frame & 0xFF) as usize;
 
