@@ -41,13 +41,26 @@ fn nvmc_wait() {
 /// # Safety
 /// Caller must ensure the page address is valid and not in use by `SoftDevice`.
 unsafe fn nvmc_erase_page(addr: u32) {
-    nvmc_wait();
-    core::ptr::write_volatile(NVMC_CONFIG, 2); // Erase enable
-    nvmc_wait();
-    core::ptr::write_volatile(NVMC_ERASEPAGE, addr);
-    nvmc_wait();
-    core::ptr::write_volatile(NVMC_CONFIG, 0); // Read-only
-    nvmc_wait();
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "one NVMC erase transaction: enable, erase, back to read-only, each \
+                  separated by a ready-wait. The sequence is the safety argument"
+    )]
+    // SAFETY: `NVMC_CONFIG` and `NVMC_ERASEPAGE` are fixed, word-aligned
+    // registers. `addr` is the caller's responsibility per the `# Safety`
+    // contract above. `nvmc_wait` spins until the controller reports ready
+    // before and after each step, which is what NVMC requires between mode
+    // changes; CONFIG is returned to read-only so no stray write can reach
+    // flash afterwards.
+    unsafe {
+        nvmc_wait();
+        core::ptr::write_volatile(NVMC_CONFIG, 2); // Erase enable
+        nvmc_wait();
+        core::ptr::write_volatile(NVMC_ERASEPAGE, addr);
+        nvmc_wait();
+        core::ptr::write_volatile(NVMC_CONFIG, 0); // Read-only
+        nvmc_wait();
+    }
 }
 
 /// Write a 4-byte aligned word to flash using raw NVMC registers.
@@ -55,13 +68,25 @@ unsafe fn nvmc_erase_page(addr: u32) {
 /// # Safety
 /// Caller must ensure the address is valid, aligned, and in an erased page.
 unsafe fn nvmc_write_word(addr: u32, value: u32) {
-    nvmc_wait();
-    core::ptr::write_volatile(NVMC_CONFIG, 1); // Write enable
-    nvmc_wait();
-    core::ptr::write_volatile(addr as *mut u32, value);
-    nvmc_wait();
-    core::ptr::write_volatile(NVMC_CONFIG, 0); // Read-only
-    nvmc_wait();
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "one NVMC write transaction: enable, store, back to read-only, each \
+                  separated by a ready-wait. The sequence is the safety argument"
+    )]
+    // SAFETY: `NVMC_CONFIG` is a fixed, word-aligned register. That `addr` is
+    // valid, word-aligned and inside an erased page is the caller's
+    // responsibility per the `# Safety` contract above. `nvmc_wait` spins until
+    // the controller reports ready around each step, and CONFIG is returned to
+    // read-only so no stray write can reach flash afterwards.
+    unsafe {
+        nvmc_wait();
+        core::ptr::write_volatile(NVMC_CONFIG, 1); // Write enable
+        nvmc_wait();
+        core::ptr::write_volatile(addr as *mut u32, value);
+        nvmc_wait();
+        core::ptr::write_volatile(NVMC_CONFIG, 0); // Read-only
+        nvmc_wait();
+    }
 }
 
 /// Small fixed-capacity buffer for formatting the panic message.
@@ -111,9 +136,23 @@ fn panic(info: &PanicInfo) -> ! {
     let already_stored =
         unsafe { core::ptr::read_volatile(PANIC_FLASH_ADDR as *const u32) } == PANIC_MAGIC;
 
-    // SAFETY: Writing to a dedicated flash page that is not used by SoftDevice.
-    // In a panic handler, nothing else is running, so NVMC access is safe.
     if !already_stored {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "erase-then-write is one flash transaction and the ordering is \
+                      the safety argument; splitting it would separate operations \
+                      that are only sound as a sequence"
+        )]
+        // SAFETY: `PANIC_FLASH_ADDR` names a page reserved for this handler in
+        // memory.x and claimed by no other code — not the SoftDevice, not the
+        // bond store, not the bootloader settings — so erasing and rewriting it
+        // cannot corrupt anything else. The erase strictly precedes the writes,
+        // which is what NVMC requires (a flash word can only be written once per
+        // erase). We are inside the panic handler with interrupts effectively
+        // dead and nothing else running, so no concurrent NVMC user can race the
+        // controller. Every write stays inside the page: `words` is bounded by
+        // `buf.pos <= MAX_MSG_LEN` and the page holds the magic plus that
+        // message.
         unsafe {
             nvmc_erase_page(PANIC_FLASH_ADDR);
 
@@ -131,7 +170,11 @@ fn panic(info: &PanicInfo) -> ! {
                     }
                 }
                 let word = u32::from_le_bytes(word_bytes);
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "i is bounded by words = buf.pos.div_ceil(4), and buf.pos \
+                              is at most MAX_MSG_LEN — far inside u32"
+                )]
                 nvmc_write_word(PANIC_FLASH_ADDR + 4 + (i as u32) * 4, word);
             }
         }
@@ -157,7 +200,17 @@ pub fn check_panic_log() {
     let msg_base = (PANIC_FLASH_ADDR + 4) as *const u8;
     let mut len = 0;
     while len < MAX_MSG_LEN {
-        // SAFETY: Reading from flash within the page.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "the offset and the read are a single indivisible access; the \
+                      bound proved above is what makes both sound"
+        )]
+        // SAFETY: `len < MAX_MSG_LEN` is the loop condition, and the reserved
+        // page holds the magic word plus MAX_MSG_LEN message bytes, so
+        // `msg_base.add(len)` stays inside the same allocation the pointer was
+        // derived from. Flash is readable as bytes at any alignment, and the
+        // page is always initialised — an erased cell reads 0xFF, which the
+        // check below treats as end-of-message.
         let byte = unsafe { core::ptr::read_volatile(msg_base.add(len)) };
         if byte == 0 || byte == 0xFF {
             break;
@@ -166,6 +219,12 @@ pub fn check_panic_log() {
     }
 
     if len > 0 {
+        // SAFETY: the loop above established that `msg_base .. msg_base + len`
+        // are all readable bytes within the reserved page, and `len <=
+        // MAX_MSG_LEN`. The region is flash: it is immutable for the lifetime of
+        // this borrow (nothing writes the page until the clear below, which
+        // happens after `msg_slice` is dropped), so the aliasing rules for a
+        // shared slice hold. `u8` has no alignment requirement.
         let msg_slice = unsafe { core::slice::from_raw_parts(msg_base, len) };
         if let Ok(_msg) = core::str::from_utf8(msg_slice) {
             crate::log!("{}", _msg);
@@ -186,6 +245,11 @@ pub fn check_panic_log() {
     // take out the bootloader. Leaving the page dirty costs nothing (it is
     // unreadable without RTT anyway) and keeps a loop flash-silent.
     #[cfg(feature = "rtt")]
+    // SAFETY: `PANIC_FLASH_ADDR` names the page reserved for this handler in
+    // memory.x, claimed by no other code, so erasing it cannot disturb the
+    // SoftDevice, the bond store or the bootloader settings. This runs at boot
+    // from `check_panic_log`, before any task is spawned, so nothing else can be
+    // using the NVMC controller concurrently.
     unsafe {
         nvmc_erase_page(PANIC_FLASH_ADDR);
     }

@@ -9,7 +9,7 @@
 
 #![no_std]
 
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
 use embassy_sync::signal::Signal;
 
 /// RTT print macro — compiles to nothing when the `rtt` feature is disabled.
@@ -19,7 +19,7 @@ use embassy_sync::signal::Signal;
 /// critical section, and a ~120-char POLLTIME line with ten integer
 /// conversions is a 50-200µs interrupt blackout. At 2 log lines/sec that
 /// produced stochastic SoftDevice assertion panics (~1/min) in every
-/// instrumented build of 2026-06-10/11 — see poll_timing's module docs for
+/// instrumented build of 2026-06-10/11 — see `poll_timing`'s module docs for
 /// the full post-mortem. With pre-formatting, the critical section shrinks
 /// to a memcpy of the rendered bytes. Lines over 256 chars are truncated.
 #[cfg(feature = "rtt")]
@@ -68,7 +68,9 @@ pub mod poll_timing;
 pub mod vmu;
 
 /// Count of poll-loop body-budget overruns: iterations whose body (poll top
-/// to pacer, excluding all pacer waiting) ran past `BODY_BUDGET_MS`. With
+/// to pacer, excluding all pacer waiting) ran past `BODY_BUDGET_MS`.
+///
+/// With
 /// the radio-quiet gate active a body only exceeds the budget when its Maple
 /// transaction collided anyway (retries) or something new got slow — so this
 /// is the always-compiled production self-check for a bad roll or a gate
@@ -83,7 +85,9 @@ pub const NOTIFY_INTERVAL_MS: u64 = 8;
 
 /// Delay before sending the first HID notify, giving the host time to
 /// finish service discovery and write the CCCD that subscribes to
-/// notifications. Reports sent before subscription return an error from
+/// notifications.
+///
+/// Reports sent before subscription return an error from
 /// `report_notify` and count toward `MAX_NOTIFY_FAILURES` — too short and
 /// we'll disconnect a slow-subscribing host.
 ///
@@ -100,9 +104,20 @@ pub const MAX_NOTIFY_FAILURES: u8 = 10;
 /// Timeout before entering sleep when disconnected (ms).
 pub const SLEEP_TIMEOUT_MS: u64 = 60_000;
 
-/// Shared controller state between maple and BLE tasks.
-pub static CONTROLLER_STATE: Signal<CriticalSectionRawMutex, maple::ControllerState> =
-    Signal::new();
+/// Latest raw Dreamcast controller sample shared between thread-mode tasks.
+///
+/// The Maple producer publishes every successful poll, including small analog
+/// movements that [`maple::ControllerState::state_changed`] intentionally
+/// filters out for inactivity/HID wake purposes. The active BLE personality is
+/// the single consumer: normal HID during ordinary boots, or `LiveInput` during
+/// an exclusive configuration boot.
+///
+/// Both sides run on Embassy's one thread-mode executor and neither accesses
+/// this slot from an interrupt. `ThreadModeRawMutex` therefore gives a
+/// whole-value latest-sample handoff without masking SoftDevice interrupts on
+/// every ~66 Hz Maple poll. It also asserts if that executor-only invariant is
+/// accidentally broken later.
+pub static RAW_CONTROLLER_STATE: Signal<ThreadModeRawMutex, maple::ControllerState> = Signal::new();
 
 /// Signal to trigger sync/pairing mode (clears bonds).
 pub static SYNC_MODE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -111,6 +126,7 @@ pub static SYNC_MODE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static PROFILE_CHANGE: Signal<CriticalSectionRawMutex, ble::ProfileId> = Signal::new();
 
 /// Set by the button task on a 10-second hold to request a graceful System Off.
+///
 /// The main task picks this up, writes a "BYE" splash to the VMU, briefly
 /// holds, then enters System Off. Avoids sleeping mid-write so the goodbye
 /// frame actually lands on the LCD.
@@ -118,6 +134,7 @@ pub static GOODBYE_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Set by the BLE task on the rising edge of the Guide chord (L+R+Start held).
+///
 /// The main poll loop picks this up and briefly flashes a "home" glyph on the
 /// VMU LCD, then resumes normal content. Purely cosmetic and strictly
 /// best-effort: a single non-blocking atomic store on the BLE side, and the
@@ -126,9 +143,13 @@ pub static GOODBYE_PENDING: core::sync::atomic::AtomicBool =
 pub static GUIDE_GLYPH_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Mirror of the Dreamcast controller's Start button, updated by the main
-/// task's poll loop on every `Get Condition` (`CONTROLLER_STATE` can't serve
-/// here: it is a consumed `Signal`, and it only fires on *change*). Cleared on
+/// Mirror of the Dreamcast controller's Start button.
+///
+/// Updated by the main task's poll loop on every `Get Condition`
+/// (`RAW_CONTROLLER_STATE` can't serve here: it is a consumed latest-value
+/// slot).
+///
+/// Cleared on
 /// every failed poll and on leaving the poll loop, so it can never report a
 /// stale press. The button task reads it during a sync-button hold to detect
 /// the OTA DFU gesture — which therefore only works while a controller is
@@ -138,9 +159,12 @@ pub static MAPLE_START_HELD: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Set by the button task when the OTA DFU gesture (sync + Start past 5s)
-/// fires. The main poll loop consumes it: the reboot must come from the main
+/// fires.
+///
+/// The main poll loop consumes it: the reboot must come from the main
 /// task, not the button task, because main owns the Maple bus — it can land a
 /// "BOOT" splash on the VMU first and reset between polls instead of mid-write.
+///
 /// Main also owns the battery gauge, so the gate lives there too: below
 /// `DFU_MIN_BATTERY_PCT` and not charging, the request is refused with a held
 /// "CHRG" splash instead of a reboot.
@@ -148,6 +172,67 @@ pub static MAPLE_START_HELD: core::sync::atomic::AtomicBool =
 /// holds its last frame while dock power holds, and on pulsarv1 the 5V rail is
 /// the IP5306's autonomous boost, which an MCU reset doesn't touch.
 pub static DFU_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// One-boot request for the isolated browser-configuration personality.
+///
+/// GPREGRET2 bit 2 is deliberately outside both shipped bootloaders' entry
+/// protocol: Adafruit does not inspect GPREGRET2, while the Nordic secure
+/// bootloader reserves a masked `0xA9` pattern and leaves this low bit for
+/// application signalling. This remains a spike hypothesis until it is proved
+/// on both physical bootloader paths (Story 001).
+const CONFIG_BOOT_MARKER: u32 = 0x04;
+
+/// Consume the one-boot configuration marker before enabling the SoftDevice.
+///
+/// Call this immediately after `embassy_nrf::init`: that function may reset
+/// once while provisioning APPROTECT, and the marker must survive that reset.
+/// The SoftDevice is still disabled at this point, so direct POWER access is
+/// permitted. Only our bit is cleared; bootloader-owned bits are preserved.
+#[must_use]
+pub fn take_config_boot_marker() -> bool {
+    // nRF52840 POWER base 0x4000_0000 + GPREGRET2 offset 0x520.
+    // Embassy keeps its PAC private unless the unstable-pac feature is enabled;
+    // this single pinned register is clearer than widening that dependency API.
+    const GPREGRET2: *mut u32 = 0x4000_0520 as *mut u32;
+
+    // SAFETY: GPREGRET2 is a 32-bit aligned nRF52840 MMIO register. This runs
+    // after Embassy init but before SoftDevice enable, so the application owns
+    // POWER access. No other task exists yet and the pointer is not retained.
+    let retained = unsafe { core::ptr::read_volatile(GPREGRET2) };
+    let requested = (retained & CONFIG_BOOT_MARKER) != 0;
+    if requested {
+        // SAFETY: same exclusive pre-SoftDevice MMIO access as the read above.
+        // Read-modify-write clears only the application-owned marker bit.
+        unsafe { core::ptr::write_volatile(GPREGRET2, retained & !CONFIG_BOOT_MARKER) };
+        cortex_m::asm::dsb();
+    }
+    requested
+}
+
+/// Set the one-boot configuration marker and reset if the write is verified.
+///
+/// Returns `false` without resetting if the SoftDevice rejects the write or a
+/// readback does not contain the marker. The caller can then suppress the
+/// normal pairing action for this hold instead of silently clearing the bond.
+#[must_use]
+pub fn reboot_into_config() -> bool {
+    use nrf_softdevice_s140 as sd_raw;
+
+    // SAFETY: these are SoftDevice SVCs operating on GPREGRET2 (register id 1).
+    // The first takes only integer values; the second writes one `u32` owned on
+    // this stack and does not retain its pointer. The SoftDevice has been
+    // enabled before the button task can call this function.
+    let set_rc = unsafe { sd_raw::sd_power_gpregret_set(1, CONFIG_BOOT_MARKER) };
+    let mut retained: u32 = 0;
+    // SAFETY: same enabled-SoftDevice precondition as above; `retained` is a
+    // valid, uniquely borrowed output word for the duration of the SVC.
+    let get_rc = unsafe { sd_raw::sd_power_gpregret_get(1, &raw mut retained) };
+    if set_rc != 0 || get_rc != 0 || (retained & CONFIG_BOOT_MARKER) == 0 {
+        return false;
+    }
+
+    cortex_m::peripheral::SCB::sys_reset();
+}
 
 /// Bootloader OTA-entry magic, board-scoped to match the bootloader each
 /// board actually carries (ADR-014):
@@ -160,25 +245,119 @@ const DFU_MAGIC_OTA_RESET: u32 = 0xB1;
 #[cfg(not(feature = "board-pulsarv1"))]
 const DFU_MAGIC_OTA_RESET: u32 = 0xA8;
 
+/// Whether USB VBUS is present — a charger or host is plugged in.
+///
+/// Read through the SoftDevice SVC rather than the raw `0x4000_0438` register
+/// that `board::xiao::is_usb_connected` uses: POWER is a restricted peripheral
+/// while the SoftDevice is enabled, and `sd_power_usbregstatus_get` is the
+/// sanctioned accessor. (The xiao path predates this and is worth converting.)
+///
+/// This is the honest "power is going in" signal on pulsarv1, and deliberately
+/// preferred over the IP5306's gauge bits for display purposes: `charging`
+/// (`0x70` bit 3) goes false the instant the pack tops off, so a full battery on
+/// a charger reads exactly like one on no charger, and `full`'s behaviour once
+/// unplugged has never been verified on hardware. VBUS is a hardware line — on
+/// this carrier the charge input *is* the XIAO's own USB-C (`VBUS → D2 → IP5306
+/// VIN`), so its presence means the cell is being fed.
+#[must_use]
+pub fn usb_vbus_present() -> bool {
+    use nrf_softdevice_s140 as sd_raw;
+
+    let mut status: u32 = 0;
+    // SAFETY: a SoftDevice SVC taking a pointer to a `u32` we own on the stack.
+    // It writes at most that single word and does not retain the pointer. Its
+    // only precondition is an enabled SoftDevice, which holds from
+    // `init_softdevice` onward for the life of the program.
+    let ret = unsafe { sd_raw::sd_power_usbregstatus_get(&raw mut status) };
+
+    // Bit 0 = VBUSDETECT. On a failed call `status` is untouched, so report
+    // "absent" rather than guessing — a bad read must not latch the charge
+    // indicator on with no way to clear it.
+    ret == 0 && (status & 1) != 0
+}
+
 /// Reboot into the board's BLE OTA DFU mode.
 ///
 /// Writes the OTA magic into `GPREGRET` and resets. `GPREGRET` is owned by the
 /// SoftDevice while it is enabled, so the write must go through
-/// `sd_power_gpregret_*` — a direct register write would be rejected. Callers
-/// reach this from a gesture that requires an active BLE connection, so the
-/// SoftDevice is always enabled here.
+/// `sd_power_gpregret_*` — a direct register write would be rejected. The
+/// precondition is only that the SoftDevice is *enabled*, which holds from
+/// `init_softdevice` onward for the life of the program; an active *connection*
+/// is not required, and callers no longer imply one — the tap-tap-hold DFU chord
+/// is reachable from Phase 1 with nothing connected at all.
 ///
 /// pulsarv1 comes up advertising "PulsarDFU" (secure DFU, `0xFE59`); XIAO dev
 /// boards come up as Adafruit's "AdaDFU" (legacy DFU). The DK is flashed bare
 /// over J-Link (no bootloader), so there this is just an app reboot —
 /// harmless, and it keeps the gesture testable end-to-end up to the reset.
 pub fn reboot_into_ota_dfu() -> ! {
+    use nrf_softdevice_s140 as sd_raw;
+
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "clear-then-set is one indivisible register update; splitting it \
+                  would imply the intermediate state is meaningful, and it is not"
+    )]
+    // SAFETY: both are SoftDevice SVC calls taking a register index and a mask
+    // by value — neither dereferences a pointer nor aliases memory. Their only
+    // precondition is that the SoftDevice is enabled, which every caller
+    // satisfies: `init_softdevice` runs during setup and the SoftDevice is never
+    // disabled afterwards, so enablement holds regardless of connection state
+    // (see the doc comment above). The clear must precede the set because
+    // `gpregret_set` ORs its argument into the register.
     unsafe {
-        use nrf_softdevice_s140 as sd_raw;
+        // A stale configuration request must never be composed with a DFU
+        // request. Clear only the application-owned bit in GPREGRET2.
+        let _ = sd_raw::sd_power_gpregret_clr(1, CONFIG_BOOT_MARKER);
         let _ = sd_raw::sd_power_gpregret_clr(0, 0xFF);
         let _ = sd_raw::sd_power_gpregret_set(0, DFU_MAGIC_OTA_RESET);
     }
+
     cortex_m::peripheral::SCB::sys_reset();
+}
+
+/// Installed application version, read from the Nordic Secure DFU bootloader
+/// settings page. `None` when no plausible settings page is present (UF2
+/// boards, bare-J-Link DK, blank flash).
+///
+/// The settings page is the bootloader's own record of what it installed —
+/// the same field its downgrade protection checks — so this is ground truth
+/// for "which *package* is on this unit", independent of the app binary
+/// itself. That distinction matters: the test ladder re-signs old binaries
+/// under new version numbers (see `dist/pulsar_ota_v2*binary.zip`), and the
+/// boot-splash tag built from this is what tells those flashes apart.
+#[must_use]
+pub fn installed_app_version() -> Option<u32> {
+    /// Bootloader settings page on the nRF52840 (see `memory.x`:
+    /// "0xFF000 bootloader settings").
+    const SETTINGS_ADDR: u32 = 0x000F_F000;
+    /// `nrf_dfu_settings_t` begins `crc, settings_version, app_version, ...`.
+    const SETTINGS_VERSION_OFFSET: u32 = 4;
+    const APP_VERSION_OFFSET: u32 = 8;
+
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "two reads of the same settings page, sound for the same reason"
+    )]
+    // SAFETY: fixed, word-aligned addresses inside the bootloader settings
+    // flash page, always mapped and readable on this part. Reading flash has
+    // no side effects and races nothing: the page is only ever rewritten by
+    // the bootloader, which never runs concurrently with the application.
+    let (settings_version, app_version) = unsafe {
+        (
+            core::ptr::read_volatile((SETTINGS_ADDR + SETTINGS_VERSION_OFFSET) as *const u32),
+            core::ptr::read_volatile((SETTINGS_ADDR + APP_VERSION_OFFSET) as *const u32),
+        )
+    };
+
+    // Plausibility gates rather than a CRC walk: layouts 1 and 2 are the only
+    // ones this bootloader family writes, and an erased page reads 0xFFFF_FFFF.
+    // UF2 boards and the bare DK fail these and report None.
+    if (1..=2).contains(&settings_version) && app_version != 0 && app_version != 0xFFFF_FFFF {
+        Some(app_version)
+    } else {
+        None
+    }
 }
 
 /// Set by the BLE task when one of its disconnected-state timeouts should end
@@ -208,7 +387,9 @@ pub async fn request_sleep() -> ! {
     match core::future::pending::<core::convert::Infallible>().await {}
 }
 
-/// Signaled by the button task on any short sync-button press. The BLE task
+/// Signaled by the button task on any short sync-button press.
+///
+/// The BLE task
 /// uses this as the explicit "wake from silent reconnect-wait" trigger,
 /// matching how Xbox / PlayStation controllers use their dedicated wake
 /// buttons. Without this signal, the BLE task stays silent after the initial
@@ -216,6 +397,7 @@ pub async fn request_sleep() -> ! {
 pub static WAKE_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Battery level percentage (0-100) for BLE reporting.
+///
 /// Signals 0xFF when charging (tells BLE task to report "charging" state).
 /// Board-agnostic: boards without a gauge simply never signal it (the BLE
 /// battery reader that waits on it is gated separately in `ble::task`).

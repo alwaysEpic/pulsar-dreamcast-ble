@@ -9,7 +9,7 @@ use embassy_time::{Duration, Timer};
 use pulsar_dreamcast_ble::ble::{get_connection_state, ConnectionState};
 use pulsar_dreamcast_ble::maple::host::MapleResult;
 use pulsar_dreamcast_ble::maple::{ControllerState, MapleBus, MapleHost};
-use pulsar_dreamcast_ble::{ble, board, CONTROLLER_STATE};
+use pulsar_dreamcast_ble::{ble, board, RAW_CONTROLLER_STATE};
 
 use embassy_time::Instant;
 use nrf_softdevice::Softdevice;
@@ -137,7 +137,7 @@ const EXTRA_ALIGN_CAP_MS: u64 = 18;
 ///
 /// Every Maple transaction is supposed to start through this. The v216
 /// soak showed why mid-iteration transactions need it too: a VMU-probe
-/// iteration ran get_condition + sub_peripheral_mask + enumerate_vmu
+/// iteration ran `get_condition` + `sub_peripheral_mask` + `enumerate_vmu`
 /// back-to-back (~20ms of bus time against a ~12ms quiet window), so the
 /// tail transactions collided every time and four collided probes in a row
 /// (12s) flipped VMU presence — the "brief VMU disconnect" during the soak.
@@ -194,6 +194,74 @@ const INACTIVITY_TIMEOUT_MS: u64 = 600_000;
 /// clean threshold for pulsarv1's IP5306 gauge, which only reports in 25%
 /// steps.
 const DFU_MIN_BATTERY_PCT: u8 = 50;
+
+/// The DFU battery gate, shared by every site that can act on `DFU_PENDING`.
+///
+/// `Some(percent)` means refuse; `None` means allow. Always a fresh read, never
+/// the 60s-cadence sample — the charging bit in particular has to be current, and
+/// a user who just plugged in expects the gesture to work. A board with no gauge,
+/// or one whose read fails, is allowed through: there is nothing to gate on.
+///
+/// **VBUS short-circuits the gate.** The risk this exists for is being stranded
+/// in DFU mode on a draining battery (ADR-014), and external power removes it
+/// outright — so plugged in is sufficient regardless of what the gauge says. That
+/// is deliberately checked *before* the IP5306, because both of its answers can
+/// refuse a perfectly safe update: `charging` goes false the instant the pack tops
+/// off, and `percent` comes from `0x78`, the undocumented LED-driver state. On
+/// 2026-08-17 those two combined to lock a unit out of OTA *while sitting on a
+/// charger* — reading 25 %, refusing, with no way to reach the bootloader.
+async fn dfu_battery_refusal(power: &mut board::Power) -> Option<u8> {
+    if pulsar_dreamcast_ble::usb_vbus_present() {
+        return None;
+    }
+
+    match power.battery().await {
+        Some(bat) if !bat.charging && bat.percent < DFU_MIN_BATTERY_PCT => Some(bat.percent),
+        _ => None,
+    }
+}
+
+/// Best-effort VMU splash from Phase 1, where the 5 V rail is down (ADR-005)
+/// and so is the VMU. Brings the rail up, lets the boost and the controller
+/// settle, then retries **enumerate + write** as a pair until the LCD takes it
+/// or the budget runs out. Returns whether the write landed.
+///
+/// One helper for both Phase 1 splashes (BYE at goodbye, BOOT at chord DFU)
+/// because the sequence is the same and the trap is the same: under the old
+/// always-on rail the VMU was warm, so a single enumerate followed by write
+/// retries was enough. Cold, the controller and VMU have to boot first, and
+/// the VMU refuses `BLOCK_WRITE` until it has answered `DEVICE_INFO` — so an
+/// enumerate that fired too early leaves every later write refused, however
+/// many times it is retried. Enumerating inside the loop is what makes the
+/// retries mean anything.
+///
+/// Budget: ~70 ms settle + up to 10 × ~100 ms ≈ 1.1 s worst case, paid only
+/// when nothing answers (no controller docked), where the caller is about to
+/// sleep or reboot anyway. Never blocks on failure; both callers proceed.
+async fn phase1_vmu_splash(
+    power: &mut board::Power,
+    bus: &mut MapleBus,
+    host: &MapleHost,
+    framebuf: &[u8; 192],
+) -> bool {
+    const ATTEMPTS: usize = 10;
+    const RETRY_MS: u64 = 100;
+    power.rail_on();
+    // Same settle as the Phase 2 entry, then the bus wake the old paths used.
+    Timer::after(Duration::from_millis(50)).await;
+    bus.set_output_mode();
+    Timer::after(Duration::from_millis(20)).await;
+    for _ in 0..ATTEMPTS {
+        // Enumerate for its side effect (see the SYNC splash in Phase 3): the
+        // reply itself never decodes, so its result says nothing.
+        let _ = host.enumerate_vmu(bus);
+        if host.write_vmu_lcd(bus, framebuf) {
+            return true;
+        }
+        Timer::after(Duration::from_millis(RETRY_MS)).await;
+    }
+    false
+}
 
 /// Low battery cutoff voltage (mV). Enter System Off below this.
 /// 3.2V gives ~5% margin above the 3.0V "empty" threshold.
@@ -261,6 +329,10 @@ async unsafe fn sample_battery(
                 "PWR: Low battery ({}mV), entering System Off",
                 bat.millivolts
             );
+            // SAFETY: `sleep_now` requires an initialised SoftDevice and never returns.
+            // Both hold here: the SoftDevice is enabled during setup, well before this
+            // point, and this call diverges — nothing after it can observe the
+            // torn-down pin state.
             unsafe {
                 sleep_now(power, status);
             }
@@ -272,7 +344,10 @@ async unsafe fn sample_battery(
     // tunable threshold that merely sits at 0 until the register map is
     // characterized. Clippy reads `u8 <= 0` as always-equality — correct today,
     // wrong the moment the constant is raised, so keep the comparison general.
-    #[allow(clippy::absurd_extreme_comparisons)]
+    #[expect(
+        clippy::absurd_extreme_comparisons,
+        reason = "the bound is a tuning constant that legitimately sits at the type's extreme in some build configurations"
+    )]
     let empty = bat.percent <= LOW_BATTERY_CUTOFF_PCT;
     if empty {
         *empty_reads = empty_reads.saturating_add(1);
@@ -284,6 +359,10 @@ async unsafe fn sample_battery(
         );
         if *empty_reads >= LOW_BATTERY_EMPTY_READS {
             log!("PWR: Low battery ({}%), entering System Off", bat.percent);
+            // SAFETY: `sleep_now` requires an initialised SoftDevice and never returns.
+            // Both hold here: the SoftDevice is enabled during setup, well before this
+            // point, and this call diverges — nothing after it can observe the
+            // torn-down pin state.
             unsafe {
                 sleep_now(power, status);
             }
@@ -313,12 +392,21 @@ async unsafe fn sample_battery(
 unsafe fn sleep_now(power: &mut board::Power, status: &mut board::StatusIndicator) -> ! {
     status.off();
     power.prepare_for_sleep();
-    board::enter_sleep()
+    // SAFETY: `board::enter_sleep` requires an initialised SoftDevice and never
+    // returns — both are this function's own `# Safety` contract (above), so the
+    // obligation passes straight through to our caller. The two calls before it
+    // are the ordering this function exists to enforce: the status bar is dark
+    // and the boost is powered down *before* the chip stops executing, because
+    // nothing can turn them off afterwards.
+    unsafe { board::enter_sleep() }
 }
 
-#[allow(clippy::items_after_statements)] // StaticCell pattern requires inline statics
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    static GAMEPAD_SERVER: StaticCell<ble::GamepadServer> = StaticCell::new();
+    static CONFIG_SERVER: StaticCell<ble::ConfigServer> = StaticCell::new();
+    static BONDER: StaticCell<ble::Bonder> = StaticCell::new();
+
     log_init!();
     pulsar_dreamcast_ble::panic_handler::check_panic_log();
     log!("DC Adapter Starting");
@@ -345,14 +433,25 @@ async fn main(spawner: Spawner) {
     board::configure_embassy(&mut config);
     let p = embassy_nrf::init(config);
 
+    // Embassy init may perform one APPROTECT-provisioning software reset, so
+    // consume the retained one-boot marker only after it returns. This is still
+    // before any SoftDevice enable, address selection, GATT registration, or
+    // bond access.
+    let config_mode = pulsar_dreamcast_ble::take_config_boot_marker();
+
     // Silicon housekeeping: clear bootloader pin residue, then park the onboard
     // QSPI flash in Deep Power Down (no-op on boards that need neither).
+    // SAFETY: `board::early_init` must run before any Embassy pin peripheral is
+    // configured. `embassy_nrf::init` above only hands back the `Peripherals`
+    // struct; no pin has been claimed from `p` yet, so the contract holds.
     unsafe {
         board::early_init();
     }
 
-    // Load active profile from flash; defaults to Xbox on first boot.
-    let profile_id = ble::flash_bond::load_profile();
+    // Load durable prefs (active profile + remap) from the journal;
+    // defaults to Xbox / RemapTable::DEFAULT on first boot.
+    let prefs = ble::prefs::load_prefs();
+    let profile_id = prefs.profile_id;
     let profile = profile_id.profile();
     log!(
         "PROFILE: {} (PID {:#06x})",
@@ -360,9 +459,17 @@ async fn main(spawner: Spawner) {
         profile.pid
     );
 
-    // Initialize SoftDevice with chosen profile
+    // Initialize exactly one SoftDevice personality. The GAP name is fixed at
+    // enable time, so this decision must precede GATT server registration.
     ble::softdevice::set_profile(profile);
-    let sd = ble::softdevice::init_softdevice(profile);
+    let sd = if config_mode {
+        log!("BOOT: isolated configuration personality");
+        let sd = ble::softdevice::init_config_softdevice();
+        ble::config::activate_config_address(sd);
+        sd
+    } else {
+        ble::softdevice::init_softdevice(profile)
+    };
 
     // Power-fail canary for the VMU-write SD-assert investigation: the VMU
     // draws its dock power from the shared 5V rail and its LCD/buzzer
@@ -370,8 +477,22 @@ async fn main(spawner: Spawner) {
     // power-fail comparator fires a SOC event (logged in softdevice_task)
     // when VDD drops below 2.5V — any POFWARN correlated with a VMU write
     // is direct evidence for the rail-dip theory.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "threshold-then-enable is one power-fail-comparator configuration; \
+                  enabling before the threshold is set would arm it at the reset default"
+    )]
+    // SAFETY: both are SoftDevice SVC calls taking small integer arguments by
+    // value and dereferencing nothing. The SoftDevice is enabled by this point,
+    // which is their only precondition, and both return codes are discarded
+    // deliberately — power-fail warning is diagnostic, so a refusal is not
+    // fatal to boot.
     unsafe {
         use nrf_softdevice_s140 as sd_raw;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "SoftDevice power-threshold constants are small enum discriminants that fit u8"
+        )]
         let _ = sd_raw::sd_power_pof_threshold_set(
             sd_raw::NRF_POWER_THRESHOLDS_NRF_POWER_THRESHOLD_V25 as u8,
         );
@@ -397,33 +518,44 @@ async fn main(spawner: Spawner) {
         log!("RADIO: notification cfg REJECTED — poll pacer in fixed-cadence fallback");
     }
 
-    // Create HID Gamepad GATT server
-    let Ok(server) = ble::GamepadServer::new(sd) else {
-        loop {
-            cortex_m::asm::wfi();
+    // Register exactly one runtime GATT database. The config branch never
+    // constructs a Bonder, takes a flash handle, restores system attributes,
+    // or calls the normal HID connection handler.
+    if config_mode {
+        let Ok(server) = ble::ConfigServer::new(sd) else {
+            loop {
+                cortex_m::asm::wfi();
+            }
+        };
+        let server = CONFIG_SERVER.init(server);
+        let _ = server.init(&prefs);
+
+        if let Ok(token) = softdevice_task(sd) {
+            spawner.spawn(token);
         }
-    };
-    static SERVER: StaticCell<ble::GamepadServer> = StaticCell::new();
-    let server = SERVER.init(server);
-    let _ = server.init(profile);
+        if let Ok(token) = ble::config::config_task(sd, server, prefs) {
+            spawner.spawn(token);
+        }
+    } else {
+        let Ok(server) = ble::GamepadServer::new(sd) else {
+            loop {
+                cortex_m::asm::wfi();
+            }
+        };
+        let server = GAMEPAD_SERVER.init(server);
+        let _ = server.init(profile);
 
-    // Spawn the SoftDevice runner task
-    if let Ok(token) = softdevice_task(sd) {
-        spawner.spawn(token);
-    }
+        if let Ok(token) = softdevice_task(sd) {
+            spawner.spawn(token);
+        }
 
-    // Create bonder for security/pairing
-    static BONDER: StaticCell<ble::Bonder> = StaticCell::new();
-    let bonder = BONDER.init(ble::Bonder::new());
-
-    // Load bonding data from flash if available
-    if let Some((master_id, enc_info, peer_id, sys_attrs)) = ble::flash_bond::load_bond() {
-        bonder.load_from_flash(master_id, enc_info, peer_id, sys_attrs);
-    }
-
-    // Spawn BLE task
-    if let Ok(token) = ble::task::ble_task(sd, server, bonder) {
-        spawner.spawn(token);
+        let bonder = BONDER.init(ble::Bonder::new());
+        if let Some((master_id, enc_info, peer_id, sys_attrs)) = ble::flash_bond::load_bond() {
+            bonder.load_from_flash(master_id, enc_info, peer_id, sys_attrs);
+        }
+        if let Ok(token) = ble::task::ble_task(sd, server, bonder, prefs.remap) {
+            spawner.spawn(token);
+        }
     }
 
     // Initialize board-specific pins and peripherals (the board grabs whatever
@@ -438,8 +570,10 @@ async fn main(spawner: Spawner) {
         mut rumble,
     } = board::init(p);
 
-    if let Ok(token) = pulsar_dreamcast_ble::button::sync_button_task(sync_button, sync_led) {
-        spawner.spawn(token);
+    if !config_mode {
+        if let Ok(token) = pulsar_dreamcast_ble::button::sync_button_task(sync_button, sync_led) {
+            spawner.spawn(token);
+        }
     }
 
     status.startup().await;
@@ -465,9 +599,23 @@ async fn main(spawner: Spawner) {
     let mut battery_empty_reads: u8 = 0;
 
     // Initial battery read at startup
+    // SAFETY: `sample_battery` is unsafe only because it may enter System Off
+    // via `sleep_now` on a critically low reading, which carries that
+    // function's contract: an initialised SoftDevice (enabled during setup,
+    // before this point) and divergence if it fires.
     unsafe {
         sample_battery(&mut power, &mut battery_empty_reads, &mut status).await;
     }
+
+    // The rail is normally down throughout Phase 1 (ADR-005). The one exception
+    // is a sync-mode entry from Phase 3: the SYNC splash on the VMU is the
+    // pairing indicator, and it only stays lit if the rail does, so that exit
+    // leaves the rail up and sets this. Phase 1 then drops the rail the moment
+    // the state leaves `SyncMode` without connecting (timeout → Reconnecting);
+    // a connect goes through Phase 2's `rail_on` (idempotent) and a sleep
+    // through `prepare_for_sleep`. Sync is a user-initiated ≤60 s window, so
+    // the charging cost of holding the rail is nil.
+    let mut rail_up_for_sync = false;
 
     // Outer loop: wait for BLE connection, then poll controller
     loop {
@@ -476,40 +624,81 @@ async fn main(spawner: Spawner) {
         bus.set_low_power();
         status.off();
         loop {
-            if get_connection_state() == ConnectionState::Connected {
+            let conn_state = get_connection_state();
+            if conn_state == ConnectionState::Connected {
                 break;
             }
+            if rail_up_for_sync && conn_state != ConnectionState::SyncMode {
+                log!("MAIN: sync window over, rail off");
+                power.rail_off();
+                rail_up_for_sync = false;
+            }
 
-            // Goodbye splash from disconnected state. Wake the bus, try to
+            // Goodbye splash from disconnected state. Bring the rail up, try to
             // write BYE to the VMU (may silently fail if no controller is
-            // plugged in), hold briefly so the user sees it, then sleep.
-            // Runs on both boards so the flow is testable on the dev kit;
-            // XIAO actually enters System Off, DK halts via WFI.
+            // plugged in), hold briefly so the user sees it, then sleep. Runs
+            // on both boards so the flow is testable on the dev kit; XIAO
+            // actually enters System Off, DK halts via WFI.
+            //
+            // The rail is down throughout Phase 1 (ADR-005), so the VMU is
+            // unpowered until `phase1_vmu_splash` brings it up — without that
+            // this splash could only ever render on a carrier whose rail
+            // happened to be live. `sleep_now` brings the rail back down via
+            // `prepare_for_sleep`.
             if pulsar_dreamcast_ble::GOODBYE_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
                 log!("MAIN: Phase 1 goodbye");
                 {
-                    bus.set_output_mode();
-                    Timer::after(Duration::from_millis(20)).await;
                     let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"BYE");
                     pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
-                    log!("MAIN: VMU enumerate = {}", host.enumerate_vmu(&mut bus));
-                    let mut wrote = false;
-                    for _ in 0..5 {
-                        if host.write_vmu_lcd(&mut bus, &send_buf) {
-                            log!("MAIN: BYE write OK");
-                            wrote = true;
-                            break;
-                        }
-                        Timer::after(Duration::from_millis(50)).await;
-                    }
-                    if !wrote {
+                    if phase1_vmu_splash(&mut power, &mut bus, &host, &send_buf).await {
+                        log!("MAIN: BYE write OK");
+                    } else {
                         log!("MAIN: BYE write failed (no controller?)");
                     }
                 }
                 Timer::after(Duration::from_millis(1000)).await;
                 log!("MAIN: goodbye — entering sleep");
+                // SAFETY: `sleep_now` requires an initialised SoftDevice and never returns.
+                // Both hold here: the SoftDevice is enabled during setup, well before this
+                // point, and this call diverges — nothing after it can observe the
+                // torn-down pin state.
                 unsafe {
                     sleep_now(&mut power, &mut status);
+                }
+            }
+
+            // DFU request from the disconnected state. The Phase 3 site is
+            // unreachable without a controller, and the tap-tap-hold chord that
+            // arms DFU without one exists precisely for that case — so the flag
+            // has to be consumed here too, exactly as GOODBYE_PENDING is above.
+            // Without this the chord would set a flag nobody reads, and the reset
+            // on the next sleep would silently discard it.
+            if pulsar_dreamcast_ble::DFU_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
+                if let Some(_pct) = dfu_battery_refusal(&mut power).await {
+                    // No CHRG splash here: that mechanism rides the Phase 3 VMU
+                    // write path, and in Phase 1 there may be no VMU powered at
+                    // all. The gesture can simply be retried on a charger.
+                    log!(
+                        "MAIN: Phase 1 DFU refused at {}% (need {}% or charger)",
+                        _pct,
+                        DFU_MIN_BATTERY_PCT
+                    );
+                } else {
+                    log!("MAIN: Phase 1 DFU pending — BOOT splash, then OTA bootloader");
+                    // Best-effort splash. There may be no controller and no VMU
+                    // here — that is the whole point of the chord — so this is
+                    // fire-and-forget and must not block the reboot beyond the
+                    // helper's ~1 s budget. The rail is down in Phase 1, so the
+                    // helper brings it up first; it then stays up through the
+                    // bootloader, which is what keeps BOOT on the LCD while the
+                    // update runs, and the app's own init brings it back down.
+                    let mut send_buf = pulsar_dreamcast_ble::vmu::build_boot_splash(
+                        pulsar_dreamcast_ble::installed_app_version(),
+                    );
+                    pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
+                    let _ = phase1_vmu_splash(&mut power, &mut bus, &host, &send_buf).await;
+                    pulsar_dreamcast_ble::reboot_into_ota_dfu();
                 }
             }
 
@@ -521,6 +710,10 @@ async fn main(spawner: Spawner) {
             // is set, and `request_sleep` parks the BLE task until we act.
             if pulsar_dreamcast_ble::SLEEP_REQUEST.load(core::sync::atomic::Ordering::Relaxed) {
                 log!("MAIN: BLE requested System Off");
+                // SAFETY: `sleep_now` requires an initialised SoftDevice and never returns.
+                // Both hold here: the SoftDevice is enabled during setup, well before this
+                // point, and this call diverges — nothing after it can observe the
+                // torn-down pin state.
                 unsafe {
                     sleep_now(&mut power, &mut status);
                 }
@@ -542,6 +735,10 @@ async fn main(spawner: Spawner) {
                 }
 
                 if last_battery_read.elapsed() >= BATTERY_READ_INTERVAL {
+                    // SAFETY: `sample_battery` is unsafe only because it may enter System Off
+                    // via `sleep_now` on a critically low reading, which carries that
+                    // function's contract: an initialised SoftDevice (enabled during setup,
+                    // before this point) and divergence if it fires.
                     unsafe {
                         sample_battery(&mut power, &mut battery_empty_reads, &mut status).await;
                     }
@@ -552,14 +749,16 @@ async fn main(spawner: Spawner) {
             Timer::after(Duration::from_millis(BLE_WAIT_CHECK_MS)).await;
         }
         log!("MAIN: BLE connected, enabling controller");
+        // Whatever the rail was doing for sync, Phase 2 owns it from here.
+        rail_up_for_sync = false;
 
         // --- Phase 2: Enable the controller rail and detect the controller ---
         // Only carriers with a Schottky USB-5V passthrough (xiao) can skip their
         // boost while plugged in. pulsarv1 has no such path — its 5 V comes from
-        // the IP5306's autonomous boost, and `is_externally_powered()` there
-        // means "charging or topped off", which has nothing to do with who feeds
-        // the rail. Gating on the capability keeps the log honest and stops the
-        // rail_on/rail_off no-ops from reading like real power decisions.
+        // the IP5306 boost, switched here over I²C, and `is_externally_powered()`
+        // there means "charging or topped off", which has nothing to do with who
+        // feeds the rail. Gating on the capability keeps the log honest: on
+        // pulsarv1 the rail is BLE-gated, never USB-gated.
         let mut usb_powered = board::HAS_USB_PASSTHROUGH && power.is_externally_powered();
         if usb_powered {
             log!("PWR: USB detected, boost off (passthrough)");
@@ -568,6 +767,30 @@ async fn main(spawner: Spawner) {
         }
         // Brief delay for power source startup
         Timer::after(Duration::from_millis(50)).await;
+
+        // Re-assert the IP5306 here, right behind `rail_on()`, and again inside
+        // the detect loop below. `rail_on` is a single best-effort I²C write; a
+        // unit powered up before its cell was connected may not have answered
+        // (historically that was `blocking_init`'s one ~10ms retry burst at boot,
+        // and the boost never came on) — and the Phase 3 refresh site cannot
+        // rescue it, because reaching Phase 3 requires the controller that the
+        // dead rail is starving. Observed 2026-08-14: port at 3.9V (raw cell, not
+        // boosted), nothing on the bus, board healthy over BLE the whole time. A
+        // BLE link implies the cell is in, so this is the first moment the write
+        // can actually land. `refresh_config` asserts the rail-up config, so it
+        // belongs only here and in Phase 3 — never in Phase 1, where it would
+        // undo `rail_off`.
+        #[expect(
+            clippy::items_after_statements,
+            reason = "the constant is declared beside the loops that consume it; hoisting it to module scope would separate a tuning value from the only code it tunes"
+        )]
+        const IP5306_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+        if power.refresh_config().await {
+            log!("PWR: IP5306 config had drifted — boost/charger re-enabled");
+        }
+        // `Instant::now()` only — never subtract a Duration from it, that panics
+        // when the clock is younger than the value.
+        let mut last_ip5306_refresh = Instant::now();
 
         status.searching();
         let mut retry_delay_ms: u64 = INITIAL_RETRY_DELAY_MS;
@@ -585,9 +808,47 @@ async fn main(spawner: Spawner) {
                     "MAPLE: Detect timeout ({}s), entering System Off",
                     DETECT_TIMEOUT_MS / 1000
                 );
+                // SAFETY: `sleep_now` requires an initialised SoftDevice and never returns.
+                // Both hold here: the SoftDevice is enabled during setup, well before this
+                // point, and this call diverges — nothing after it can observe the
+                // torn-down pin state.
                 unsafe {
                     sleep_now(&mut power, &mut status);
                 }
+            }
+
+            // DFU request during detection — the single likeliest moment to want
+            // one. A host is connected but no controller is answering, either
+            // because none is docked or because the Maple side has stopped
+            // working; both leave Phase 3 unreachable. Without this the flag would
+            // sit unread until DETECT_TIMEOUT_MS put the unit into System Off, and
+            // the reset would clear it.
+            if pulsar_dreamcast_ble::DFU_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
+                if let Some(_pct) = dfu_battery_refusal(&mut power).await {
+                    log!(
+                        "MAIN: Phase 2 DFU refused at {}% (need {}% or charger)",
+                        _pct,
+                        DFU_MIN_BATTERY_PCT
+                    );
+                } else {
+                    log!("MAIN: Phase 2 DFU pending — OTA bootloader");
+                    // No splash attempt: by definition nothing on the bus is
+                    // answering here, so a write would only add latency before
+                    // the reboot.
+                    pulsar_dreamcast_ble::reboot_into_ota_dfu();
+                }
+            }
+
+            // Keep re-asserting through detection, too. Nothing draws on the 5V
+            // rail until the controller answers, and the IP5306's light-load dwell
+            // is as short as 8s (`SYS_CTL2[3:2]`) — so the boost can drop out
+            // *during* a detect that runs up to DETECT_TIMEOUT_MS.
+            if last_ip5306_refresh.elapsed() >= IP5306_REFRESH_INTERVAL {
+                if power.refresh_config().await {
+                    log!("PWR: IP5306 config had drifted — boost/charger re-enabled");
+                }
+                last_ip5306_refresh = Instant::now();
             }
 
             status.tx_activity_on();
@@ -623,12 +884,15 @@ async fn main(spawner: Spawner) {
         }
 
         // --- Phase 3: Poll loop (active gaming) ---
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a compile-time constant division (3_000 / 15 = 200) that plainly fits u16"
+        )]
         let mut vmu_delay: u16 = (3_000 / POLL_PERIOD_MS) as u16; // ~3s before VMU attempt
-                                                                  // See the refresh site below. `Instant::now()` only — never subtract a
-                                                                  // Duration from it, that panics when the clock is younger than the value.
-        const IP5306_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
-        let mut last_ip5306_refresh = Instant::now();
+
+        // `IP5306_REFRESH_INTERVAL` and `last_ip5306_refresh` are declared above
+        // Phase 2 now, so the detect loop can re-assert the boost as well — see
+        // the comment there for why that placement is load-bearing.
 
         // Is a VMU actually docked? `enumerate_vmu` is a real probe — it sends
         // DEVICE_INFO_REQUEST to sub-peripheral 1 and returns true only on a
@@ -647,11 +911,19 @@ async fn main(spawner: Spawner) {
         // input — run #45 measured the 3s cadence at ~1-1.5% of the
         // doubled-interval budget. Dock detection ≤5s, absence in 20s;
         // both fine for a display.
+        #[expect(
+            clippy::items_after_statements,
+            reason = "the constant is declared beside the loop that consumes it; hoisting it to module scope would separate a tuning value from the only code it tunes"
+        )]
         const VMU_PROBE_INTERVAL: Duration = Duration::from_secs(5);
         // Consecutive failed probes before believing the VMU is really gone. A
         // probe is a request/response transaction that must survive BLE
         // collisions (~64% of Maple frames collide with a connection event and
         // are dropped), so one failure means nothing. Presence is sticky.
+        #[expect(
+            clippy::items_after_statements,
+            reason = "the constant is declared beside the loop that consumes it; hoisting it to module scope would separate a tuning value from the only code it tunes"
+        )]
         const VMU_ABSENT_STREAK: u8 = 4;
         let mut vmu_present = false;
         let mut vmu_probe_misses: u8 = 0;
@@ -682,18 +954,43 @@ async fn main(spawner: Spawner) {
         // an honest conversion instead of the old "~17ms per poll" estimate
         // (a bad layout roll used to stretch every poll-counted duration —
         // the lingering boot splash was a visible bad-roll symptom).
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a compile-time constant division (30_000 / 15 = 2_000) that plainly fits u16"
+        )]
         let mut vmu_splash_polls: u16 = (30_000 / POLL_PERIOD_MS) as u16;
         // Polls to hold the Guide-chord "home" glyph (~1s)
         // before resuming normal content. 0 = not showing it.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::items_after_statements,
+            reason = "a compile-time constant division (1_000 / 15 = 66) that plainly \
+                      fits u16, declared beside the loop that consumes it"
+        )]
         const VMU_HOME_POLLS: u16 = (1_000 / POLL_PERIOD_MS) as u16;
         let mut vmu_home_polls: u16 = 0;
         // Advance the animation every 20 polls (~260ms, ~4fps). Each frame is
         // a ~1.7ms hardware-timed DMA TX the CPU awaits through — ~0.5ms of
         // average poll period, no bus corruption possible.
+        #[expect(
+            clippy::items_after_statements,
+            reason = "the constant is declared beside the loop that consumes it; hoisting it to module scope would separate a tuning value from the only code it tunes"
+        )]
         const VMU_ANIM_INTERVAL: u16 = 20;
         let mut vmu_battery_percent: u8 = 100;
+        // Tracked separately from `vmu_battery_percent` rather than encoded into
+        // it. This used to be smuggled in as `percent = 100`, which made charging
+        // and finished-charging render identically — plugging in appeared to do
+        // nothing at all when the pack was already near full.
+        let mut vmu_battery_charging = false;
+        // USB VBUS, polled far more often than the 60 s gauge cadence. This is
+        // what actually drives the charge indicator: the IP5306's `charging` bit
+        // drops the moment the pack tops off, so on its own it made "plugged in
+        // and full" indistinguishable from "not plugged in" — which is how the
+        // bolt came to look broken. VBUS is a hardware line and answers the
+        // question the user is actually asking.
+        let mut vmu_usb_present = false;
+        let mut last_vbus_check = Instant::now();
         let mut last_state: Option<ControllerState> = None;
         let mut fail_count: u16 = 0;
         let mut last_activity = Instant::now();
@@ -704,6 +1001,10 @@ async fn main(spawner: Spawner) {
         // waiting and retry behavior as the regular pulsar/splash writes.
         // Once the write lands, we hold for ≥1s before triggering System Off
         // (XIAO) or halting via WFI (DK) so the user actually sees BYE.
+        #[expect(
+            clippy::items_after_statements,
+            reason = "the goodbye state machine is declared beside the loop that drives it; it has no other user"
+        )]
         #[derive(Clone, Copy)]
         enum GoodbyeState {
             Render,        // need to swap framebuffer to BYE
@@ -763,10 +1064,18 @@ async fn main(spawner: Spawner) {
                         if start.elapsed() >= Duration::from_millis(1000) =>
                     {
                         log!("MAIN: goodbye hold done — entering sleep");
+                        // SAFETY: `sleep_now` requires an initialised SoftDevice and never returns.
+                        // Both hold here: the SoftDevice is enabled during setup, well before this
+                        // point, and this call diverges — nothing after it can observe the
+                        // torn-down pin state.
                         unsafe {
                             sleep_now(&mut power, &mut status);
                         }
                     }
+                    #[expect(
+                        clippy::match_same_arms,
+                        reason = "Hold(_) and None are distinct states that happen to share an empty body; merging them would hide that both are handled deliberately"
+                    )]
                     Some(GoodbyeState::Hold(_)) => {}
                     None => {}
                 }
@@ -776,8 +1085,11 @@ async fn main(spawner: Spawner) {
             let conn_state = get_connection_state();
             if conn_state != ConnectionState::Connected {
                 // If the disconnect is because we just entered sync mode, write
-                // a SYNC splash to the VMU so it persists through Phase 1.
+                // a SYNC splash to the VMU so it persists through Phase 1 — and
+                // leave the rail up so it actually can (see `rail_up_for_sync`);
+                // Phase 1 drops it when the sync window ends.
                 if conn_state == ConnectionState::SyncMode {
+                    rail_up_for_sync = true;
                     log!("MAIN: Sync mode entered, writing SYNC splash");
                     {
                         let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"SYNC");
@@ -806,12 +1118,14 @@ async fn main(spawner: Spawner) {
                 // host queued but we never applied. `rail_off` removes the motor
                 // supply, so this is not what silences it now — it is what stops a
                 // latched duty cycle from resuming the instant the rail comes back
-                // on a silent reconnect.
+                // on a silent reconnect (or, for sync, never went away).
                 rumble.set(0);
                 pulsar_dreamcast_ble::RUMBLE_LEVEL.reset();
-                power.rail_off();
+                if !rail_up_for_sync {
+                    power.rail_off();
+                }
                 status.off();
-                CONTROLLER_STATE.signal(ControllerState::default());
+                RAW_CONTROLLER_STATE.signal(ControllerState::default());
                 pulsar_dreamcast_ble::MAPLE_START_HELD
                     .store(false, core::sync::atomic::Ordering::Relaxed);
                 break;
@@ -826,23 +1140,15 @@ async fn main(spawner: Spawner) {
             // a BOOT splash can land first, between polls, on a quiet bus. The
             // LCD keeps its last frame while dock power holds, so the splash
             // stays up through DFU mode as the "updating" indicator — on
-            // pulsarv1 the 5V rail is the IP5306's autonomous boost, which an
-            // MCU reset doesn't touch. (XIAO's discrete boost-enable pin goes
+            // pulsarv1 the 5V rail is the IP5306 boost, up because we are in
+            // Phase 3, and an MCU reset doesn't touch it; the app's own init
+            // drops it after the update. (XIAO's discrete boost-enable pin goes
             // hi-Z at reset, so there the rail — and the splash — may drop;
             // retail hardware is pulsarv1.) Deliberately no rail_off here.
             if pulsar_dreamcast_ble::DFU_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed)
             {
-                // Battery gate: a fresh read, not the 60s-cadence sample — the
-                // charging bit especially must be current. Allowed while
-                // charging or at >= DFU_MIN_BATTERY_PCT; a board with no gauge
-                // or a failed read (dk) is allowed through, since there is
-                // nothing to gate on.
-                let too_low = match power.battery().await {
-                    Some(bat) if !bat.charging && bat.percent < DFU_MIN_BATTERY_PCT => {
-                        Some(bat.percent)
-                    }
-                    _ => None,
-                };
+                // One shared gate for all three sites — see `dfu_battery_refusal`.
+                let too_low = dfu_battery_refusal(&mut power).await;
 
                 // `_pct` is log-only: without the rtt feature `log!` compiles
                 // to nothing and the binding would otherwise warn as unused.
@@ -862,7 +1168,9 @@ async fn main(spawner: Spawner) {
                     vmu_home_polls = VMU_HOME_POLLS * 2; // ~2s
                 } else {
                     log!("MAIN: DFU pending — BOOT splash, then OTA bootloader");
-                    let mut send_buf = pulsar_dreamcast_ble::vmu::build_message_splash(b"BOOT");
+                    let mut send_buf = pulsar_dreamcast_ble::vmu::build_boot_splash(
+                        pulsar_dreamcast_ble::installed_app_version(),
+                    );
                     pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
                     // Same reasoning as the SYNC splash: enumerate unconditionally
                     // for its side effect (the VMU refuses BLOCK_WRITE until asked
@@ -894,15 +1202,27 @@ async fn main(spawner: Spawner) {
                 pulsar_dreamcast_ble::MAPLE_START_HELD
                     .store(state.buttons.start, core::sync::atomic::Ordering::Relaxed);
 
+                // Publish the raw source sample on every successful poll. The
+                // remapper/config LiveInput path must see small analog changes
+                // even when the current HID inactivity filter considers them
+                // noise. `Signal` is intentionally a one-slot latest-value
+                // latch, so a faster producer simply replaces an unread sample.
+                RAW_CONTROLLER_STATE.signal(state);
+
+                #[expect(
+                    clippy::option_if_let_else,
+                    reason = "the match reads as the first-poll-vs-subsequent distinction it is; map_or would bury both arms in a closure"
+                )]
                 let changed = match &last_state {
                     None => true,
                     Some(prev) => prev.state_changed(&state),
                 };
 
-                // Only signal on change — avoids overwriting a real button
-                // press with identical idle-state data from the next poll.
+                // Keep the filtered comparison only for inactivity tracking.
+                // Do not update `last_state` on every raw sample: a slowly
+                // moving axis could otherwise remain below the delta threshold
+                // forever.
                 if changed {
-                    CONTROLLER_STATE.signal(state);
                     last_state = Some(state);
                     last_activity = Instant::now();
                 }
@@ -1082,11 +1402,35 @@ async fn main(spawner: Spawner) {
                 // makes controller detection work), and `VMU_ABSENT_STREAK`
                 // requires 4 consecutive misses — 12s — before declaring the bay
                 // empty, so no single dropped exchange can blank the screen.
+                // Poll VBUS on a 1 s cadence — cheap (one SVC), and unlike the
+                // gauge it must feel immediate: plugging in and waiting up to a
+                // minute for any acknowledgement is most of what made this look
+                // broken. Redraw only on the transition, so an unchanging state
+                // costs nothing.
+                #[expect(
+                    clippy::items_after_statements,
+                    reason = "the constant belongs beside the poll it paces; module scope would separate it from its only consumer"
+                )]
+                const VBUS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+                if last_vbus_check.elapsed() >= VBUS_POLL_INTERVAL {
+                    last_vbus_check = Instant::now();
+                    let vbus = pulsar_dreamcast_ble::usb_vbus_present();
+                    if vbus != vmu_usb_present {
+                        vmu_usb_present = vbus;
+                        vmu_frame_dirty = true;
+                    }
+                }
+
                 if vmu_present && vmu_frame_dirty {
                     let mut send_buf = vmu_framebuf;
                     pulsar_dreamcast_ble::vmu::composite_battery(
                         &mut send_buf,
                         vmu_battery_percent,
+                        // Either source counts as "power going in". VBUS is the
+                        // one that actually fires; the gauge bit is kept so a
+                        // board whose VBUS read fails still shows something while
+                        // genuinely charging.
+                        vmu_usb_present || vmu_battery_charging,
                         true,
                     );
                     pulsar_dreamcast_ble::vmu::rotate_180(&mut send_buf);
@@ -1124,7 +1468,7 @@ async fn main(spawner: Spawner) {
                     .store(false, core::sync::atomic::Ordering::Relaxed);
                 if fail_count == CONTROLLER_LOST_THRESHOLD {
                     log!("MAPLE: Controller lost, re-detecting...");
-                    CONTROLLER_STATE.signal(ControllerState::default());
+                    RAW_CONTROLLER_STATE.signal(ControllerState::default());
                     last_state = None;
                     // The controller — and the VMU docked in it — may have
                     // power-cycled rather than merely glitched. Force an
@@ -1153,6 +1497,10 @@ async fn main(spawner: Spawner) {
                             && redetect_start.elapsed().as_millis() >= SLEEP_TIMEOUT_MS
                         {
                             log!("MAPLE: Re-detect timeout, entering System Off");
+                            // SAFETY: `sleep_now` requires an initialised SoftDevice and never returns.
+                            // Both hold here: the SoftDevice is enabled during setup, well before this
+                            // point, and this call diverges — nothing after it can observe the
+                            // torn-down pin state.
                             unsafe {
                                 sleep_now(&mut power, &mut status);
                             }
@@ -1175,7 +1523,7 @@ async fn main(spawner: Spawner) {
                         log!("MAIN: BLE disconnected during controller re-detect");
                         power.rail_off();
                         status.off();
-                        CONTROLLER_STATE.signal(ControllerState::default());
+                        RAW_CONTROLLER_STATE.signal(ControllerState::default());
                         pulsar_dreamcast_ble::MAPLE_START_HELD
                             .store(false, core::sync::atomic::Ordering::Relaxed);
                         break;
@@ -1184,7 +1532,7 @@ async fn main(spawner: Spawner) {
             }
 
             // Re-assert the IP5306 configuration periodically. `SYS_CTL0` is
-            // written once at boot and never verified; a VIN transition
+            // written at connect (`rail_on`) and otherwise never verified; a VIN transition
             // (unplugging USB) is exactly the kind of event that can perturb the
             // chip, and if the boost bit comes back clear the 5 V rail stays
             // down with nothing else able to restore it — which is why the board
@@ -1231,11 +1579,24 @@ async fn main(spawner: Spawner) {
                 }
 
                 if last_battery_read.elapsed() >= BATTERY_READ_INTERVAL {
+                    // SAFETY: `sample_battery` is unsafe only because it may enter System Off
+                    // via `sleep_now` on a critically low reading, which carries that
+                    // function's contract: an initialised SoftDevice (enabled during setup,
+                    // before this point) and divergence if it fires.
                     let bat = unsafe {
                         sample_battery(&mut power, &mut battery_empty_reads, &mut status).await
                     };
                     if let Some(bat) = bat {
-                        vmu_battery_percent = if bat.charging { 100 } else { bat.percent };
+                        vmu_battery_percent = bat.percent;
+                        // Redraw on the *transition* only. Nothing else marks the
+                        // frame dirty on a battery read, so without this the bolt
+                        // would not appear until some unrelated update happened to
+                        // dirty the frame — a large part of why plugging in looked
+                        // inert. One transition per plug/unplug, so no extra DMA.
+                        if bat.charging != vmu_battery_charging {
+                            vmu_battery_charging = bat.charging;
+                            vmu_frame_dirty = true;
+                        }
                         // Same value feeds the VMU icon and the WS2812 gauge, and
                         // both bucket it through `vmu::bars_for_percent`, so the
                         // two displays cannot disagree. Suppressed while a VMU is
@@ -1263,6 +1624,10 @@ async fn main(spawner: Spawner) {
             if board::SUPPORTS_SLEEP && last_activity.elapsed().as_millis() >= INACTIVITY_TIMEOUT_MS
             {
                 log!("MAIN: Inactivity timeout (10 min), entering System Off");
+                // SAFETY: `sleep_now` requires an initialised SoftDevice and never returns.
+                // Both hold here: the SoftDevice is enabled during setup, well before this
+                // point, and this call diverges — nothing after it can observe the
+                // torn-down pin state.
                 unsafe {
                     sleep_now(&mut power, &mut status);
                 }
@@ -1309,8 +1674,10 @@ async fn softdevice_task(sd: &'static Softdevice) {
         }
         // `log!` compiles to nothing without `rtt`, so `other` reads as unused
         // in production builds — it's only referenced for diagnostics.
-        #[allow(unused_variables)]
-        other => log!("SOC: event {}", other as u32),
+        // `_other` rather than `other`: `log!` compiles to nothing without `rtt`,
+        // so the binding is genuinely unused in production builds and used in
+        // instrumented ones. An #[expect] would be correct in only one of them.
+        _other => log!("SOC: event {}", _other as u32),
     })
     .await;
 }
