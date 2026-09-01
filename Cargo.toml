@@ -1,9 +1,91 @@
 [workspace]
 members = [".", "maple-protocol"]
 
+# Lint policy lives here, not in scripts/ci.sh, so that *every* invocation of
+# `cargo clippy` — in CI or a local shell, from any directory — sees the identical
+# rule set. When the rules lived only in the gate's argv, local runs were
+# quietly weaker than CI and work was iterated against a lie.
+[workspace.lints.rust]
+# Adopt the edition-2024 behaviour early: an `unsafe fn` body is not implicitly
+# an unsafe block. Without this, the 17 `unsafe fn` here silently license every
+# unsafe operation in their bodies, which is exactly the "unsafe as a
+# workaround" pattern the rest of this table exists to prevent.
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Unsafe must be justified, not merely possible. `undocumented_unsafe_blocks`
+# is the mechanical form of that policy: no `unsafe {}` compiles without a
+# `// SAFETY:` comment, and `multiple_unsafe_ops_per_block` stops one comment
+# from covering a grab-bag of unrelated operations.
+#
+# `forbid`, not `deny`: a denied lint can be waved through with a local
+# `#[expect(..)]`, which is the exact escape-hatch-as-workaround move this
+# policy exists to stop. `forbid` cannot be overridden locally at all — an
+# attempt is itself a hard error. Relaxing it means editing this table, which
+# is visible in review; a one-line attribute buried in a function is not.
+undocumented_unsafe_blocks = "forbid"
+missing_safety_doc = "forbid"
+
+# `deny`, not `forbid`, and the distinction is deliberate. The two lints above
+# are about *justification*: there is never a good reason for an unsafe block
+# with no argument for why it is sound, so they are absolute. This one is about
+# *granularity*, and that is rebuttable — an MMIO configuration sequence is
+# often one logical operation (set priority, then enable, in that order) sharing
+# a single justification, and splitting it into a block per register write adds
+# ceremony without adding safety. Deviating still costs an #[expect] carrying a
+# written reason, so the argument is made in the diff rather than assumed.
+multiple_unsafe_ops_per_block = "deny"
+
+# Escape hatches must expire on their own. `#[expect]` warns once the
+# suppression is no longer needed, so a fixed lint stops being papered over;
+# `#[allow]` is silent forever and accumulates. Reasons are mandatory — the
+# next reader gets the "why", not just the lint name.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# There is no unwinding on this target: a panic is a firmware-wide event that
+# takes the controller offline mid-game.
+#
+# Also `forbid` — same reasoning as the unsafe block above. Tests remain
+# ergonomic without any escape hatch, because clippy.toml's
+# `allow-{unwrap,expect,panic}-in-tests` stops these lints from *firing* under
+# `#[cfg(test)]` at all, rather than suppressing them with an attribute. So the
+# exemption is scoped to tests by construction and cannot be borrowed by
+# production code.
+unwrap_used = "forbid"
+expect_used = "forbid"
+panic = "forbid"
+
+# `_name` is this codebase's marker for a binding that exists only for `log!`,
+# which compiles to nothing without the `rtt` feature. The lint is unsatisfiable
+# either way: drop the underscore and non-rtt builds report it unused, keep it
+# and rtt builds report it used. The convention is the more useful signal.
+used_underscore_binding = "allow"
+
+# The Embassy executor here is single-threaded on one Cortex-M core: futures are
+# polled from `executor-thread` and never move between threads, because there is
+# no second thread to move them to. `Send` is unsatisfiable for any future
+# holding a peripheral handle and would buy nothing if it were.
+future_not_send = "allow"
+
+# Deliberately NOT enabled — measured, not overlooked:
+#
+#   arithmetic_side_effects (144 sites) — every counter, timestamp delta and
+#   period calculation trips it. The signal-to-noise never justifies it here.
+#
+#   indexing_slicing (83 sites) — the fix is `.get()`, which inserts a bounds
+#   branch. In the RX sampling loop and the cycle-anchored TX path that is an
+#   actively harmful change: those loops are cycle-counted, and
+#   scripts/check_timing_invariants.sh exists precisely to catch codegen drift
+#   there. Fixed-size arrays with const-asserted bounds are the safer idiom.
+
 [package]
 name = "pulsar-dreamcast-ble"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["alwaysEpic"]
@@ -11,6 +93,9 @@ description = "Bluetooth LE adapter for Dreamcast controllers — Rust on nRF528
 repository = "https://github.com/alwaysEpic/pulsar-dreamcast-ble"
 keywords = ["embedded", "dreamcast", "bluetooth", "nrf52", "gamepad"]
 categories = ["embedded", "hardware-support", "no-std"]
+
+[lints]
+workspace = true
 
 [dependencies]
 maple-protocol = { path = "maple-protocol" }
