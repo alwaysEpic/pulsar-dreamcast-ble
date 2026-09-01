@@ -7,7 +7,9 @@ Thanks for checking out Pulsar Dreamcast BLE! Whether you're fixing a bug, addin
 ### Prerequisites
 
 - Rust stable toolchain with `thumbv7em-none-eabihf` target
-- For on-hardware testing: nRF52840 DK or Seeed XIAO nRF52840 with a debug probe
+- For on-hardware testing, one of the three boards: an nRF52840-DK (built-in J-Link), a
+  Seeed XIAO nRF52840 (flashes over USB — no probe needed), or a Pulsar v1. Each has a
+  start-to-finish guide under [`docs/build/`](docs/build/).
 
 ```bash
 rustup target add thumbv7em-none-eabihf
@@ -21,17 +23,35 @@ cargo build --release
 
 # XIAO
 cargo build --release --no-default-features --features board-xiao
+
+# Pulsar v1
+cargo build --release --no-default-features --features board-pulsarv1
 ```
+
+Boards are selected by mutually exclusive feature, never by `cfg` sprinkled through the
+logic. `--release` is mandatory on every board — a debug build misses the Maple timing
+window outright.
 
 ### Running Checks
 
-Before submitting a PR, run the full check suite:
+Two commands:
 
 ```bash
-./scripts/ci.sh
+./scripts/check.sh [dk|xiao|pulsarv1]   # after every change  — ~2 s warm
+./scripts/ci.sh                         # before every commit — ~12 s warm
 ```
 
-This runs formatting, maple-protocol unit tests (including the BlueRetro mapping fixtures), clippy lints, and release builds across every shipped feature combination (`board-xiao`/`board-dk`, with and without `vmu`/`rtt`). Each build is then checked for timing invariants — the Maple sampling loop must stay word-aligned with its pinned encoding, and the hardware-timed TX path must be present (see the timing-invariant checks in `scripts/check_timing_invariants.sh`). CI runs the same checks on every PR.
+`check.sh` runs the `maple-protocol` tests and clippy for one board. `ci.sh` is the gate:
+formatting, the `maple-protocol` tests (including the BlueRetro mapping fixtures), clippy for
+all three boards, and every shipped release build (`board-xiao` and `board-pulsarv1` with and
+without `rtt`, plus `board-dk`). Each build is then checked for timing invariants — the Maple
+sampling loop must stay word-aligned with its pinned encoding, and the hardware-timed TX path
+must be present (`scripts/check_timing_invariants.sh`). CI runs the same checks on every PR.
+
+The lint policy lives in `[workspace.lints]` in `Cargo.toml`, so a bare `cargo clippy` gives
+exactly what CI gives. Use `#[expect(lint, reason = "…")]` rather than `#[allow]`; every
+`unsafe` block needs a `// SAFETY:` comment, and `unwrap`/`expect`/`panic` are forbidden
+outside tests — there is no unwind on this target.
 
 ## Submitting Changes
 
@@ -47,8 +67,15 @@ Don't worry about getting everything perfect — feedback on PRs is part of the 
 - **`maple-protocol/`** — Pure protocol library (no embedded deps, runs on host). Tests go here.
 - **`src/`** — Firmware: BLE stack, Maple Bus GPIO, board support, button handling.
 - **`src/board/`** — Board-specific pin mappings, LEDs, battery, and power management.
-- **`docs/`** — Protocol reference, user guide, learnings.
+- **`docs/`** — Build guides (`docs/build/`), user guide, protocol reference, learnings; `docs/MOC.md` is the index.
 - **`3d_files/`** — Enclosure models (not covered by GPL, see [3d_files/README.md](3d_files/README.md)).
+
+### Decision records
+
+Comments cite `ADR-NNN` and design-note sections (e.g. "remap design v2 §4.5"). Those are
+the maintainer's architecture decision records, kept outside this repository. The comment
+states the decision and its reason; the number is a cross-reference, not required reading.
+If a comment leans on a record without saying what it decided, that is a bug — open an issue.
 
 ## Ways to Contribute
 

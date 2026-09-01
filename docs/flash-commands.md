@@ -20,7 +20,7 @@ The easiest way to flash the XIAO — no debug probe needed. The XIAO ships with
 2. Double-tap the reset button on the XIAO — it mounts as `XIAO-BOOT`
 3. Copy the file to the drive:
    ```bash
-   cp pulsar-dreamcast-ble.uf2 /Volumes/XIAO-BOOT/
+   cp pulsar-dreamcast-ble-xiao.uf2 /Volumes/XIAO-BOOT/
    ```
 4. The board auto-resets and runs the firmware
 

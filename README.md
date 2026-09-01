@@ -120,7 +120,7 @@ Pre-built firmware is available on the [Releases](https://github.com/alwaysEpic/
 The XIAO ships with a UF2 bootloader that includes the Nordic SoftDevice. Just double-tap the reset button — the board mounts as a USB drive (`XIAO-BOOT`) — then copy the `.uf2` file:
 
 ```bash
-cp pulsar-dreamcast-ble.uf2 /Volumes/XIAO-BOOT/
+cp pulsar-dreamcast-ble-xiao.uf2 /Volumes/XIAO-BOOT/
 ```
 
 The board auto-resets and runs the firmware.
@@ -192,6 +192,13 @@ cargo embed --release --no-default-features --features board-xiao,rtt
 cargo embed --release
 ```
 
+**Pulsar v1** (ships as a signed OTA package; SWD is for bring-up only):
+```bash
+cargo build --release --no-default-features --features board-pulsarv1
+```
+
+Each board has a start-to-finish guide under [`docs/build/`](docs/build/).
+
 ### Testing
 
 The `maple-protocol` crate is pure Rust with no embedded dependencies — tests run on the host:
@@ -215,17 +222,24 @@ The GPIO implementation bulk-samples both data lines at ~7.9 MS/s (≈4 samples 
 ./scripts/ci.sh
 ```
 
-Runs formatting, tests, clippy, and release builds for both board targets.
+Runs formatting, the protocol tests, clippy for all three boards, every release build, and
+then checks each ELF's timing invariants. `./scripts/check.sh [dk|xiao|pulsarv1]` is the ~2 s
+inner loop to run after every change; `ci.sh` is the gate before a commit.
 
 ## Documentation
 
+[`docs/MOC.md`](docs/MOC.md) indexes everything. The main entries:
+
 | Document | Description |
 |----------|-------------|
-| [User Guide](docs/users_guide.md) | Non-technical guide to using the adapter |
+| [Build guides](docs/build/) | One per board: [XIAO](docs/build/xiao.md), [DK](docs/build/dk.md), [Pulsar v1](docs/build/pulsar-v1.md) |
+| [User Guide](docs/users_guide.md) | Using the adapter, across all three boards |
+| [Owner's Manual](docs/pulsar_v1_manual.md) | For an assembled Pulsar v1 |
 | [Bill of Materials](docs/bill_of_materials.md) | Parts list for building your own |
-| [Pin Mapping](docs/pin_mapping.md) | Complete wiring reference for both boards |
+| [Pin Mapping](docs/pin_mapping.md) | Complete wiring reference for all three boards |
 | [Flash Commands](docs/flash-commands.md) | Flashing and debugging cheat sheet |
 | [Maple Bus Protocol](docs/maple_bus_protocol.md) | Protocol reference and implementation details |
+| [Input Quality Testing](docs/input_quality_testing.md) | Measuring latency and packet loss |
 | [Battery Optimization](docs/battery_optimization.md) | Power management strategy |
 | [Learnings](docs/learnings.md) | Implementation lessons learned |
 
