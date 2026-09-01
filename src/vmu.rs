@@ -5,6 +5,15 @@
 //! The Dreamcast VMU LCD is 48×32 pixels, 1 bit per pixel (192 bytes).
 //! Each row is 6 bytes, MSB = leftmost pixel.
 
+#![expect(
+    clippy::unusual_byte_groupings,
+    reason = "the glyph tables here are pixel art: `0b11110_000` is a 5-pixel-wide \
+              character row plus 3 bits of padding, and the underscore marks exactly \
+              that boundary. Clippy wants nibble grouping (`0b1111_0000`), which \
+              would split every row mid-glyph and destroy the visual correspondence \
+              between the literal and the character it draws."
+)]
+
 /// VMU LCD dimensions.
 pub const LCD_WIDTH: usize = 48;
 pub const LCD_HEIGHT: usize = 32;
@@ -183,6 +192,64 @@ const BATTERY_OUTLINE: [[u8; 2]; BATTERY_HEIGHT] = [
 /// Bars at icon columns 2, 4, 6, 8.
 const BAR_COLS: [usize; 4] = [2, 4, 6, 8];
 
+/// Charging bolt, drawn inside the outline **instead of** the bars.
+///
+/// The interior is 9×5 (cols 1-9, rows 1-5) and the bars already own cols
+/// 2/4/6/8 of rows 2-4, so the two cannot coexist legibly at this size. Replacing
+/// them costs no information that was previously visible: a charging pack used to
+/// render as a *full* icon, indistinguishable from one that had finished — which
+/// is exactly the bug this fixes. Level returns the moment charging stops.
+///
+/// ```text
+///  .XXXXXXXXX..
+///  X....XX...X.
+///  X...XX....XX  ← nub
+///  X..XXXX...XX
+///  X...XX....XX
+///  X..XX.....X.
+///  .XXXXXXXXX..
+/// ```
+#[rustfmt::skip]
+const BATTERY_BOLT: [[u8; 2]; BATTERY_HEIGHT] = [
+    //  ............
+    [0x00, 0x00],
+    //  .....XX.....       (cols 5-6)
+    [0x06, 0x00],
+    //  ....XX......       (cols 4-5)
+    [0x0C, 0x00],
+    //  ...XXXX.....       (cols 3-6, the crossbar)
+    [0x1E, 0x00],
+    //  ....XX......       (cols 4-5)
+    [0x0C, 0x00],
+    //  ...XX.......       (cols 3-4)
+    [0x18, 0x00],
+    //  ............
+    [0x00, 0x00],
+];
+
+// The bolt must sit strictly inside the outline. Overlapping the border or nub
+// would deform the battery shape; straying outside `BATTERY_MASK` would light a
+// pixel the mask never clears, so a stale dot would survive into the next frame.
+// Checked at compile time rather than by eye, because the bit-per-column packing
+// makes an off-by-one here easy to write and hard to see. Same idiom as the other
+// layout bounds in this file.
+const _: () = {
+    let mut row = 0;
+    while row < BATTERY_HEIGHT {
+        assert!(
+            BATTERY_BOLT[row][0] & BATTERY_OUTLINE[row][0] == 0
+                && BATTERY_BOLT[row][1] & BATTERY_OUTLINE[row][1] == 0,
+            "charging bolt collides with the battery border or nub"
+        );
+        assert!(
+            BATTERY_BOLT[row][0] & !BATTERY_MASK[row][0] == 0
+                && BATTERY_BOLT[row][1] & !BATTERY_MASK[row][1] == 0,
+            "charging bolt has a pixel outside the overlay mask"
+        );
+        row += 1;
+    }
+};
+
 /// Number of bars to show for a given battery percentage.
 ///
 /// Bucketed so that a **coarse 4-level gauge lands one bar per level**:
@@ -228,17 +295,36 @@ pub fn render_battery(bars: u8) -> [[u8; 2]; BATTERY_HEIGHT] {
     icon
 }
 
+/// Render the battery icon showing the charging bolt instead of a level.
+#[must_use]
+pub fn render_battery_charging() -> [[u8; 2]; BATTERY_HEIGHT] {
+    let mut icon = BATTERY_OUTLINE;
+    for (row, bolt) in icon.iter_mut().zip(BATTERY_BOLT.iter()) {
+        row[0] |= bolt[0];
+        row[1] |= bolt[1];
+    }
+    icon
+}
+
 /// Composite the battery icon onto a VMU framebuffer at the top-right corner.
+///
+/// `charging` swaps the level bars for a bolt — see [`BATTERY_BOLT`]. It takes
+/// precedence over `percent` because while a charger is attached the level is both
+/// changing and coarse (25 % steps on pulsarv1), and "power is going in" is the
+/// more useful fact.
 ///
 /// Uses AND-then-OR masked blit:
 ///   `output[i] = (frame[i] & !mask[i]) | icon[i]`
-pub fn composite_battery(frame: &mut [u8; LCD_BYTES], percent: u8, visible: bool) {
+pub fn composite_battery(frame: &mut [u8; LCD_BYTES], percent: u8, charging: bool, visible: bool) {
     if !visible {
         return;
     }
 
-    let bars = bars_for_percent(percent);
-    let icon = render_battery(bars);
+    let icon = if charging {
+        render_battery_charging()
+    } else {
+        render_battery(bars_for_percent(percent))
+    };
 
     let bytes_per_row = LCD_WIDTH / 8; // 6
 
@@ -282,9 +368,9 @@ const STAR_RADIUS_X: i16 = 8;
 const STAR_RADIUS_Y: i16 = 5;
 
 /// Jet cone definitions for each animation frame (12 frames = 30° steps).
-/// Each entry is (tip_dx, tip_dy, spread_dx, spread_dy):
-///   - (tip_dx, tip_dy): center of the cone's far end, relative to star center
-///   - (spread_dx, spread_dy): offset from tip center to each edge of the cone
+/// Each entry is (`tip_dx`, `tip_dy`, `spread_dx`, `spread_dy`):
+///   - (`tip_dx`, `tip_dy`): center of the cone's far end, relative to star center
+///   - (`spread_dx`, `spread_dy`): offset from tip center to each edge of the cone
 ///
 /// The cone is a filled triangle: star center → tip+spread → tip-spread.
 /// Lower jet mirrors the upper: negate all offsets.
@@ -309,7 +395,13 @@ const JET_CONES: [(i16, i16, i16, i16); 12] = [
 ];
 
 /// Set a pixel in the framebuffer. x=0 is leftmost, y=0 is topmost.
-fn set_pixel(frame: &mut [u8; LCD_BYTES], x: i16, y: i16) {
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "the bounds check immediately above rejects negative and out-of-range coordinates, so the i16/usize casts that follow are in range"
+)]
+const fn set_pixel(frame: &mut [u8; LCD_BYTES], x: i16, y: i16) {
     if x < 0 || x >= LCD_WIDTH as i16 || y < 0 || y >= LCD_HEIGHT as i16 {
         return;
     }
@@ -322,6 +414,14 @@ fn set_pixel(frame: &mut [u8; LCD_BYTES], x: i16, y: i16) {
 
 /// Draw a filled triangle using scanline fill.
 /// Vertices: (x0,y0), (x1,y1), (x2,y2).
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "scanline bounds are clamped to the 48x32 LCD before every cast, so the \
+              i16/usize round trips stay in range and non-negative; the LCD \
+              dimensions themselves are compile-time constants far inside i16"
+)]
 fn fill_triangle(frame: &mut [u8; LCD_BYTES], verts: [(i16, i16); 3]) {
     let min_y = verts[0].1.min(verts[1].1).min(verts[2].1).max(0);
     let max_y = verts[0]
@@ -511,7 +611,11 @@ include!(concat!(env!("OUT_DIR"), "/glyph_dreamcast.rs"));
 
 /// 5x7 monochrome bitmap font, supporting just the characters used in profile labels.
 /// Returns 7 row bytes, each row's 5 bits in the high nibble (bits 7..3).
-fn font_5x7(c: u8) -> [u8; 7] {
+#[expect(
+    clippy::too_many_lines,
+    reason = "a flat glyph-compositing sequence; splitting it would scatter a layout that reads top to bottom"
+)]
+const fn font_5x7(c: u8) -> [u8; 7] {
     match c {
         b'R' => [
             0b11110_000,
@@ -621,6 +725,106 @@ fn font_5x7(c: u8) -> [u8; 7] {
             0b10001_000,
             0b11110_000,
         ],
+        // 'V' and digits: used by the installed-version tag on the BOOT splash.
+        b'V' => [
+            0b10001_000,
+            0b10001_000,
+            0b10001_000,
+            0b10001_000,
+            0b10001_000,
+            0b01010_000,
+            0b00100_000,
+        ],
+        b'0' => [
+            0b01110_000,
+            0b10001_000,
+            0b10011_000,
+            0b10101_000,
+            0b11001_000,
+            0b10001_000,
+            0b01110_000,
+        ],
+        b'1' => [
+            0b00100_000,
+            0b01100_000,
+            0b00100_000,
+            0b00100_000,
+            0b00100_000,
+            0b00100_000,
+            0b01110_000,
+        ],
+        b'2' => [
+            0b01110_000,
+            0b10001_000,
+            0b00001_000,
+            0b00010_000,
+            0b00100_000,
+            0b01000_000,
+            0b11111_000,
+        ],
+        b'3' => [
+            0b11111_000,
+            0b00010_000,
+            0b00100_000,
+            0b00010_000,
+            0b00001_000,
+            0b10001_000,
+            0b01110_000,
+        ],
+        b'4' => [
+            0b00010_000,
+            0b00110_000,
+            0b01010_000,
+            0b10010_000,
+            0b11111_000,
+            0b00010_000,
+            0b00010_000,
+        ],
+        b'5' => [
+            0b11111_000,
+            0b10000_000,
+            0b11110_000,
+            0b00001_000,
+            0b00001_000,
+            0b10001_000,
+            0b01110_000,
+        ],
+        b'6' => [
+            0b00110_000,
+            0b01000_000,
+            0b10000_000,
+            0b11110_000,
+            0b10001_000,
+            0b10001_000,
+            0b01110_000,
+        ],
+        b'7' => [
+            0b11111_000,
+            0b00001_000,
+            0b00010_000,
+            0b00100_000,
+            0b01000_000,
+            0b01000_000,
+            0b01000_000,
+        ],
+        b'8' => [
+            0b01110_000,
+            0b10001_000,
+            0b10001_000,
+            0b01110_000,
+            0b10001_000,
+            0b10001_000,
+            0b01110_000,
+        ],
+        b'9' => [
+            0b01110_000,
+            0b10001_000,
+            0b10001_000,
+            0b01111_000,
+            0b00001_000,
+            0b00010_000,
+            0b01100_000,
+        ],
         _ => [0; 7], // unsupported char renders blank
     }
 }
@@ -642,7 +846,11 @@ fn blit_glyph(
             let byte_idx = row * bytes_per_row + col / 8;
             let bit_idx = 7 - (col % 8);
             if (glyph[byte_idx] >> bit_idx) & 1 != 0 {
-                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    clippy::cast_possible_truncation,
+                    reason = "glyph coordinates are loop indices bounded by the glyph dimensions and the 48x32 LCD, far inside i16"
+                )]
                 set_pixel(frame, origin_x + col as i16, origin_y + row as i16);
             }
         }
@@ -688,7 +896,11 @@ fn clear_rect(frame: &mut [u8; LCD_BYTES], x0: usize, y0: usize, x1: usize, y1: 
 /// Draw an ASCII string in the 5x7 font starting at (x, y).
 /// Characters are separated by 1 pixel of space.
 fn draw_text(frame: &mut [u8; LCD_BYTES], x: i16, y: i16, text: &[u8]) {
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        reason = "text coordinates are bounded by the 48x32 LCD and the 5x7 font pitch, far inside i16"
+    )]
     for (i, &ch) in text.iter().enumerate() {
         let glyph = font_5x7(ch);
         let cx = x + (i * (FONT_WIDTH + 1)) as i16;
@@ -703,7 +915,7 @@ fn draw_text(frame: &mut [u8; LCD_BYTES], x: i16, y: i16, text: &[u8]) {
 }
 
 /// Width in pixels of a string rendered in the 5x7 font.
-fn text_width(text: &[u8]) -> usize {
+const fn text_width(text: &[u8]) -> usize {
     if text.is_empty() {
         0
     } else {
@@ -718,11 +930,19 @@ fn text_width(text: &[u8]) -> usize {
 /// before the label is drawn, so the label always reads as a knock-out
 /// regardless of how the glyph art happens to overlap.
 #[must_use]
+#[expect(
+    clippy::similar_names,
+    reason = "cut_x0/cut_y0/cut_x1/cut_y1 are the four corners of one rectangle; the shared stem is what makes them readable as a set"
+)]
 pub fn build_profile_splash(glyph: &[u8; GLYPH_BYTES], label: &[u8]) -> [u8; LCD_BYTES] {
     let mut frame = [0u8; LCD_BYTES];
 
     // Glyph centered horizontally, anchored at top.
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        reason = "a centring offset computed from the LCD and glyph constants, so it is bounded by the 48-pixel display width"
+    )]
     let glyph_x = ((LCD_WIDTH - GLYPH_WIDTH) / 2) as i16;
     blit_glyph(&mut frame, glyph, glyph_x, 0);
 
@@ -740,16 +960,71 @@ pub fn build_profile_splash(glyph: &[u8; GLYPH_BYTES], label: &[u8]) -> [u8; LCD
     let cut_y1 = (text_y + FONT_HEIGHT + pad).min(LCD_HEIGHT);
     clear_rect(&mut frame, cut_x0, cut_y0, cut_x1, cut_y1);
 
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        reason = "text origins are bounded by the 48x32 LCD, far inside i16"
+    )]
     draw_text(&mut frame, text_x as i16, text_y as i16, label);
 
     frame
 }
 
+/// Build the DFU hand-off splash: "BOOT" at 2× scale plus a small version tag.
+///
+/// The tag ("V231") is the installed package version, tucked beneath the big
+/// text in the 5×7 font — so the unit says on screen which version it is
+/// *leaving*, and the next DFU entry's changed number confirms what the
+/// update actually did.
+///
+/// `None` (no Nordic settings page: UF2 boards, bare DK) renders plain "BOOT".
+#[must_use]
+pub fn build_boot_splash(version: Option<u32>) -> [u8; LCD_BYTES] {
+    let mut frame = build_message_splash(b"BOOT");
+
+    if let Some(v) = version {
+        let mut buf = [0u8; 11];
+        let tag = format_version(&mut buf, v);
+
+        // Bottom strip, centered, 1 px bottom padding — below the 2x "BOOT",
+        // which is vertically centered and ends at y = 23.
+        let tw = text_width(tag);
+        let tag_x = LCD_WIDTH.saturating_sub(tw) / 2;
+        let tag_y = LCD_HEIGHT - FONT_HEIGHT - 1;
+        #[expect(
+            clippy::cast_possible_wrap,
+            clippy::cast_possible_truncation,
+            reason = "text origins are bounded by the 48x32 LCD, far inside i16"
+        )]
+        draw_text(&mut frame, tag_x as i16, tag_y as i16, tag);
+    }
+
+    frame
+}
+
+/// Render `v` as "V<decimal>" into `buf`, returning the used suffix.
+/// 11 bytes fit the worst case exactly: 'V' + the 10 digits of `u32::MAX`.
+fn format_version(buf: &mut [u8; 11], v: u32) -> &[u8] {
+    let mut n = v;
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        // (n % 10) is 0-9; clippy proves the u8 cast lossless on its own.
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    i -= 1;
+    buf[i] = b'V';
+    &buf[i..]
+}
+
 // Compile-time sanity: glyph + text strip fit within the LCD.
 const _: () = assert!(GLYPH_HEIGHT <= LCD_HEIGHT);
 const _: () = assert!(GLYPH_WIDTH <= LCD_WIDTH);
-const _: () = assert!(FONT_HEIGHT + 1 <= LCD_HEIGHT);
+const _: () = assert!(FONT_HEIGHT < LCD_HEIGHT);
 
 // ── Sync / Goodbye splashes (2× scale text-only) ───────────────────────────
 
@@ -757,7 +1032,7 @@ const _: () = assert!(FONT_HEIGHT + 1 <= LCD_HEIGHT);
 const FONT_2X_GAP: usize = 2;
 
 /// Width in pixels of a string rendered at 2× scale.
-fn text_width_2x(text: &[u8]) -> usize {
+const fn text_width_2x(text: &[u8]) -> usize {
     if text.is_empty() {
         0
     } else {
@@ -766,7 +1041,11 @@ fn text_width_2x(text: &[u8]) -> usize {
 }
 
 /// Draw an ASCII string at 2× scale. Each font pixel becomes a 2×2 block.
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    reason = "text coordinates are bounded by the 48x32 LCD and the double-width font pitch, far inside i16"
+)]
 fn draw_text_2x(frame: &mut [u8; LCD_BYTES], x: i16, y: i16, text: &[u8]) {
     let char_pitch = FONT_WIDTH * 2 + FONT_2X_GAP;
     for (i, &ch) in text.iter().enumerate() {
@@ -796,7 +1075,11 @@ pub fn build_message_splash(text: &[u8]) -> [u8; LCD_BYTES] {
     let tw = text_width_2x(text);
     let text_x = LCD_WIDTH.saturating_sub(tw) / 2;
     let text_y = LCD_HEIGHT.saturating_sub(FONT_HEIGHT * 2) / 2;
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        reason = "text origins are bounded by the 48x32 LCD, far inside i16"
+    )]
     draw_text_2x(&mut frame, text_x as i16, text_y as i16, text);
     frame
 }
