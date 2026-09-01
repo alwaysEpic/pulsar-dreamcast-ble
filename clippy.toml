@@ -1,0 +1,43 @@
+# Clippy tuning for the workspace. Lint *levels* live in Cargo.toml
+# ([workspace.lints]); this file holds the knobs those lints read.
+
+# `unwrap_used` / `expect_used` / `panic` are denied in firmware because this
+# target cannot unwind — a panic drops the controller mid-game. In a test, a
+# panic *is* the failure report, and forcing tests through match arms would
+# make them worse at the one job they have.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# Accept `// SAFETY:` above the enclosing statement, so `let x = unsafe { .. }`
+# can carry its justification above the `let` where it reads naturally.
+#
+# House ordering when a block needs both a lint attribute and a safety comment:
+# attribute first, then the comment, then `unsafe`. Verified on clippy 0.1.97 —
+# a SAFETY comment placed *above* the attribute is not seen, and the block still
+# reports as undocumented.
+accept-comment-above-statement = true
+accept-comment-above-attributes = true
+
+# Product, vendor and standard names that appear in prose throughout the docs.
+# `doc_markdown` flags them as un-backticked code items, but they are not code —
+# backticking them would be wrong, and blanket-allowing the lint would lose the
+# real hits (`GET_CONDITION`, `PIN_CNF`, `set_mask`, …), which we do want caught.
+# ".." keeps clippy's own default list in addition to these.
+doc-valid-idents = [
+    "..",
+    "SoftDevice",
+    "EasyDMA",
+    "DirectInput",
+    "XInput",
+    "GameController",
+    "BlueRetro",
+    "PlayStation",
+    "NeoPixel",
+    "M5Stack",
+    "LiPo",
+    "PnP",
+    "PulsarDFU",
+    "AdaDFU",
+    "MapleLink",
+]
