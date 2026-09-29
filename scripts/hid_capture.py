@@ -223,7 +223,7 @@ def _git_info():
         "branch": run("rev-parse", "--abbrev-ref", "HEAD"),
         # A dirty tree means the commit does NOT describe the running firmware.
         # `--untracked-files=no` is load-bearing: this repo permanently carries
-        # untracked CAD (3d_files/*.blend, *.step), so a plain --porcelain marks
+        # untracked CAD (hardware/enclosure/*.blend, *.step), so a plain --porcelain marks
         # EVERY run dirty and the flag becomes noise you learn to ignore. Only
         # modifications to tracked sources can change the firmware.
         "dirty": bool(run("status", "--porcelain", "--untracked-files=no")),
@@ -424,7 +424,46 @@ PP_TAGS = {
     4: ("retries/window", "count"),
     5: ("cadence overruns", "count, cumulative"),
     6: ("radio notifications", "count, wrapping"),
+    # Capture-health counters (v297). Cumulative since boot, saturating at
+    # 65535 on-device — so these are read as a difference across the capture,
+    # not as the last value. Tags 8/9 read gpio_bus::NO_TRIGGER / INCOMPLETE,
+    # which exist only on the SPIM boards; a CPU-sampling build publishes 0.
+    #
+    # Ported to `main`'s telemetry 2026-09-18: the counters behind
+    # 8/9 already incremented there, only the payload table was missing. Before
+    # that they lived on bench branches only, and this script decoded
+    # them anyway because it reads captures from those branches and got them
+    # wrong once already.
+    7: ("polls", "count, cumulative"),
+    8: ("SPIM no-trigger", "count, cumulative"),
+    9: ("SPIM incomplete", "count, cumulative"),
+    # NOT cumulative-saturating, however it was documented and read on v297:
+    # this is `MAPLE_FAIL_TOTAL`, a plain wrapping `fetch_add` on a u16 with no
+    # saturation anywhere in its path. Classified with tag 6 below.
+    10: ("get_condition fails", "count, WRAPPING"),
+    11: ("app version", "build number"),
+    12: ("polls, no frame shadow", "count, cumulative"),
+    13: ("no-trigger, no shadow", "count, cumulative"),
+    # Which arm of an interleaved A/B the binary is. Two arms are the same
+    # version by necessity — downgrade prevention refuses a lower one — so
+    # without this nothing on the wire says which is running, which is the gap
+    # the v299 pair had to close with staged payload shas.
+    14: ("A/B arm", "0 = baseline, 1 = candidate"),
 }
+
+# Counters that only ever climb on-device and saturate at 65535 (`sat_count`
+# in `poll_period.rs`). Read as a difference across the capture. A DECREASE is
+# therefore impossible in normal operation: it means the counter was reset —
+# the unit rebooted, or DFU'd — and the two ends belong to different
+# populations. Subtracting across one silently invents exposure: 20,000 -> 100
+# read as 45,636 polls with zero failures on a real v297 capture.
+PP_CUMULATIVE = (5, 7, 8, 9, 12, 13)
+
+# Counters backed by a u16 that genuinely wraps. Here a decrease is expected
+# and modulo subtraction is the right reading — but only while the counter
+# wraps at most once between reports, which is why these are kept apart from
+# the saturating ones rather than sharing their arithmetic.
+PP_WRAPPING = (6, 10)
 
 
 def analyze_pollperiod(samples):
@@ -437,7 +476,7 @@ def analyze_pollperiod(samples):
     layout roll a healthy poll loop?
     """
     by_tag = {}
-    span = {}  # tag -> [first_t, first_v, last_t, last_v] for rate derivation
+    series = {}  # tag -> [(t, value), ...] in report order
     non_magic = 0
     for t, p in samples:
         tag = p[7] ^ PP_MAGIC_BASE
@@ -447,22 +486,236 @@ def analyze_pollperiod(samples):
         v = int.from_bytes(p[4:6], "little")
         # Values repeat until the next window flush — dedup per (window, tag)
         # so slow-rotation captures don't overweight long-lived windows.
+        #
+        # NOTE the window byte is 8 bits, so it wraps after 256 windows (~123 s
+        # at 32 polls/window) and later windows overwrite earlier ones. That
+        # costs the mean/min/max columns on a long capture. The cumulative
+        # figures below come from `series`, which is every report in order and
+        # is unaffected.
         by_tag.setdefault(tag, {})[p[6]] = v
-        if tag not in span:
-            span[tag] = [t, v, t, v]
-        else:
-            span[tag][2], span[tag][3] = t, v
+        series.setdefault(tag, []).append((t, v))
     stats = {}
     for tag, wins in by_tag.items():
         vals = list(wins.values())
-        t0, v0, t1, v1 = span[tag]
-        rate = ((v1 - v0) & 0xFFFF) / (t1 - t0) if t1 > t0 else None
+        ser = series[tag]
+        (t0, v0), (t1, v1) = ser[0], ser[-1]
+        wrapping = tag in PP_WRAPPING
+        cumulative = tag in PP_CUMULATIVE
+
+        # Every step down across the whole capture, not just first vs last: a
+        # reset in the middle can leave the ends looking monotonic.
+        drops = sum(1 for (_, a), (_, b) in zip(ser, ser[1:]) if b < a)
+        # Saturation is a property of the saturating counters only; on a
+        # wrapping one 65535 is just a value it passes through.
+        pegged = cumulative and any(v == 0xFFFF for _, v in ser)
+
+        reset = cumulative and drops > 0
+        if cumulative:
+            # Suppressed outright on a reset. There is no arithmetic that
+            # recovers the exposure — the pre-reset history has no known
+            # duration — so the honest answer is that this population is
+            # unavailable, not a number computed from two unrelated ends.
+            delta = None if reset else v1 - v0
+        elif wrapping:
+            # Summed over adjacent reports, not taken across the endpoints: a
+            # counter that turns over a whole revolution between the first and
+            # last report differences to nothing, though the reports in
+            # between show every increment. 100 -> 65000 -> 100 is 65,536, not
+            # 0. This assumes at most ONE wrap between two adjacent reports,
+            # which is what `wrapped` below flags — past that the sum is a
+            # floor, so nothing derived from it may be printed as exact.
+            delta = sum((b - a) & 0xFFFF for (_, a), (_, b) in zip(ser, ser[1:]))
+        else:
+            # A per-window figure (a mean, a max, a version). Differencing the
+            # ends of an oscillating series answers nothing.
+            delta = None
+
+        rate = delta / (t1 - t0) if delta is not None and t1 > t0 else None
         stats[tag] = {
+            # mean/min/max come from the window-deduped values and carry the
+            # rollover caveat above; `last` must not, so it is the final
+            # CHRONOLOGICAL sample. The deduped dict keeps a window ID at its
+            # first insertion point, so once the 8-bit ID rolls over its last
+            # entry is whatever window 255 held — an old value that the record
+            # would then pair with the run's final timestamp, leaving a JSONL
+            # row that cannot reproduce its own delta.
             "n": len(vals), "mean": statistics.fmean(vals),
-            "min": min(vals), "max": max(vals), "last": vals[-1],
+            "min": min(vals), "max": max(vals), "last": v1,
             "rate": rate,
+            # Cumulative tags are read as a difference across the capture, not
+            # as a last value: the counters are boot-level, so a unit that has
+            # been up for an hour carries an hour of history into the run.
+            "first": v0, "delta": delta,
+            "first_t": t0, "last_t": t1,
+            "kind": "cumulative" if cumulative else "wrapping" if wrapping else "window",
+            # `reset` means this tag's figures are unavailable, full stop.
+            # `pegged` means the on-device u16 hit its ceiling, so `delta` and
+            # everything derived from it is a floor, not a measurement.
+            # `wrapped` means a wrapping counter turned over at least once, so
+            # `delta` is a floor for the same reason.
+            "reset": reset, "pegged": pegged,
+            "wrapped": wrapping and drops > 0, "drops": drops,
         }
     return {"stats": stats, "non_magic": non_magic, "total": len(samples)}
+
+
+def pp_run_reset(st):
+    """Tags that prove the unit's counters were reset during the capture."""
+    return sorted(t for t in PP_CUMULATIVE if t in st and st[t]["reset"])
+
+
+def pp_unavailable(st, tag):
+    """Why tag `tag`'s difference cannot be quoted, or None if it can.
+
+    Saturation does not make a figure unavailable — it makes it a floor, which
+    is still worth printing as long as it is never printed as an exact count.
+
+    A reset does, and it does so for the WHOLE RUN rather than for the counter
+    that happened to show it. Every counter here is boot-level and they all
+    reset together; which ones reveal it is an accident of how densely each tag
+    was sampled. A reboot between two reports of a sparsely sampled tag leaves
+    that tag monotonic, and a tag sitting at zero never decreases at all — so
+    suppressing only the tag that dropped announces the reset and then prints a
+    passing gate underneath it, which is the exact shape of the bug this
+    function exists to prevent.
+    """
+    s = st.get(tag)
+    if s is None:
+        return "not published by this build"
+    if s["delta"] is None and not s["reset"]:
+        return "a per-window figure, not a cumulative one"
+    if s["reset"]:
+        return (f"counter reset mid-capture ({s['drops']} decrease(s)) —"
+                " the two ends are different populations")
+    others = [t for t in pp_run_reset(st) if t != tag]
+    if others and s["kind"] in ("cumulative", "wrapping"):
+        return ("a counter reset was detected on tag "
+                + ", ".join(str(t) for t in others)
+                + " — the unit rebooted mid-capture, so this counter spans the"
+                  " same break even though it did not decrease")
+    return None
+
+
+def _pp_route_a_gate(st):
+    """Print the capture-health readings from tags 7-13.
+
+    Silent on a build that does not carry them, so this stays a no-op for the
+    ordinary layout-lottery use the channel was built for.
+
+    Every figure is a difference across the capture. The counters are
+    boot-level, so a unit that has been powered for a while carries history
+    into the run; the last value answers a different question than the gate
+    asks.
+
+    A reading is never printed once it is known to be unsound. On v297 the
+    saturation warning was printed and then a derived "0 of 12,000" was printed
+    underneath it, which reads as a pass; a reset was silently absorbed by the
+    modulo subtraction and reported 45,636 polls of exposure with zero
+    failures. Both are suppressed here, and suppression names the tag.
+    """
+    if 14 in st:
+        arm = st[14]["last"]
+        name = {0: "A (baseline)", 1: "B (candidate)"}.get(arm, f"unknown ({arm})")
+        lo, hi = st[14]["min"], st[14]["max"]
+        if lo != hi:
+            print(f"    ⚠ A/B arm changed mid-capture ({lo} → {hi}) — the reports in this run")
+            print("      come from two different binaries. Judge neither; re-capture.")
+        else:
+            print(f"    A/B arm: {name} — read this before any comparison; the two arms"
+                  " carry the same version number by necessity")
+    if 11 in st:
+        v = st[11]["last"]
+        print(f"    app version (bootloader settings): {v if v else 'not recorded'}"
+              " — can lag a flash by one; a stale reading is unwritten settings,"
+              " not the wrong build")
+    if 7 not in st:
+        return
+
+    # A reset anywhere invalidates the run's arithmetic, so say so once, at the
+    # top, before any figure is printed.
+    reset = sorted(t for t in PP_CUMULATIVE if t in st and st[t]["reset"])
+    if reset:
+        print("    ⚠ COUNTER RESET during the capture (tag(s) "
+              + ", ".join(f"{t} {PP_TAGS[t][0]}" for t in reset) + ") — the unit")
+        print("      rebooted or was reflashed mid-run. EVERY cumulative figure in this")
+        print("      run is reported unavailable below, not just the tag that decreased:")
+        print("      they all reset together, and which ones show it is an accident of")
+        print("      sampling. The pre-reset history has no known duration, so no exposure")
+        print("      figure can be recovered from this capture.")
+    if any(st[t]["pegged"] for t in PP_CUMULATIVE if t in st):
+        print("    ⚠ a cumulative counter reached 65535 (the channel's ceiling) — every")
+        print("      figure derived from it is a FLOOR, not a count, and no exact rate or")
+        print("      exposure verdict can be read off this run. Power-cycle and re-run.")
+
+    why = pp_unavailable(st, 7)
+    if why:
+        print(f"    polls in this capture: unavailable — {why}")
+        print("    No gate verdict from this run.")
+        return
+    polls = st[7]["delta"]
+    if st[7]["pegged"]:
+        print(f"    polls in this capture: >= {polls} — the counter saturated, so this is a"
+              " floor and cannot be judged against the gate's >= 10,000")
+    else:
+        print(f"    polls in this capture: {polls}"
+              f" ({'meets' if polls >= 10000 else 'SHORT OF'} the gate's >= 10,000)")
+    if not polls:
+        return
+
+    def pct(tag, label, denom, denom_exact):
+        why = pp_unavailable(st, tag)
+        if why:
+            print(f"      {label:<20} unavailable — {why}")
+            return
+        n = st[tag]["delta"]
+        # A wrapped counter is a floor for the same reason a saturated one is:
+        # the sum holds only while no two adjacent reports straddle more than
+        # one revolution. Checked HERE, with the figure — a floor warning
+        # printed after the exact percentage it qualifies is read as a pass.
+        if st[tag]["pegged"] or st[tag]["wrapped"] or not denom_exact:
+            why = ("it turned over during this capture"
+                   if st[tag]["wrapped"] else "the counter saturated")
+            print(f"      {label:<20} >= {n} of {denom} — a floor ({why});"
+                  " no rate from this run")
+        else:
+            print(f"      {label:<20} {n} of {denom} — {100.0 * n / denom:.2f} %")
+
+    exact = not st[7]["pegged"] and not st[7]["wrapped"]
+    for tag, label in ((8, "pooled no-trigger"), (9, "pooled incomplete"),
+                       (10, "get_condition fails")):
+        if tag in st:
+            pct(tag, label, polls, exact)
+
+    if 12 in st and 13 in st:
+        why = pp_unavailable(st, 12) or pp_unavailable(st, 13)
+        print("    THE GATE READING — outside the LCD frame shadow (poll >= 15 ms after the"
+              " last frame, or before any frame):")
+        if why:
+            print(f"      unavailable — {why}")
+        elif st[12]["delta"]:
+            clear, nt_clear = st[12]["delta"], st[13]["delta"]
+            if any(st[t]["pegged"] or st[t]["wrapped"] for t in (12, 13)):
+                print(f"      no-trigger >= {nt_clear} of >= {clear} polls — floors, no rate")
+            else:
+                print(f"      no-trigger {nt_clear} of {clear} polls —"
+                      f" {100.0 * nt_clear / clear:.3f} %")
+                print(f"      ({'meets' if clear >= 10000 else 'SHORT OF'} the gate's >= 10,000;"
+                      " run it on each of the owner's controllers)")
+        else:
+            print("      no polls outside the shadow — nothing to read")
+        # Tag 8 counts no-trigger EVENTS, retries included; tag 13 counts POLLS
+        # with at least one. They are not additive and their difference is not
+        # a frame-shadow figure.
+        print("      The pooled line above counts events (retries included) and this one"
+              " counts polls, so the two do not subtract. The pooled figure also carries"
+              " the v290/v292 frame effect, tracked separately and NOT attributed to"
+              " route (a): on v296, 58-60 of 64 pooled no-triggers sat in the 0-2 ms"
+              " post-frame bucket. Gate on this line, not on the pooled one.")
+    elif 8 in st:
+        print("      pooled only — this build carries no frame-shadow split (tags 12/13)."
+              " Pooled, the no-trigger rate mostly measures how often a poll follows an LCD"
+              " frame (~1 % on every route-(a) build measured) and does not gate route (a).")
+
 
 # sd_ble_gap_conn_param_update return codes worth naming (nrf_error.h).
 NRF_RC = {
@@ -477,6 +730,60 @@ NRF_RC = {
 }
 
 
+GAUGE_PCT_UNDECODED = 0xFF
+GAUGE_FLAG_CHARGING = 0x01
+GAUGE_FLAG_FULL = 0x02
+GAUGE_SEQ_SHIFT, GAUGE_SEQ_MASK = 2, 0x03
+GAUGE_FLAG_CHARGING_UNREAD = 0x10
+GAUGE_FLAG_FULL_UNREAD = 0x20
+GAUGE_FLAG_GAUGE_UNREAD = 0x40
+
+
+def decode_gauge(raw, pct, flags):
+    """One gauge sample as the firmware meant it. `None` is *unknown*, never false or zero.
+
+    The firmware reports each of its three I²C reads separately, because a read
+    that failed is not a `false` and a byte nobody can decode is not 0 %. This
+    has to keep that distinction or the capture manufactures the very reading
+    the firmware refused to: an all-reads-failed sample once printed here as
+    "255 % discharging".
+
+    `gauge` is one of "ok", "undecodable" (the byte read; nobody knows what it
+    means — `raw` is kept, it is what a characterization run is looking for) or
+    "unread" (the I²C read failed; `raw` is meaningless and reported as None).
+    """
+    if flags & GAUGE_FLAG_GAUGE_UNREAD:
+        gauge, raw, percent = "unread", None, None
+    elif pct == GAUGE_PCT_UNDECODED:
+        gauge, percent = "undecodable", None
+    else:
+        gauge, percent = "ok", pct
+    return {
+        "raw": raw,
+        "percent": percent,
+        "gauge": gauge,
+        "charging": None if flags & GAUGE_FLAG_CHARGING_UNREAD else bool(flags & GAUGE_FLAG_CHARGING),
+        "full": None if flags & GAUGE_FLAG_FULL_UNREAD else bool(flags & GAUGE_FLAG_FULL),
+        "seq": (flags >> GAUGE_SEQ_SHIFT) & GAUGE_SEQ_MASK,
+    }
+
+
+def gauge_state(entry):
+    """The charge state in words, saying "unknown" where the firmware did."""
+    chg, full = entry["charging"], entry["full"]
+    if chg:
+        return "charging"
+    if full:
+        return "full"
+    if chg is None and full is None:
+        return "charge state unknown"
+    if chg is None:
+        return "charging unknown, not full"
+    if full is None:
+        return "not charging, full unknown"
+    return "discharging"
+
+
 def analyze_gauge(samples):
     """Decode IP5306 gauge samples smuggled in the right-stick bytes (4-7).
 
@@ -486,21 +793,28 @@ def analyze_gauge(samples):
     exactly what a wired channel would disturb. The Dreamcast has no right
     stick, so bytes 4-7 are otherwise a constant 0x8000/0x8000.
 
-    Layout (LE u32): [raw 0x78, decoded %, flags, MAGIC]; flags bit0=charging,
-    bit1=charge-complete. Returns one entry per *distinct* sample, timestamped
-    at first sighting, since the firmware only re-reads the gauge every 60 s.
+    Layout (LE u32): [raw 0x78, decoded %, flags, MAGIC] — the flag bits are in
+    `decode_gauge`, and `src/lib.rs::publish_gauge_sample` is the other half of
+    the contract.
+
+    Returns one entry per *change* from the previous report, timestamped at
+    first sighting. Not per distinct value: this used to keep a global `seen`
+    set, so 25 % -> 0 % -> 25 % reported two entries and the return — the
+    rebound a discharge run exists to catch — vanished. The firmware's sequence
+    counter is part of what changes, so a repeated identical *measurement* is
+    an entry while the same measurement carried by many HID reports is not. An
+    older build without the counter still works; it just collapses repeats.
     """
-    seen, timeline = set(), []
+    previous, timeline = None, []
     non_magic = 0
     for t, p in samples:
         if p[7] != GAUGE_MAGIC:
             non_magic += 1
             continue
-        raw, pct, flags = p[4], p[5], p[6]
-        key = (raw, pct, flags)
-        if key not in seen:
-            seen.add(key)
-            timeline.append((t, raw, pct, bool(flags & 0x01), bool(flags & 0x02)))
+        key = (p[4], p[5], p[6])
+        if key != previous:
+            previous = key
+            timeline.append({"t": t, **decode_gauge(*key)})
     return {"timeline": timeline, "non_magic": non_magic, "total": len(samples)}
 
 
@@ -542,7 +856,7 @@ def main() -> int:
                     help=f"capture log path (default {DEFAULT_RECORD})")
     ap.add_argument("--board", help="board this run was captured against, e.g. pulsarv1")
     ap.add_argument("--unit", metavar="SERIAL",
-                    help="serial of the physical unit under test, e.g. PV1-0002. Without it "
+                    help="serial of the physical unit under test, e.g. UNIT-01. Without it "
                          "a run cannot be attributed to a board, which is what QC needs. "
                          "With --history, shows only that unit's runs")
     ap.add_argument("--note", help="free-text label for this run, e.g. 'post ip5306 RMW fix'")
@@ -724,11 +1038,12 @@ def main() -> int:
             print("  → reports ARE dropped between firmware and host (BLE or macOS HID). Re-run on a")
             print("    Linux host (hidraw) to separate a real BLE drop from macOS delivery coalescing.")
 
+    pp = None
     if args.pollperiod:
         pp = analyze_pollperiod(samples)
         print("\n── Poll-loop period (bytes 4-7 — requires a poll-period-debug build) ──")
         if not pp["stats"]:
-            print(f"  no 0xB0-0xB5 tag in byte 7 across {pp['total']} report(s) —")
+            print(f"  no 0xB0-0xBD tag in byte 7 across {pp['total']} report(s) —")
             print("  this firmware was NOT built with the poll-period-debug feature. Rebuild")
             print("  with --features board-pulsarv1,rtt,seq-counter,poll-period-debug.")
         else:
@@ -750,20 +1065,43 @@ def main() -> int:
                       "A stretched period WITH raised retries = the coupled-oscillator "
                       "signature; stretched WITHOUT retries = look elsewhere.")
             if 5 in st:
-                print(f"    cadence overruns since boot: {st[5]['last']}"
-                      " (0 on a pre-anchor build; on an anchored build, >0/s = this "
-                      "layout's body exceeds the period budget — a bad roll, caught on-device)")
-            if 6 in st and st[6]["rate"] is not None:
-                print(f"    radio notifications: ≈{st[6]['rate']:.0f}/s "
-                      "(healthy ≈133/s = 2 edges × 66.6 conn events/s; low or bursty = "
-                      "the quiet-window gate is starving at its input, upstream of "
-                      "classification)")
-            print("    NOTE: on a poll-period-debug build the --seq loss figure is NOT link "
-                  "loss: the rotating tag defeats wire dedup, the ~125Hz notify loop then "
-                  "attempts more sends than there are connection events, and the surplus "
-                  "is rejected queue-full — each reject consumes a seq (benign, "
-                  "run #44: 29.7% 'loss' at a perfectly healthy 66Hz). Judge transit "
-                  "loss only on builds without poll-period-debug.")
+                # A difference across the capture, not the last value: the
+                # counter is cumulative since boot, so a unit that has been up
+                # a while carries history into the run.
+                why = pp_unavailable(st, 5)
+                if why:
+                    print(f"    cadence overruns in this capture: unavailable — {why}")
+                else:
+                    floor = " (a floor — the counter saturated)" if st[5]["pegged"] else ""
+                    print(f"    cadence overruns in this capture: {st[5]['delta']}{floor}"
+                          f" (since-boot total {st[5]['last']})"
+                          " — 0 on a pre-anchor build; on an anchored build, >0/s = this "
+                          "layout's body exceeds the period budget, a bad roll caught "
+                          "on-device")
+            if 6 in st:
+                # Same rule as everywhere else: a reboot zeroes the radio
+                # counter with the rest of them, so its span is broken too.
+                why = pp_unavailable(st, 6)
+                if why:
+                    print(f"    radio notifications: unavailable — {why}")
+                elif st[6]["rate"] is not None:
+                    floor = (" — a floor; the counter turned over"
+                             f" {st[6]['drops']}× and the sum assumes at most one wrap"
+                             " between adjacent reports" if st[6]["wrapped"] else "")
+                    print(f"    radio notifications: ≈{st[6]['rate']:.0f}/s{floor} "
+                          "(healthy ≈133/s = 2 edges × 66.6 conn events/s; low or bursty = "
+                          "the quiet-window gate is starving at its input, upstream of "
+                          "classification)")
+            _pp_route_a_gate(st)
+            print("    NOTE: the telemetry payload now advances once per fresh controller "
+                  "sample and is replayed byte-for-byte in between, so wire dedup works on "
+                  "this build and report arrivals track the poll loop again. Before that fix "
+                  "(every build up to and including v297) the tag rotated per SEND: dedup "
+                  "never fired, the ~125 Hz notify loop attempted more sends than there were "
+                  "connection events, the surplus was rejected queue-full, and each reject "
+                  "consumed a seq — so --seq read 29.7 % 'loss' at a perfectly healthy 66 Hz "
+                  "(run #44) and Hz/IQR could not fail at all (v297 run #200). On a capture "
+                  "from one of those builds, judge neither.")
 
     if args.connparam:
         c = analyze_connparam(samples)
@@ -808,13 +1146,16 @@ def main() -> int:
         else:
             if g["non_magic"]:
                 print(f"  ⚠ {g['non_magic']}/{g['total']} report(s) lacked the magic byte")
-            print(f"  {len(g['timeline'])} distinct sample(s) "
-                  "(the firmware re-reads the gauge every 60 s):")
-            print(f"    {'t (s)':>8}  {'0x78':>5}  {'bits 7:4':>9}  {'decoded':>8}  state")
-            for t, raw, pct, chg, full in g["timeline"]:
-                nib = format(raw >> 4, "04b")
-                state = "charging" if chg else ("full" if full else "discharging")
-                print(f"    {t:8.1f}  0x{raw:02X}   {nib:>9}  {pct:6d} %  {state}")
+            print(f"  {len(g['timeline'])} sample(s), one per change "
+                  "(the firmware re-reads the gauge every 10-60 s):")
+            print(f"    {'t (s)':>8}  {'seq':>3}  {'0x78':>5}  {'bits 7:4':>9}  {'decoded':>12}  state")
+            for e in g["timeline"]:
+                if e["gauge"] == "unread":
+                    raw, nib, decoded = "  --", "----", "read failed"
+                else:
+                    raw, nib = f"0x{e['raw']:02X}", format(e["raw"] >> 4, "04b")
+                    decoded = "undecodable" if e["gauge"] == "undecodable" else f"{e['percent']} %"
+                print(f"    {e['t']:8.1f}  {e['seq']:>3}  {raw:>5}  {nib:>9}  {decoded:>12}  {gauge_state(e)}")
             print("  → Log these against a known cell voltage to rebuild the map. Bits 7:4 are")
             print("    believed to be the 4 gauge LEDs, active-LOW (0000 = all lit = 100 %).")
 
@@ -847,6 +1188,29 @@ def main() -> int:
             "rotations_per_sec": _r(rot.get("rotations_per_sec")),
             "samples_per_direction": _r(spo, 2),
         }
+        # The telemetry counters the capture-health readings rest on. Runs
+        # #200/#201 recorded none of this, so the stitched result they produced
+        # could not be reconstructed from the records afterwards — only from a
+        # console scrollback that happened to be kept. First and last values
+        # with their timestamps make the difference re-derivable; `reset` and
+        # `pegged` travel with them so a later reader cannot re-make the
+        # mistake of differencing across a reset or quoting a saturated floor
+        # as a count. Snapshot-to-snapshot spans are date-to-date across runs,
+        # never `date` plus `seconds`.
+        if pp and pp["stats"]:
+            record["poll_period"] = {
+                str(tag): {
+                    "name": PP_TAGS[tag][0],
+                    "kind": t["kind"],
+                    "first": t["first"], "last": t["last"],
+                    "first_t": _r(t["first_t"], 3), "last_t": _r(t["last_t"], 3),
+                    "delta": t["delta"],
+                    "reset": t["reset"], "pegged": t["pegged"],
+                    "wrapped": t["wrapped"], "drops": t["drops"],
+                    "n": t["n"],
+                }
+                for tag, t in sorted(pp["stats"].items())
+            }
         total = append_record(args.record_file, record)
         if total is not None:
             dirty = " (dirty tree)" if git["dirty"] else ""
