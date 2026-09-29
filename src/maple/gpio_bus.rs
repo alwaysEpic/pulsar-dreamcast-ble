@@ -12,10 +12,18 @@
 //! - 500ns per phase = 2Mbps
 //! - Idle state: SDCKA HIGH, SDCKB LOW
 
+#[cfg(feature = "spim-capture")]
+use crate::maple::spim_capture::{SpimCapture, StreamBufs};
 use crate::maple::MaplePacket;
+#[cfg(feature = "spim-capture")]
+use core::mem::MaybeUninit;
+#[cfg(feature = "spim-capture")]
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{compiler_fence, Ordering};
 use embassy_nrf::gpio::{Flex, Pull};
 use heapless::Vec;
+#[cfg(feature = "spim-capture")]
+use maple_protocol::packed;
 use maple_protocol::wire;
 
 /// Number of u32 samples in the bulk capture buffer.
@@ -41,6 +49,83 @@ const TX_DEADLINE_GRACE_CYCLES: u32 = 8;
 /// CPU clock in MHz — DWT cycles / this = microseconds (nRF52840, 64 MHz).
 const CPU_MHZ: u32 = 64;
 
+/// Bytes per SPIM stream for one controller capture: eight samples a byte, so
+/// this covers the same `SAMPLE_BUFFER_LEN` window the CPU loop filled.
+#[cfg(feature = "spim-capture")]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "SAMPLE_BUFFER_LEN is a 24,576 literal; the buffer cannot reach 2^35 bytes on this part"
+)]
+const SPIM_MAXCNT_BYTES: u32 = (SAMPLE_BUFFER_LEN / 8) as u32;
+
+/// Cycles to wait for both streams' `END` after the trigger fired: the
+/// transfer itself — one sample per 8 MHz clock, so `SAMPLE_BUFFER_LEN / 8`
+/// microseconds, 3.072 ms — plus a millisecond. Nothing after the trigger is
+/// the responder's to be late about, so this is a hang guard, not a budget:
+/// blowing it means the DMA stopped, which is the `INCOMPLETE` counter.
+#[cfg(feature = "spim-capture")]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "as for SPIM_MAXCNT_BYTES: a compile-time constant far inside u32"
+)]
+const SPIM_END_BUDGET_CYCLES: u32 = ((SAMPLE_BUFFER_LEN / 8) as u32 + 1_000) * CPU_MHZ;
+
+/// Bytes per poll stream, as a length: `SPIM_MAXCNT_BYTES`.
+#[cfg(feature = "spim-capture")]
+const POLL_STREAM_BYTES: usize = SAMPLE_BUFFER_LEN / 8;
+
+/// The controller poll's own two bit streams.
+///
+/// The capture owns no buffers: one `SpimCapture` serves the poll and the
+/// diag read path, and a capture one of them has latched must survive the
+/// other's next `arm` (`spim_capture::SpimCapture`, bench run #175). So the
+/// poll brings its own pair, armed and read only here. `.uninit`, which
+/// cortex-m-rt places after `.bss` and does not zero at boot, so no existing
+/// RAM symbol moves and EasyDMA rather than the reset handler fills them.
+#[cfg(feature = "spim-capture")]
+#[link_section = ".uninit.poll_streams"]
+static mut POLL_STREAM_A: MaybeUninit<[u8; POLL_STREAM_BYTES]> = MaybeUninit::uninit();
+#[cfg(feature = "spim-capture")]
+#[link_section = ".uninit.poll_streams"]
+static mut POLL_STREAM_B: MaybeUninit<[u8; POLL_STREAM_BYTES]> = MaybeUninit::uninit();
+
+/// The poll's stream buffers, for [`MapleBus::capture_on_spim`]'s `arm`.
+#[cfg(feature = "spim-capture")]
+fn poll_stream_bufs() -> StreamBufs {
+    // The statics are named by address only; a raw borrow of a `static mut`
+    // is safe and creates no reference to either.
+    let a = core::ptr::addr_of_mut!(POLL_STREAM_A).cast::<u8>();
+    let b = core::ptr::addr_of_mut!(POLL_STREAM_B).cast::<u8>();
+    // SAFETY: `POLL_STREAM_A` and `POLL_STREAM_B` are two distinct statics of
+    // exactly `POLL_STREAM_BYTES` bytes each, in RAM as EasyDMA requires, and
+    // they live for the program. `capture_on_spim` is their only user: it is
+    // the only caller of this function, it runs on the main task of a
+    // single-core part, and within one call it arms, waits, finishes and
+    // unpacks before returning — so nothing reads or writes either region
+    // between the `arm` and its `finish`/`abort`, and no capture of anyone
+    // else's is still holding them.
+    unsafe { StreamBufs::new(a, b, SPIM_MAXCNT_BYTES) }
+}
+
+/// Controller polls whose reply never triggered the capture.
+///
+/// `EVENTS_STARTED` was still clear `timeout_us` after the bus went neutral,
+/// so the capture was aborted and the poll failed. The bench gate for the
+/// hardware capture is that this stays ≈ 0 over ≥ 10,000 polls across
+/// several controllers — the
+/// trigger has to beat every pad's turnaround, not just the VMU's ≤ 260 µs.
+/// Read out by a diagnostic build; nothing in production consumes it.
+#[cfg(feature = "spim-capture")]
+pub static NO_TRIGGER: AtomicU32 = AtomicU32::new(0);
+
+/// Controller polls that triggered but did not deliver both whole streams.
+///
+/// An `END` missing at the deadline, or `RXD.AMOUNT` short of what was armed.
+/// Counterpart to [`NO_TRIGGER`]; a diagnostic saw 0 of these in 2,333 read
+/// captures, so anything but ≈ 0 here is a finding, not noise.
+#[cfg(feature = "spim-capture")]
+pub static INCOMPLETE: AtomicU32 = AtomicU32::new(0);
+
 /// NOP iterations for pin stabilization after output mode set.
 pub const PIN_STABILIZE_NOPS: u32 = 100;
 
@@ -48,6 +133,16 @@ pub const PIN_STABILIZE_NOPS: u32 = 100;
 /// word + one block/phase word + 48 words of pixel data. Lands in the low
 /// byte of the frame word.
 pub const LCD_PAYLOAD_WORDS: u32 = 50;
+
+/// Payload word count of one storage `BLOCK_WRITE` phase: the function word,
+/// the location word and 32 words — 128 bytes — of block data. Lands in the
+/// low byte of the frame word.
+pub const BLOCK_PHASE_WORDS: u32 = 34;
+const _: () =
+    assert!(BLOCK_PHASE_WORDS as usize == 2 + maple_protocol::block_bytes::PHASE_BYTES / 4);
+
+/// Maple command: `BLOCK_WRITE`, the LCD's and the storage function's.
+const BLOCK_WRITE: u8 = 0x0C;
 
 /// NOP iterations for pull-up stabilization after input mode set.
 const PULLUP_STABILIZE_NOPS: u32 = 200;
@@ -85,9 +180,10 @@ const MIN_FRAME_BYTES: usize = 4;
 /// includes headroom for the idle/wait period before the response starts.
 ///
 /// # Safety
-/// Accessed only from `wait_and_sample()` and `receive_frame()`, which run
-/// sequentially on a single-core Cortex-M4 with interrupts disabled during
-/// the sampling window. No concurrent or overlapping references are possible.
+/// Accessed only from the capture stage (`wait_and_sample()`, or
+/// `capture_on_spim()`'s unpack where the hardware capture is the sampler)
+/// and `receive_frame()`, which run sequentially on a single-core Cortex-M4.
+/// No concurrent or overlapping references are possible.
 /// Shared bulk sample / TX waveform buffer.
 ///
 /// Used by RX for bulk GPIO sampling and by TX (timeslot) for pre-computed
@@ -217,6 +313,15 @@ fn delay_half_bit() {
 pub struct MapleBus {
     sdcka: Flex<'static>,
     sdckb: Flex<'static>,
+    /// The hardware capture that samples every reply on these builds, once
+    /// `main` has handed over the board's parts ([`attach_capture`]). `None`
+    /// until then, and `None` for good on a board whose `spim_capture` parts
+    /// are `None` — see [`read_packet_bulk`].
+    ///
+    /// [`attach_capture`]: MapleBus::attach_capture
+    /// [`read_packet_bulk`]: MapleBus::read_packet_bulk
+    #[cfg(feature = "spim-capture")]
+    capture: Option<SpimCapture>,
 }
 
 impl MapleBus {
@@ -248,7 +353,41 @@ impl MapleBus {
             core.DWT.enable_cycle_counter();
         }
 
-        Self { sdcka, sdckb }
+        Self {
+            sdcka,
+            sdckb,
+            #[cfg(feature = "spim-capture")]
+            capture: None,
+        }
+    }
+
+    /// Hand the bus the board's hardware capture; it samples every reply from
+    /// here on.
+    ///
+    /// Called once, from `main`, before the first poll. The capture and the
+    /// bit-bang TX share the two Maple pins but never the wire: the SPIM only
+    /// listens, and it is enabled only between [`set_input_mode`] and the end
+    /// of the reply.
+    ///
+    /// [`set_input_mode`]: MapleBus::set_input_mode
+    #[cfg(feature = "spim-capture")]
+    pub fn attach_capture(&mut self, cap: SpimCapture) {
+        self.capture = Some(cap);
+    }
+
+    /// The bus's capture, for a consumer that drives it itself.
+    ///
+    /// There is one `SpimCapture` in the program because there is one set of
+    /// board parts, and the bus owns it. `maple::block_read` arms and waits on
+    /// the same instance for its `BLOCK_READ` window: the poll and a read never
+    /// overlap — one poll task, and a read window *replaces* the controller
+    /// poll in its window rather than running beside it — so a single instance
+    /// serving both is sound. `arm` sets the transfer length each time, and
+    /// each consumer brings its own stream buffers, so a poll between a read's
+    /// `finish` and its unpack disturbs neither.
+    #[cfg(feature = "spim-capture")]
+    pub const fn capture_mut(&mut self) -> Option<&mut SpimCapture> {
+        self.capture.as_mut()
     }
 
     /// Set pins to lowest-power disconnected state.
@@ -488,7 +627,7 @@ impl MapleBus {
 
         let mut crc: u8 = 0;
 
-        let frame: u32 = (0x0C_u32 << 24)
+        let frame: u32 = (u32::from(BLOCK_WRITE) << 24)
             | (u32::from(dest) << 16)
             | (u32::from(sender) << 8)
             | LCD_PAYLOAD_WORDS;
@@ -505,6 +644,58 @@ impl MapleBus {
 
         for chunk in framebuffer.chunks_exact(4) {
             let word = u32::from_le_bytes([chunk[3], chunk[2], chunk[1], chunk[0]]);
+            self.write_word(word, &mut phase);
+            Self::update_crc(word, &mut crc);
+        }
+
+        self.write_byte(crc, &mut phase);
+        self.send_end_pattern();
+    }
+
+    /// Write one 128-byte phase of a storage `BLOCK_WRITE` to the VMU: the
+    /// LCD frame's shape on function `0x02`, with `location` carrying the
+    /// phase and the block (`phase << 16 | block`). Bit-banged like
+    /// [`Self::write_lcd`], on the cycle-anchored half-bit (ADR-010), in the
+    /// quiet window the caller has aligned to — 141 bytes ≈ 5.5 ms on the
+    /// wire, so the ACK capture that follows still fits the window.
+    ///
+    /// `data` is in **image order**, as the link carries it; each word goes
+    /// out as `u32::from_be_bytes` of its four bytes, which is the LCD path's
+    /// "pixel byte-swap" and `block_bytes::image_to_wire` in one step — the
+    /// wire sends a word least-significant byte first, and the card's
+    /// filesystem is laid out in the reverse of that.
+    pub fn write_block_phase(
+        &mut self,
+        sender: u8,
+        dest: u8,
+        location: u32,
+        data: &[u8; maple_protocol::block_bytes::PHASE_BYTES],
+    ) {
+        self.set_output_mode();
+        self.set_idle();
+        tx_timing_reset();
+        delay_half_bit();
+        let mut phase = true;
+        self.send_start_pattern();
+
+        let mut crc: u8 = 0;
+
+        let frame: u32 = (u32::from(BLOCK_WRITE) << 24)
+            | (u32::from(dest) << 16)
+            | (u32::from(sender) << 8)
+            | BLOCK_PHASE_WORDS;
+        self.write_word(frame, &mut phase);
+        Self::update_crc(frame, &mut crc);
+
+        let func: u32 = super::host::functions::STORAGE;
+        self.write_word(func, &mut phase);
+        Self::update_crc(func, &mut crc);
+
+        self.write_word(location, &mut phase);
+        Self::update_crc(location, &mut crc);
+
+        for chunk in data.chunks_exact(4) {
+            let word = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             self.write_word(word, &mut phase);
             Self::update_crc(word, &mut crc);
         }
@@ -556,6 +747,19 @@ impl MapleBus {
     /// (DWT is valid here: this is blocking code, the core never sleeps.)
     ///
     /// Returns `(success, waited_us, sample_count)`.
+    ///
+    /// # The CPU sampler is not built where the hardware capture is
+    ///
+    /// With `spim-capture` this function, and the pinned loop with it, is not
+    /// compiled at all: the carrier and the XIAO capture every reply on the
+    /// SPIM pair by EasyDMA ([`capture_on_spim`]), so the sample rate stops
+    /// being a property of where the linker put a loop.
+    /// The DK keeps this path. There is deliberately no fallback in either
+    /// direction — a build has one sampler, and `check_timing_invariants.sh`
+    /// checks for the right one.
+    ///
+    /// [`capture_on_spim`]: MapleBus::capture_on_spim
+    #[cfg(not(feature = "spim-capture"))]
     pub fn wait_and_sample(&mut self, timeout_us: u32) -> (bool, u32, usize) {
         self.set_input_mode();
 
@@ -643,6 +847,124 @@ impl MapleBus {
                 return (false, cyccnt().wrapping_sub(t0) / CPU_MHZ, 0);
             }
         }
+    }
+
+    /// Capture a reply on the SPIM pair and unpack it into `SAMPLE_BUFFER`.
+    ///
+    /// The hardware half of [`wait_and_sample`](Self::wait_and_sample), and
+    /// its replacement on the boards that have the capture: two SPIM
+    /// instances sample SDCKA and SDCKB into RAM at 8 MHz by EasyDMA, both
+    /// started in the same cycle by the reply's own first SDCKA fall through
+    /// GPIOTE → PPI, with no CPU in the loop (`maple::spim_capture`). The
+    /// unpack then writes exactly the word-per-sample buffer the CPU loop
+    /// wrote, so `find_data_start`, `decode_bulk_samples` and the frame parse
+    /// below are the same code reading the same shape.
+    ///
+    /// The order is the one measured over 2,333 read captures:
+    /// input mode, **then** arm — the trigger is one-shot and armed only
+    /// after the command's TX, or the command's own SDCKA falls would fire
+    /// it — then the idle wait, then the two spins. Every wait is a plain
+    /// spin on an event register against a DWT deadline: no PRIMASK, no
+    /// critical section, nothing that could hold off the SoftDevice, and
+    /// nothing whose duration depends on codegen.
+    ///
+    /// The CPU's 3.07 ms of spinning becomes the DMA's, and the unpack — the
+    /// price of feeding a word-per-sample decoder from packed bits — lands
+    /// inside the caller's `poll-timing` *read* span, not its decode span, so
+    /// a bench run compares against the CPU capture's read span directly.
+    ///
+    /// Returns `(success, sample_count)`.
+    #[cfg(feature = "spim-capture")]
+    fn capture_on_spim(&mut self, timeout_us: u32) -> (bool, usize) {
+        self.set_input_mode();
+
+        let Some(capture) = self.capture.as_mut() else {
+            // No capture on this board, and no CPU sampler in this build to
+            // fall back to: the pinned loop is compiled out wherever
+            // `spim-capture` is on. The board contract makes this
+            // unreachable — the two boards that enable the feature both hand
+            // over their `Parts` — so failing the poll is the honest answer
+            // rather than a second sampler kept alive for a case that cannot
+            // happen.
+            return (false, 0);
+        };
+        capture.arm(poll_stream_bufs());
+
+        // Wait for the bus to go neutral (both HIGH), on the CPU path's own
+        // budget and deadline: half the timeout, DWT cycles, never an
+        // iteration count (2026-08-05, see `wait_and_sample`).
+        let t0 = cyccnt();
+        let idle_budget = (timeout_us / 2).saturating_mul(CPU_MHZ);
+        loop {
+            let val = read_p0_in();
+            if (val & PIN_A_MASK) != 0 && (val & PIN_B_MASK) != 0 {
+                break;
+            }
+            if cyccnt().wrapping_sub(t0) > idle_budget {
+                capture.abort();
+                return (false, 0);
+            }
+        }
+
+        // The reply's first SDCKA fall starts both transfers in hardware; all
+        // the CPU does is watch one `EVENTS_STARTED`. A silent bus times out
+        // here, as it did in the CPU path, and costs no transfer.
+        let start_budget = timeout_us.saturating_mul(CPU_MHZ);
+        let t1 = cyccnt();
+        while !capture.started() {
+            if cyccnt().wrapping_sub(t1) > start_budget {
+                capture.abort();
+                NO_TRIGGER.fetch_add(1, Ordering::Relaxed);
+                return (false, 0);
+            }
+        }
+
+        // Both `END`s, within the transfer's own length plus a millisecond.
+        let t2 = cyccnt();
+        while !capture.ended() {
+            if cyccnt().wrapping_sub(t2) > SPIM_END_BUDGET_CYCLES {
+                capture.abort();
+                INCOMPLETE.fetch_add(1, Ordering::Relaxed);
+                return (false, 0);
+            }
+        }
+
+        // Both ends are already in, so `finish` only checks `RXD.AMOUNT`,
+        // disarms and fences — a zero budget, per its contract. It hands
+        // back the capture itself; a short stream leaves `captured` `None`
+        // and nothing about it in the instance.
+        let Some(cap) = capture.finish(0).captured else {
+            INCOMPLETE.fetch_add(1, Ordering::Relaxed);
+            return (false, 0);
+        };
+        let (stream_a, stream_b) = cap.streams();
+
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "the reborrow and the never-None unwrap are one derivation of the \
+                      buffer reference, sound for the same reason"
+        )]
+        // SAFETY: single-core, and this is the only reference to
+        // `SAMPLE_BUFFER` that exists while the unpack runs — the decode
+        // below takes its shared reference only after this one is dropped,
+        // TX's view of the same buffer never overlaps RX, and the two stream
+        // slices are the capture's statics, not this one. `addr_of_mut!` on a
+        // static always yields a non-null, well-aligned, initialised pointer,
+        // so `as_mut()` cannot return `None` and `unwrap_unchecked` is
+        // discharged.
+        let samples = unsafe {
+            core::ptr::addr_of_mut!(SAMPLE_BUFFER)
+                .as_mut()
+                .unwrap_unchecked()
+        };
+        let count = packed::unpack_words_into(
+            stream_a,
+            stream_b,
+            samples,
+            crate::board::PIN_A_BIT,
+            crate::board::PIN_B_BIT,
+        );
+        (true, count)
     }
 
     /// Decode bits from bulk samples.
@@ -741,10 +1063,19 @@ impl MapleBus {
     )]
     pub fn read_packet_bulk(&mut self, timeout_us: u32) -> Option<MaplePacket> {
         // poll-timing spans are taken here, around whole calls — never inside
-        // wait_and_sample, whose wait/capture loops are timing-critical.
+        // the capture stage, whose wait/capture loops are timing-critical.
         #[cfg(feature = "poll-timing")]
         let _pt_read = crate::poll_timing::start();
+        // The capture stage is the board's: the CPU sampling loop where there
+        // is no hardware capture (the DK), the SPIM pair by EasyDMA where
+        // there is. Everything below — the start-pattern
+        // search, the decode and the frame parse — reads the same
+        // `SAMPLE_BUFFER` words either way, which is why all six `host.rs`
+        // callers move through this one entry.
+        #[cfg(not(feature = "spim-capture"))]
         let (success, _waited_us, count) = self.wait_and_sample(timeout_us);
+        #[cfg(feature = "spim-capture")]
+        let (success, count) = self.capture_on_spim(timeout_us);
         #[cfg(feature = "poll-timing")]
         crate::poll_timing::record_read(_pt_read);
 
@@ -760,8 +1091,8 @@ impl MapleBus {
             reason = "the reborrow and the never-None unwrap are one derivation of the \
                       buffer reference, sound for the same reason"
         )]
-        // SAFETY: single-core, and the mutable reference handed out by
-        // `wait_and_sample` has already been dropped, so this shared reference
+        // SAFETY: single-core, and the mutable reference the capture stage
+        // held has already been dropped, so this shared reference
         // to `SAMPLE_BUFFER` cannot alias a live `&mut`. `addr_of!` on a static
         // always yields a non-null, well-aligned, initialised pointer, so
         // `as_ref()` cannot return `None` and `unwrap_unchecked` is discharged.

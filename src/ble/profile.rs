@@ -66,6 +66,10 @@ pub struct Profile {
     pub gap_name: &'static [u8],
     /// Pre-built scan response payload (length-prefixed AD structure).
     pub scan_response: &'static [u8],
+    /// When set, advertise from a **public** address with this three-byte
+    /// prefix (most significant byte first) over the chip's own low three
+    /// bytes, instead of the SoftDevice's random-static default.
+    pub public_prefix: Option<[u8; 3]>,
     /// Manufacturer string for Device Information Service (0x2A29).
     pub manufacturer: &'static [u8],
     /// Model string for Device Information Service (0x2A24).
@@ -129,6 +133,12 @@ pub static PROFILE_XBOX: Profile = Profile {
     id: ProfileId::Xbox,
     gap_name: NAME_XBOX,
     scan_response: &SCAN_RESPONSE_XBOX,
+    // A public address, not the random-static default: the 8BitDo USB
+    // Wireless Adapter 2 ignores random-address advertisers, however exact the
+    // advert. The prefix is locally administered (`02:44:43`, bit
+    // 1 of the first octet set), not a registered OUI, so it borrows no one's
+    // range; any public prefix passed on the bench.
+    public_prefix: Some([0x02, 0x44, 0x43]),
     manufacturer: b"Microsoft",
     model: b"Xbox Wireless Controller",
     vid: 0x045E,
@@ -157,6 +167,7 @@ pub static PROFILE_GENERIC: Profile = Profile {
     id: ProfileId::Generic,
     gap_name: NAME_DREAMCAST,
     scan_response: &SCAN_RESPONSE_DREAMCAST,
+    public_prefix: None,
     manufacturer: b"Pulsar",
     model: b"Dreamcast Wireless Controller",
     // pid.codes open-source VID + project PID — deliberately NOT a Microsoft/Xbox

@@ -27,8 +27,10 @@ pub use maple_protocol::xbox_hid::{
 };
 
 use heapless::Vec;
+use maple_protocol::notify_budget::Outcome;
 use nrf_softdevice::ble::gatt_server::{NotifyValueError, SetValueError};
-use nrf_softdevice::ble::Connection;
+use nrf_softdevice::ble::{Connection, SecurityMode};
+use nrf_softdevice::RawError;
 
 /// HID Information characteristic value.
 /// bcdHID: 1.11, bCountryCode: 0, Flags: `RemoteWake` | `NormallyConnectable`
@@ -41,12 +43,23 @@ pub const PROTOCOL_MODE_REPORT: u8 = 1;
 
 /// HID Service (UUID 0x1812)
 /// Security: `JustWorks` (encrypted, unauthenticated) - required by HOGP spec
+///
+/// **Characteristic order is load-bearing**: with the services in
+/// `GamepadServer`'s order it puts Report Map at handle `0x001C`, the input
+/// report at `0x001E` with its CCCD at `0x001F`, and rumble at `0x0022` —
+/// a real Xbox One S's handles. The 8BitDo USB Wireless Adapter 2 skips
+/// service discovery and uses those handles directly. Add characteristics
+/// only after `rumble`.
 #[nrf_softdevice::gatt_service(uuid = "1812")]
 pub struct HidService {
     /// HID Information (UUID 0x2A4A) - Read only
     /// Value: [bcdHID_lo, bcdHID_hi, bCountryCode, flags]
     #[characteristic(uuid = "2A4A", read, security = "JustWorks")]
     pub hid_info: [u8; 4],
+
+    /// HID Control Point (UUID 0x2A4C) - Write without response
+    #[characteristic(uuid = "2A4C", write_without_response, security = "JustWorks")]
+    pub control_point: u8,
 
     /// Report Map (UUID 0x2A4B) - Read only, contains HID descriptor
     #[characteristic(uuid = "2A4B", read, security = "JustWorks")]
@@ -78,10 +91,6 @@ pub struct HidService {
     )]
     pub rumble: [u8; 8],
 
-    /// HID Control Point (UUID 0x2A4C) - Write without response
-    #[characteristic(uuid = "2A4C", write_without_response, security = "JustWorks")]
-    pub control_point: u8,
-
     /// Protocol Mode (UUID 0x2A4E) - Read, Write Without Response
     #[characteristic(uuid = "2A4E", read, write_without_response, security = "JustWorks")]
     pub protocol_mode: u8,
@@ -94,13 +103,18 @@ pub struct DeviceInfoService {
     #[characteristic(uuid = "2A29", read)]
     pub manufacturer: Vec<u8, 32>,
 
-    /// Model Number (UUID 0x2A24)
-    #[characteristic(uuid = "2A24", read)]
-    pub model_number: Vec<u8, 32>,
-
     /// PnP ID (UUID 0x2A50) - Vendor ID, Product ID, Version
     #[characteristic(uuid = "2A50", read)]
     pub pnp_id: [u8; 7],
+
+    /// Firmware Revision (UUID 0x2A26). A real pad has one here; it also makes
+    /// this service four characteristics long, as the handle layout needs.
+    #[characteristic(uuid = "2A26", read)]
+    pub firmware_revision: Vec<u8, 16>,
+
+    /// Model Number (UUID 0x2A24). Where a real pad has its serial number.
+    #[characteristic(uuid = "2A24", read)]
+    pub model_number: Vec<u8, 32>,
 }
 
 /// Battery Service (UUID 0x180F)
@@ -111,12 +125,94 @@ pub struct BatteryService {
     pub battery_level: u8,
 }
 
+/// Pulsar host-integration service  — the console-side dongle's
+/// channel to the docked VMU's screen.
+///
+/// A 128-bit primary service, so it is invisible to a host that does not look
+/// for it by UUID and cannot collide with an assigned number. The UUIDs are
+/// a published contract (`docs/host_integration.md`) — every sender uses
+/// exactly these values, so they are never to be regenerated.
+///
+/// Present in **both** BLE personalities, Xbox and Generic, because there is
+/// one GATT table and the profile only swaps names, IDs and the report
+/// descriptor. So a sender can key on this service under either identity —
+/// the service, not the identity, is what identifies a Pulsar.
+#[nrf_softdevice::gatt_service(uuid = "7EDF0001-3536-4A03-82D0-8AB9122016C6")]
+pub struct HostService {
+    /// LCD frame (UUID `…0002`) — Write Without Response.
+    ///
+    /// `Vec<u8, LCD_BYTES>`, not `[u8; LCD_BYTES]`, and the difference is
+    /// load-bearing rather than stylistic. `GattValue for [u8; N]` reports
+    /// `MIN_SIZE = 0` and **zero-pads** anything shorter to N, so a 49-byte
+    /// chunk write would arrive as a 192-byte array indistinguishable from a
+    /// whole frame followed by 143 blank bytes — the two wire shapes are told
+    /// apart by length, and the array type destroys exactly that. The `Vec`
+    /// impl preserves it. Writes longer than 192 never reach us: the attribute
+    /// is registered with a 192-byte maximum and the SoftDevice rejects the
+    /// rest at the ATT layer.
+    ///
+    /// `JustWorks` like the HID characteristics: a sender is already bonded and
+    /// encrypted to push HID, so this costs it nothing and keeps the screen off
+    /// the air for unpaired strangers.
+    #[characteristic(
+        uuid = "7EDF0002-3536-4A03-82D0-8AB9122016C6",
+        write_without_response,
+        security = "JustWorks"
+    )]
+    pub lcd_frame: Vec<u8, { crate::vmu::LCD_BYTES }>,
+
+    /// VMU storage, up (UUID `…0003`) — Notify. `81 DATA`, `83 STATUS`.
+    ///
+    /// **Attribute-table cost, and the failure mode to check for first.** These
+    /// two characteristics add roughly 320 bytes to `gatts_attr_tab_size`
+    /// (2048): a 132-byte value each, their declarations, and a CCCD. An earlier revision
+    /// estimated ~1000 in use before its 192-byte frame characteristic, so this
+    /// should leave ~470 spare — an estimate, not a measurement, and the
+    /// failure mode if it is wrong is `GamepadServer::new` erroring into main's
+    /// silent `wfi` loop: a device that boots dark and never advertises. The
+    /// first bench boot is that check.
+    ///
+    /// The 132 is the protocol's, not this revision's: a READ is two bytes and
+    /// the write path that needs the rest is a later step. Registering it small
+    /// now and growing it later would move the table under a cached bond, which
+    /// is the more expensive mistake.
+    ///
+    /// 132 bytes: a four-byte header and one 128-byte write phase, which is
+    /// protocol v1's unit in both directions. **Not** the MTU and not 512 — a
+    /// GATTS event is bounded by the *registered maximum*, and sizing this to
+    /// the MTU is the shape that panicked an earlier revision.
+    #[characteristic(
+        uuid = "7EDF0003-3536-4A03-82D0-8AB9122016C6",
+        notify,
+        security = "JustWorks"
+    )]
+    pub vmu_up: Vec<u8, { maple_protocol::host_vmu_io::MSG_MAX }>,
+
+    /// VMU storage, down (UUID `…0004`) — Write Without Response. `01 READ`,
+    /// `02 WRITE`, `03 STATUS?`.
+    ///
+    /// `Vec`, not an array, for `lcd_frame`'s reason: `GattValue for [u8; N]`
+    /// zero-pads a short write to N, and every op here is told apart by its
+    /// length as well as its first byte.
+    #[characteristic(
+        uuid = "7EDF0004-3536-4A03-82D0-8AB9122016C6",
+        write_without_response,
+        security = "JustWorks"
+    )]
+    pub vmu_down: Vec<u8, { maple_protocol::host_vmu_io::MSG_MAX }>,
+}
+
 /// Combined GATT server with all services.
 #[nrf_softdevice::gatt_server]
 pub struct GamepadServer {
-    pub hid: HidService,
+    // Service order is load-bearing: it copies a real Xbox One S's handle
+    // layout, which the 8BitDo USB Wireless Adapter 2 relies on (see
+    // `HidService`). Our host service goes last, where the pad's vendor
+    // service sits.
     pub device_info: DeviceInfoService,
     pub battery: BatteryService,
+    pub hid: HidService,
+    pub host: HostService,
 }
 
 impl GamepadServer {
@@ -143,6 +239,12 @@ impl GamepadServer {
         let mut model: Vec<u8, 32> = Vec::new();
         let _ = model.extend_from_slice(profile.model).ok();
         self.device_info.model_number_set(&model)?;
+
+        let mut firmware: Vec<u8, 16> = Vec::new();
+        let _ = firmware
+            .extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes())
+            .ok();
+        self.device_info.firmware_revision_set(&firmware)?;
 
         let vid = profile.vid.to_le_bytes();
         let pid = profile.pid.to_le_bytes();
@@ -231,11 +333,15 @@ impl GamepadServer {
 
         // Debug-only: same four right-stick bytes, carrying poll-loop period
         // telemetry (rotating tagged payloads — see `crate::poll_period`).
-        // Injected before dedup like the channels above; the tag byte rotates
-        // per send, so this build never dedups identical sticks. Fine for its
-        // purpose (rotation captures), but it means seq-counter dedup dynamics
-        // in THIS build are not representative — acceptance captures use
-        // builds without this feature.
+        // Injected before dedup like the channels above. The payload advances
+        // once per fresh controller sample and is replayed byte-for-byte in
+        // between, so the dedup below still collapses repeats of one sample —
+        // it used to rotate per send, which defeated dedup outright and made
+        // the host's arrival cadence a property of the connection interval
+        // rather than the poll loop (v297 run #200). Dedup dynamics here are
+        // close to, but still not, a bare build's: a *changed* stick and a
+        // fresh sample are not the same event. Acceptance captures use builds
+        // without this feature.
         #[cfg(feature = "poll-period-debug")]
         let bytes = {
             let mut b = bytes;
@@ -289,6 +395,40 @@ impl GamepadServer {
             LAST_REPORT.lock(|cell| cell.set(Some(bytes)));
         }
         result
+    }
+
+    /// Reduce a [`send_report`](Self::send_report) result to the
+    /// [`Outcome`] the notify budget judges.
+    ///
+    /// The meaning of each class — which are "not yet" and which are "never" —
+    /// lives with the rule in `maple_protocol::notify_budget`, where it is
+    /// tested; this is only the mapping from the SoftDevice's codes.
+    #[must_use]
+    pub const fn notify_outcome(result: Result<(), NotifyValueError>) -> Outcome {
+        match result {
+            Ok(()) => Outcome::Sent,
+            Err(NotifyValueError::Raw(RawError::Resources)) => Outcome::QueueFull,
+            Err(NotifyValueError::Raw(RawError::InvalidState)) => Outcome::NotSubscribed,
+            Err(NotifyValueError::Raw(RawError::BleGattsSysAttrMissing)) => Outcome::AttrsMissing,
+            Err(_) => Outcome::Refused,
+        }
+    }
+
+    /// Whether the link is encrypted — the gate on sending a report at all.
+    ///
+    /// `security_mode` is `Open` at connect and raised from
+    /// `BLE_GAP_EVT_CONN_SEC_UPDATE` in the same event drain as everything
+    /// else, so it is current when the notify loop reads it. Encryption is
+    /// security mode 1 at level 2 or above; the `Signed` variants are mode 2,
+    /// data signing without encryption, so they are listed out rather than
+    /// "anything but `Open`". The pinned library maps a mode it does not
+    /// recognise to `Open`, so doubt reads as unencrypted — the safe direction.
+    #[must_use]
+    pub fn link_encrypted(conn: &Connection) -> bool {
+        matches!(
+            conn.security_mode(),
+            SecurityMode::JustWorks | SecurityMode::Mitm | SecurityMode::LescMitm
+        )
     }
 
     /// Serialize a report using the active BLE profile.

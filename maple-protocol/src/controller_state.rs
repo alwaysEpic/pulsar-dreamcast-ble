@@ -53,7 +53,10 @@ impl Default for ControllerState {
     reason = "one field per physical Dreamcast button, mirroring the wire word 1:1; \
               a bitflags type would hide that mapping"
 )]
-#[derive(Debug, Clone, Copy, Default)]
+// `PartialEq` so the idle watch can ask "did any button change?" in
+// one comparison rather than fourteen. Analogue axes are deliberately *not*
+// given one: they are compared against a threshold, never for equality.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ButtonState {
     pub c: bool,
     pub b: bool,

@@ -39,6 +39,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "battery-policy"
+version = "0.1.0"
+
+[[package]]
 name = "bitfield"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -805,6 +809,7 @@ dependencies = [
 name = "pulsar-dreamcast-ble"
 version = "0.5.0"
 dependencies = [
+ "battery-policy",
  "cortex-m",
  "cortex-m-rt",
  "embassy-executor",

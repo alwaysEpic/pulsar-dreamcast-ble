@@ -36,7 +36,7 @@
 //! ~1.97 samples per peripheral phase, where edges can alias away — so the
 //! accepted count is a window, not an equality. See [`MIN_TOGGLES`].
 //!
-//! [`docs/maple_bus_protocol.md`]: ../../../docs/maple_bus_protocol.md
+//! [`docs/maple_bus_protocol.md`]: ../../docs/maple_bus_protocol.md
 
 /// SDCKB LOW->HIGH toggles a **data frame** start pattern is specified to carry.
 /// TX sends exactly this many; RX accepts [`MIN_TOGGLES`]..=[`MAX_TOGGLES`].
@@ -100,11 +100,36 @@ enum Scan {
 /// Losing a *rise* costs nothing either — see [`MIN_TOGGLES`]. The returned
 /// index is the pattern's closing SDCKA rise, which is in the same place
 /// regardless of how many toggles were resolved before it.
+///
+/// The word-wide instance, by name. `find_data_start_in` is generic over the
+/// sample width, and a generic is instantiated by whichever crate calls it:
+/// called from the firmware's `read_packet_bulk`, `scan_pattern::<u32>` was
+/// compiled into the firmware crate and landed among its functions instead of
+/// in this crate's block, a text shift ahead of the Maple code (found on
+/// `main` after the merges, v278). This
+/// non-generic function keeps the instance here, where the non-generic
+/// original had it; `block_decode::find_data_start_u8` does the same for the
+/// byte-wide one.
 #[must_use]
 pub fn find_data_start(samples: &[u32], a_mask: u32, b_mask: u32) -> Option<usize> {
+    find_data_start_in(samples, a_mask, b_mask)
+}
+
+/// [`find_data_start`], generic over the sample width.
+///
+/// The stock capture stores whole `P0.IN` words, a byte-wide capture stores
+/// the low byte, and the masks pick the same two bits out of either. Call it
+/// through a non-generic function in this crate — see [`find_data_start`]
+/// for why.
+#[must_use]
+pub fn find_data_start_in<S: Copy + Into<u32>>(
+    samples: &[S],
+    a_mask: u32,
+    b_mask: u32,
+) -> Option<usize> {
     let mut i = 1;
 
-    if !samples.is_empty() && (samples[0] & a_mask) == 0 {
+    if !samples.is_empty() && (samples[0].into() & a_mask) == 0 {
         match scan_pattern(samples, 0, a_mask, b_mask) {
             Scan::Match(end) => return Some(end),
             Scan::Reject(resume) => i = resume,
@@ -114,7 +139,7 @@ pub fn find_data_start(samples: &[u32], a_mask: u32, b_mask: u32) -> Option<usiz
 
     while i < samples.len() {
         // SDCKA falling edge — a candidate start pattern begins here.
-        if (samples[i - 1] & a_mask) != 0 && (samples[i] & a_mask) == 0 {
+        if (samples[i - 1].into() & a_mask) != 0 && (samples[i].into() & a_mask) == 0 {
             match scan_pattern(samples, i, a_mask, b_mask) {
                 Scan::Match(end) => return Some(end),
                 // Resume at the rejected pattern's own A-rise. Always > i, so
@@ -132,11 +157,12 @@ pub fn find_data_start(samples: &[u32], a_mask: u32, b_mask: u32) -> Option<usiz
 }
 
 /// Scan one candidate pattern starting at `fall`, the sample where SDCKA went low.
-fn scan_pattern(samples: &[u32], fall: usize, a_mask: u32, b_mask: u32) -> Scan {
+fn scan_pattern<S: Copy + Into<u32>>(samples: &[S], fall: usize, a_mask: u32, b_mask: u32) -> Scan {
     let mut toggles: u32 = 0;
-    let mut last_b = (samples[fall] & b_mask) != 0;
+    let mut last_b = (samples[fall].into() & b_mask) != 0;
 
     for (offset, &sample) in samples[fall + 1..].iter().enumerate() {
+        let sample: u32 = sample.into();
         let a = (sample & a_mask) != 0;
         let b = (sample & b_mask) != 0;
 
@@ -459,6 +485,26 @@ mod tests {
             wave.set_b(true);
         }
         assert_eq!(find_data_start(&wave.build(), A, B), None);
+    }
+
+    #[test]
+    fn byte_wide_samples_find_the_same_start_as_word_samples() {
+        // A byte-wide capture keeps only P0.IN's low byte; both Maple pins sit
+        // in it on every board, so the finder must agree index for index.
+        for rate in [FAST, SLOW] {
+            let words = Wave::new(rate)
+                .idle(8)
+                .start_pattern(4)
+                .data(&[1, 0, 1])
+                .build();
+            let bytes: Vec<u8> = words.iter().map(|&w| (w & 0xFF) as u8).collect();
+            assert_eq!(
+                find_data_start_in(&bytes, A, B),
+                find_data_start(&words, A, B),
+                "rate {rate}"
+            );
+            assert!(find_data_start_in(&bytes, A, B).is_some());
+        }
     }
 
     #[test]

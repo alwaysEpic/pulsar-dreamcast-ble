@@ -1,0 +1,13 @@
+[package]
+name = "battery-policy"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["alwaysEpic"]
+description = "Low-battery policy for the Pulsar adapters: observations in, decisions out"
+repository = "https://github.com/alwaysEpic/pulsar-dreamcast-ble"
+
+[lints]
+workspace = true
+
+[dependencies]

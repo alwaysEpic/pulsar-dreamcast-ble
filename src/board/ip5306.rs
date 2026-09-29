@@ -32,6 +32,8 @@ use embassy_nrf::twim::{self, Twim};
 use embassy_nrf::{bind_interrupts, gpio::Pin, Peri};
 use static_cell::StaticCell;
 
+use super::ConfigRefresh;
+
 /// IP5306 7-bit I²C address.
 const ADDR: u8 = 0x75;
 
@@ -93,6 +95,23 @@ const SYS_CTL0_RESET: u8 = 0xBE;
 bind_interrupts!(struct Irqs {
     TWISPI0 => twim::InterruptHandler<TWISPI0>;
 });
+
+/// One read of the undocumented gauge register.
+#[derive(Clone, Copy, Debug)]
+pub struct GaugeSample {
+    /// The byte as read — kept so an unrecognized code can still be logged and
+    /// published for characterization.
+    #[cfg_attr(
+        not(feature = "gauge-debug"),
+        expect(
+            dead_code,
+            reason = "read only by the gauge-debug channel and by a derived Debug in the log, neither of which counts as a read"
+        )
+    )]
+    pub raw: u8,
+    /// The decoded level, or `None` for a code nobody can explain.
+    pub percent: Option<u8>,
+}
 
 /// IP5306 power IC over I²C. Owns the TWIM peripheral.
 pub struct Ip5306 {
@@ -274,12 +293,27 @@ impl Ip5306 {
     /// from "this was never the problem", which matters when the alternative is
     /// guessing.
     ///
+    /// **"No drift" does not mean the rail is up.** These are *enable* bits:
+    /// configuration, not output state. Neither source document offers a bit
+    /// that reports the output itself — the reads are
+    /// `0x70[3]` charging, `0x71[3]` full, `0x72[2]` light load and the `0x77`
+    /// key flags, nothing else — and neither says the enables clear when the
+    /// chip shuts its own output off (Batlow, output protection). Whether they
+    /// do is not established on this board either. The one untried signal is
+    /// the IRQ pin (U2 pin 4 → P1.11; documented high while working, high-Z in
+    /// standby), whose meaning through a Batlow trip is unmeasured.
+    ///
+    /// The result says which of four things happened — see
+    /// [`ConfigRefresh`]. It used to be a `bool` that returned `true` even when
+    /// the repair write failed, claiming a recovery that had not happened. The
+    /// caller's next pass re-reads the register, so a failed repair is retried.
+    ///
     /// The previous version tested `SYS_CTL1` bit 1, which both source documents
     /// show is Reserved with reset 0. Nothing sets it, so the check could only
     /// ever report "no drift" — the telemetry added specifically to tell those
     /// two cases apart was measuring a bit that never moves. It now watches the
     /// two bits whose loss actually kills the rail.
-    pub async fn refresh_config(&mut self) -> bool {
+    pub async fn refresh_config(&mut self) -> ConfigRefresh {
         let mut cur = [0u8; 1];
         if self
             .twim
@@ -287,20 +321,26 @@ impl Ip5306 {
             .await
             .is_err()
         {
-            return false;
+            return ConfigRefresh::ReadFailed;
         }
         if cur[0] & SYS_CTL0_RAIL_ON == SYS_CTL0_RAIL_ON {
-            return false; // nothing to do; leave the register untouched
+            return ConfigRefresh::Unchanged; // leave the register untouched
         }
-        let _ = self
+        let repaired = self
             .twim
             .write(ADDR, &[REG_SYS_CTL0, cur[0] | SYS_CTL0_RAIL_ON])
-            .await;
-        true
+            .await
+            .is_ok();
+        if repaired {
+            ConfigRefresh::Repaired
+        } else {
+            ConfigRefresh::RepairFailed
+        }
     }
 
-    /// Coarse battery percentage (25/50/75/100) **and the raw `0x78` byte it was
-    /// decoded from**. `None` on I²C error. ⚠ **Permanently unverifiable.**
+    /// The raw `0x78` byte and the coarse level decoded from it. `None` on I²C
+    /// error; [`GaugeSample::percent`] is `None` when the byte is not one of the
+    /// five recognized codes. ⚠ **Permanently unverifiable.**
     ///
     /// The decode treats bits 7:4 as the chip's 4 gauge LEDs, active-low
     /// (`0xF0` = none lit, `0x00` = all four), which is what the M5Stack /
@@ -313,42 +353,59 @@ impl Ip5306 {
     /// reverse-engineering with no spec behind it, and a full LiPo reading 75 %
     /// has no authoritative explanation available.
     ///
-    /// This is why `LOW_BATTERY_CUTOFF_PCT` (main.rs) sits at 0: it is the one
-    /// bucket whose meaning survives any plausible decode. The raw byte comes
-    /// back with the percentage so the caller can log it and characterize the
-    /// map empirically across a charge/discharge — that remains the only route.
-    pub async fn battery_percent(&mut self) -> Option<(u8, u8)> {
+    /// **An unrecognized code is unknown, not empty.** It used to fall through to
+    /// 0 %, which fed the low-battery cutoff: a byte nobody can explain was
+    /// counted as evidence of a flat cell. Only `0xF0` is "no LEDs lit" — and
+    /// even that wants a bench capture before it is called proof. The datasheet's
+    /// four-LED discharge table *blinks* the bottom LED below ~3 %; if `0x78`
+    /// mirrors the instantaneous LED state rather than a settled bucket, a
+    /// blinking last bar could read `0xF0` half the time (unmeasured).
+    ///
+    /// This is why `LOW_BATTERY_CUTOFF_PCT` (main.rs) sits at 0: of the five
+    /// codes, "no LEDs lit" is the *least* dependent on how the others decode.
+    /// That is not the same as verified — see the blinking-LED question above —
+    /// which is why the cutoff also demands repeated readings over time. The
+    /// raw byte comes back with the level so the caller can log it and
+    /// characterize the map empirically across a charge/discharge — that remains
+    /// the only route.
+    pub async fn battery_percent(&mut self) -> Option<GaugeSample> {
         let mut buf = [0u8; 1];
         self.twim
             .write_read(ADDR, &[REG_BAT_LEVEL], &mut buf)
             .await
             .ok()?;
         let percent = match buf[0] & 0xF0 {
-            0x00 => 100,
-            0x80 => 75,
-            0xC0 => 50,
-            0xE0 => 25,
-            _ => 0,
+            0x00 => Some(100),
+            0x80 => Some(75),
+            0xC0 => Some(50),
+            0xE0 => Some(25),
+            0xF0 => Some(0),
+            _ => None,
         };
-        Some((percent, buf[0]))
+        Some(GaugeSample {
+            raw: buf[0],
+            percent,
+        })
     }
 
-    /// True while charging (charge in progress). `false` on error.
+    /// Whether the charger is running. `None` on I²C error — a failed read is
+    /// not "not charging", and the low-battery cutoff exempts a charging cell.
     /// ✅ `0x70` bit 3 — datasheet-confirmed, and named in its app notes as the
     /// intended way to tell charging from discharging.
-    pub async fn is_charging(&mut self) -> bool {
+    pub async fn is_charging(&mut self) -> Option<bool> {
         self.read_flag(REG_READ0, 0x08).await
     }
 
-    /// True once charging has completed (battery full). `false` on error.
+    /// Whether charging has completed (battery full). `None` on I²C error.
     /// ✅ `0x71` bit 3 — datasheet-confirmed.
-    pub async fn is_full(&mut self) -> bool {
+    pub async fn is_full(&mut self) -> Option<bool> {
         self.read_flag(REG_READ1, 0x08).await
     }
 
-    /// Read one register and test `mask`; `false` on I²C error.
-    async fn read_flag(&mut self, reg: u8, mask: u8) -> bool {
+    /// Read one register and test `mask`; `None` on I²C error.
+    async fn read_flag(&mut self, reg: u8, mask: u8) -> Option<bool> {
         let mut buf = [0u8; 1];
-        self.twim.write_read(ADDR, &[reg], &mut buf).await.is_ok() && (buf[0] & mask) != 0
+        self.twim.write_read(ADDR, &[reg], &mut buf).await.ok()?;
+        Some((buf[0] & mask) != 0)
     }
 }

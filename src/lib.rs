@@ -87,19 +87,41 @@ pub const NOTIFY_INTERVAL_MS: u64 = 8;
 /// finish service discovery and write the CCCD that subscribes to
 /// notifications.
 ///
-/// Reports sent before subscription return an error from
-/// `report_notify` and count toward `MAX_NOTIFY_FAILURES` — too short and
-/// we'll disconnect a slow-subscribing host.
+/// A courtesy, not a guard. Reports sent to an encrypted host before it
+/// subscribes fail, but `maple_protocol::notify_budget` does not count that
+/// toward `MAX_NOTIFY_FAILURES` — it used to, and this guess was then the only
+/// thing standing between a slow-subscribing host and a hang-up. `BlueZ` on a
+/// fresh pairing subscribes at ~2.6 s against the ~2.1 s this delay produces,
+/// and was dropped for it.
 ///
-/// Original value 5000 ms (commit 1d66d2c) bundled pairing time too, but
-/// pairing is now handled separately in `handle_connection` (~600 ms of
-/// explicit waits) before the notify task starts, so this only needs to
-/// cover service discovery + CCCD write, which macOS typically completes
-/// in well under 1 s. 1500 ms keeps a comfortable margin.
+/// Original value 5000 ms (commit 1d66d2c) bundled pairing time too. 1500 ms
+/// covers discovery + CCCD write on macOS, which completes in well under 1 s;
+/// a host that takes longer just sees its first report a few ticks after it
+/// subscribes.
 pub const SERVICE_DISCOVERY_DELAY_MS: u64 = 1500;
 
-/// Max consecutive BLE notify failures before disconnecting.
+/// Max consecutive counted notify failures before disconnecting — which
+/// failures count is `maple_protocol::notify_budget`'s rule.
+///
+/// On an encrypted link queue-full and not-yet-subscribed are excluded: at
+/// `NOTIFY_INTERVAL_MS` this budget is 88 ms, and a marginal link stalls for
+/// longer than that routinely while the host's supervision timeout would wait
+/// 4000 ms. On an unencrypted link every due report counts, so this is also how
+/// long a peer that never encrypts may hold the connection once reports start.
 pub const MAX_NOTIFY_FAILURES: u8 = 10;
+
+/// How often the BLE task drains the VMU storage egress, in ms.
+///
+/// The same 8 ms as the HID cadence, and for the same reason: one connection
+/// event per interval is the most the SoftDevice can send anything in, so a
+/// faster tick only finds a full queue. A whole block is four notifications,
+/// which at this tick is ~32 ms of link time against a ~13 ms decode — the
+/// decoder, not the link, is what paces a pull.
+///
+/// Sharing the air with HID is not a concern by construction: reads are served
+/// only while the pad is idle, so the reports this competes with are the
+/// unchanging ones.
+pub const VMU_DRAIN_INTERVAL_MS: u64 = 8;
 
 /// Timeout before entering sleep when disconnected (ms).
 pub const SLEEP_TIMEOUT_MS: u64 = 60_000;
@@ -119,7 +141,7 @@ pub const SLEEP_TIMEOUT_MS: u64 = 60_000;
 /// accidentally broken later.
 pub static RAW_CONTROLLER_STATE: Signal<ThreadModeRawMutex, maple::ControllerState> = Signal::new();
 
-/// Signal to trigger sync/pairing mode (clears bonds).
+/// Signal to trigger sync/pairing mode (opens a bond-replacement window).
 pub static SYNC_MODE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Signal to switch active BLE profile and reset. Carries the new `ProfileId`.
@@ -131,6 +153,19 @@ pub static PROFILE_CHANGE: Signal<CriticalSectionRawMutex, ble::ProfileId> = Sig
 /// holds, then enters System Off. Avoids sleeping mid-write so the goodbye
 /// frame actually lands on the LCD.
 pub static GOODBYE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Set by the button task when the sleep hold reaches
+/// [`maple_protocol::sync_hold::FORCE_OFF_MS`]: the goodbye is no longer
+/// deferrable.
+///
+/// The 7 s goodbye waits while the VMU storage service is draining acked
+/// saves onto the card — sleeping mid-drain loses them, and a reboot moves the
+/// generation so the dongle cannot replay them. pulsarv1 has no power switch,
+/// so a person must still be able to end a drain that will not finish; the
+/// hold to 15 s is that escape, documented as emergency behaviour rather than
+/// a timeout.
+pub static SHUTDOWN_FORCED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Set by the BLE task on the rising edge of the Guide chord (L+R+Start held).
@@ -213,7 +248,7 @@ pub fn take_config_boot_marker() -> bool {
 ///
 /// Returns `false` without resetting if the SoftDevice rejects the write or a
 /// readback does not contain the marker. The caller can then suppress the
-/// normal pairing action for this hold instead of silently clearing the bond.
+/// normal pairing action for this hold instead of silently opening a window.
 #[must_use]
 pub fn reboot_into_config() -> bool {
     use nrf_softdevice_s140 as sd_raw;
@@ -406,10 +441,19 @@ pub static BATTERY_LEVEL: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 /// Debug-only: the latest raw IP5306 gauge sample, packed for smuggling out in
 /// the HID report's unused right-stick bytes (`gauge-debug` feature).
 ///
-/// Layout, low byte first: `[raw 0x78, decoded %, flags, MAGIC]`, where flags
-/// bit 0 = charging and bit 1 = charge-complete. The magic byte lets a host
-/// capture prove it is looking at a `gauge-debug` build rather than a genuine
-/// centered right stick.
+/// Layout, low byte first: `[raw 0x78, decoded %, flags, MAGIC]`. Flags: bit 0
+/// = charging, bit 1 = charge-complete, bits 3:2 = a sample sequence counter,
+/// and three *invalid* bits so that a read which failed is never mistaken for
+/// a `false` — bit 4 = charging unread, bit 5 = charge-complete unread, bit 6 =
+/// gauge unread. A gauge byte that read but did not decode publishes its raw
+/// value with `%` = `0xFF`. The sequence counter steps once per *measurement*,
+/// so a capture can tell a repeated identical measurement from the same one
+/// carried in many HID reports. The magic byte lets a host capture prove it is
+/// looking at a `gauge-debug` build rather than a genuine centered right stick.
+///
+/// **`scripts/hid_capture.py::analyze_gauge` decodes this layout and must
+/// change with it** — a decoder that does not know the invalid bits prints an
+/// all-reads-failed sample as "255 % discharging".
 ///
 /// This exists because pulsarv1 **cannot be observed over RTT** — the XIAO
 /// module has no onboard debugger and there is no SWD probe for it — and the
@@ -426,8 +470,20 @@ pub const GAUGE_MAGIC: u8 = 0xA5;
 /// Publish a gauge sample for the `gauge-debug` HID channel. No-op cost in
 /// normal builds — the whole thing compiles out.
 #[cfg(feature = "gauge-debug")]
-pub fn publish_gauge_sample(raw: u8, percent: u8, charging: bool, full: bool) {
-    let flags = u8::from(charging) | (u8::from(full) << 1);
+pub fn publish_gauge_sample(
+    gauge: Option<(u8, Option<u8>)>,
+    charging: Option<bool>,
+    full: Option<bool>,
+) {
+    static SEQUENCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    let sequence = SEQUENCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) & 0b11;
+    let (raw, percent) = gauge.map_or((0, 0xFF), |(raw, pct)| (raw, pct.unwrap_or(0xFF)));
+    let flags = u8::from(charging == Some(true))
+        | (u8::from(full == Some(true)) << 1)
+        | (sequence << 2)
+        | (u8::from(charging.is_none()) << 4)
+        | (u8::from(full.is_none()) << 5)
+        | (u8::from(gauge.is_none()) << 6);
     let packed = u32::from(raw)
         | (u32::from(percent) << 8)
         | (u32::from(flags) << 16)
@@ -435,16 +491,23 @@ pub fn publish_gauge_sample(raw: u8, percent: u8, charging: bool, full: bool) {
     GAUGE_SAMPLE.store(packed, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Running count of failed `get_condition` polls (wrapping u16), for the
-/// `maple-fail-debug` HID channel. Same rationale as [`GAUGE_SAMPLE`]:
+/// Running count of failed `get_condition` polls (wrapping u16).
+///
+/// For the `maple-fail-debug` HID channel. Same rationale as [`GAUGE_SAMPLE`]:
 /// pulsarv1 has no RTT path, so the HID report is the only telemetry link.
-#[cfg(feature = "maple-fail-debug")]
+///
+/// Also read by `poll-period-debug`'s tag 10. The two channels are mutually
+/// exclusive (they share report bytes 4-7), so the counter has to exist for
+/// either of them, not only the one it was named after — gated on
+/// `maple-fail-debug` alone, tag 10 would have published a counter nothing
+/// increments (found building v297, never fixed on `main`).
+#[cfg(any(feature = "maple-fail-debug", feature = "poll-period-debug"))]
 pub static MAPLE_FAIL_TOTAL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
 /// Longest consecutive `get_condition` failure streak seen since boot
 /// (saturated to u8). One failed poll = 5 ms of unsampled input; 3+ in a row
 /// is a whole BLE connection interval gone dark.
-#[cfg(feature = "maple-fail-debug")]
+#[cfg(any(feature = "maple-fail-debug", feature = "poll-period-debug"))]
 pub static MAPLE_FAIL_MAX_CONSEC: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
 

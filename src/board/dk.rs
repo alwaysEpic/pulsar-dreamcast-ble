@@ -12,7 +12,7 @@
 //! contract documented in [`super`] with no-op / `None` power and a WFI-halt
 //! `enter_sleep`.
 
-use super::BatteryStatus;
+use super::{ConfigRefresh, Reading};
 use embassy_nrf::gpio::{Flex, Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::Peripherals;
 use embassy_time::{Duration, Timer};
@@ -52,10 +52,18 @@ impl StatusIndicator {
         self.led4.set_low();
     }
 
-    /// Controller found / connected (LED4 off, LED3 on).
+    /// Controller found / connected (LED4 off, LED3 on). Clears LED2 too, so
+    /// it also ends `saving`.
     pub fn connected(&mut self) {
         self.led4.set_high();
+        self.led2.set_high();
         self.led3.set_low();
+    }
+
+    /// Acked saves draining onto the VMU (LED2 on beside LED3). `connected`
+    /// ends it.
+    pub fn saving(&mut self) {
+        self.led2.set_low();
     }
 
     /// All status LEDs off.
@@ -95,8 +103,8 @@ impl Power {
         reason = "the board contract (ADR-013) fixes this signature so all three boards expose \
               one API; this board answers without awaiting"
     )]
-    pub async fn refresh_config(&mut self) -> bool {
-        false
+    pub async fn refresh_config(&mut self) -> ConfigRefresh {
+        ConfigRefresh::Unchanged
     }
 
     /// No boost rail on the DK — nothing to power down for sleep.
@@ -120,8 +128,8 @@ impl Power {
         reason = "the board contract (ADR-013) fixes this signature so all three boards expose \
               one API; this board answers without awaiting"
     )]
-    pub async fn battery(&mut self) -> Option<BatteryStatus> {
-        None
+    pub async fn battery(&mut self) -> Reading {
+        Reading::NoGauge
     }
 }
 
@@ -142,6 +150,14 @@ pub struct BoardPins {
     pub status: StatusIndicator,
     pub power: Power,
     pub rumble: Rumble,
+    /// The SPIM pair, trigger and clock pins for the hardware reply capture
+    /// (`maple::spim_capture`) — always `None` here. The DK keeps the CPU
+    /// sampling loop as its RX capture (2026-09-15), so
+    /// `board-dk` does not imply `spim-capture`; the field exists only because
+    /// the board contract is uniform, and is present at all only when some
+    /// other feature turns the capture on.
+    #[cfg(feature = "spim-capture")]
+    pub spim_capture: Option<crate::maple::spim_capture::Parts>,
 }
 
 /// No board-specific Embassy config on the DK.
@@ -183,6 +199,8 @@ pub fn init(p: Peripherals) -> BoardPins {
         status: StatusIndicator { led2, led3, led4 },
         power: Power,
         rumble: Rumble,
+        #[cfg(feature = "spim-capture")]
+        spim_capture: None,
     }
 }
 

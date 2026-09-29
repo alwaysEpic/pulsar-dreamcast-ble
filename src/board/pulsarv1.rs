@@ -22,7 +22,7 @@
 use super::{
     ip5306::Ip5306,
     ws2812::{Rgb, Ws2812, LED_COUNT},
-    xiao_common, BatteryStatus,
+    xiao_common, ConfigRefresh, Observation, Reading,
 };
 use embassy_nrf::gpio::{Flex, Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::peripherals::PWM1;
@@ -54,6 +54,7 @@ pub const HAS_USB_PASSTHROUGH: bool = false;
 /// Dim status colors (kept low to avoid glare through the shell window).
 const C_SEARCHING: Rgb = Rgb::new(12, 0, 0); // dim red
 const C_CONNECTED: Rgb = Rgb::new(0, 14, 0); // dim green
+const C_SAVING: Rgb = Rgb::new(12, 6, 0); // dim amber
 const C_STARTUP: Rgb = Rgb::new(0, 0, 14); // dim blue
 
 /// Battery-gauge color. Deliberately **magenta**, not another red/green/blue:
@@ -61,6 +62,10 @@ const C_STARTUP: Rgb = Rgb::new(0, 0, 14); // dim blue
 /// mistakable for a status color — especially at these low brightnesses, where
 /// cyan and green are easy to confuse. One const to change for a different hue.
 const C_BATTERY: Rgb = Rgb::new(10, 0, 10); // dim magenta
+/// An empty gauge: the first battery LED alone, red. Red rather than a dimmer
+/// magenta because it has to read as a warning beside either status color —
+/// green when the link is fine, red when nothing answers.
+const C_BATTERY_EMPTY: Rgb = Rgb::new(12, 0, 0); // dim red
 
 /// LED 0 shows connection status; LEDs 1-4 are the battery gauge.
 ///
@@ -79,7 +84,8 @@ const BATTERY_LED_COUNT: usize = 4;
 ///
 /// - `searching` → LED 0 dim red
 /// - `connected` → LED 0 dim green
-/// - `set_battery(pct)` → LEDs 1-4, one per gauge level, dim magenta
+/// - `set_battery(Some(pct))` → LEDs 1-4, one per gauge level, dim magenta;
+///   an empty gauge lights LED 1 dim red instead. `None` hides the gauge.
 /// - `off` → all dark
 ///
 /// Battery level is retained across status changes, so connecting or losing the
@@ -87,7 +93,8 @@ const BATTERY_LED_COUNT: usize = 4;
 pub struct StatusIndicator {
     leds: Ws2812,
     status: Rgb,
-    battery_bars: u8,
+    /// `None` = gauge hidden; `Some(0)` = shown and reading empty.
+    battery_bars: Option<u8>,
     lit: bool,
 }
 
@@ -98,7 +105,7 @@ impl StatusIndicator {
         Self {
             leds,
             status: Rgb::OFF,
-            battery_bars: 0,
+            battery_bars: None,
             lit: false,
         }
     }
@@ -110,8 +117,17 @@ impl StatusIndicator {
         let mut frame = [Rgb::OFF; LED_COUNT];
         if self.lit {
             frame[STATUS_LED] = self.status;
-            for i in 0..(self.battery_bars as usize).min(BATTERY_LED_COUNT) {
-                frame[BATTERY_LED_0 + i] = C_BATTERY;
+            match self.battery_bars {
+                None => {}
+                // Shown and empty. Zero lit bars is also what a hidden gauge
+                // looks like, so "charge me" was indistinguishable from "not
+                // telling you" — the exact case `C_BATTERY_EMPTY` exists for.
+                Some(0) => frame[BATTERY_LED_0] = C_BATTERY_EMPTY,
+                Some(bars) => {
+                    for i in 0..(bars as usize).min(BATTERY_LED_COUNT) {
+                        frame[BATTERY_LED_0 + i] = C_BATTERY;
+                    }
+                }
             }
         }
         self.leds.write(&frame);
@@ -142,6 +158,14 @@ impl StatusIndicator {
         self.render();
     }
 
+    /// Acked saves draining onto the VMU — status LED dim amber, so the unit
+    /// is visibly not to be undocked or held off. `connected` ends it.
+    pub fn saving(&mut self) {
+        self.status = C_SAVING;
+        self.lit = true;
+        self.render();
+    }
+
     /// All LEDs off. Battery level is remembered for the next `render`.
     pub fn off(&mut self) {
         self.lit = false;
@@ -160,7 +184,7 @@ impl StatusIndicator {
     /// 60s battery read nor the presence probe pushes a redundant WS2812 DMA
     /// sequence into the poll loop.
     pub fn set_battery(&mut self, percent: Option<u8>) {
-        let bars = percent.map_or(0, crate::vmu::bars_for_percent);
+        let bars = percent.map(crate::vmu::bars_for_percent);
         if bars != self.battery_bars {
             self.battery_bars = bars;
             self.render();
@@ -229,19 +253,18 @@ impl Power {
     ///
     /// **Unconsumed on this board.** Both `main.rs` call sites now sit behind
     /// `HAS_USB_PASSTHROUGH`, which is `false` here, so this const-folds away.
-    /// Kept for board-contract conformance. Note the `is_full()` I²C read that
-    /// maintains `self.powered` is therefore only feeding diagnostics — prune it
-    /// once the `0x78` characterization is done (needs a timing capture).
+    /// Kept for board-contract conformance. The `is_full()` I²C read that
+    /// maintains `self.powered` is not only for this: it is also the
+    /// `charge_complete` observation behind the on-cable 100 %.
     #[must_use]
     pub const fn is_externally_powered(&self) -> bool {
         self.powered
     }
 
-    /// Re-assert the rail-up IP5306 configuration; `true` if it had actually
-    /// drifted. See [`Ip5306::refresh_config`] — the register is otherwise
+    /// Re-assert the rail-up IP5306 configuration and say what happened. See [`Ip5306::refresh_config`] — the register is otherwise
     /// written at connect/disconnect and never checked between. **Phase 2/3
     /// only**: it asserts the boost, so it would undo `rail_off` in Phase 1.
-    pub async fn refresh_config(&mut self) -> bool {
+    pub async fn refresh_config(&mut self) -> ConfigRefresh {
         self.ip5306.refresh_config().await
     }
 
@@ -266,29 +289,44 @@ impl Power {
     ///   untethered on battery, i.e. in the condition being characterized.
     ///
     /// Reads are 60 s apart, so neither costs anything in the poll loop.
-    pub async fn battery(&mut self) -> Option<BatteryStatus> {
-        self.charging = self.ip5306.is_charging().await;
+    pub async fn battery(&mut self) -> Reading {
+        // Three independent reads, three independent facts. Each is reported
+        // on its own: a failed charge-flag read must not become "not
+        // charging", an unexplained gauge byte must not become "0 %" — and a
+        // failed read must not throw away the ones that landed, which is how a
+        // level reading "empty" once vanished from the DFU gate (2026-09-21).
+        // The cached flags move only on a read that landed.
+        let charging = self.ip5306.is_charging().await;
+        let full = self.ip5306.is_full().await;
+        let gauge = self.ip5306.battery_percent().await;
+        if let Some(charging) = charging {
+            self.charging = charging;
+        }
         // "Externally powered" = plugged in: either charging, or topped-off
         // (full) with input present. Good enough without a dedicated VIN bit.
-        let full = self.ip5306.is_full().await;
-        self.powered = self.charging || full;
-        // `_raw` is log-only: `log!` expands to nothing without the `rtt`
-        // feature, so the underscore keeps non-rtt builds warning-free (same
-        // pattern as `_cmd` in main.rs).
-        let (percent, _raw) = self.ip5306.battery_percent().await?;
+        if let (Some(charging), Some(full)) = (charging, full) {
+            self.powered = charging || full;
+        }
         crate::log!(
-            "IP5306: bat 0x78=0x{:02X} -> {}% (chg={} full={})",
-            _raw,
-            percent,
-            self.charging,
+            "IP5306: bat 0x78={:?} (chg={:?} full={:?})",
+            gauge,
+            charging,
             full
         );
+        // Published *before* anything is filtered: an unrecognized byte is
+        // exactly what a characterization run is looking for.
         #[cfg(feature = "gauge-debug")]
-        crate::publish_gauge_sample(_raw, percent, self.charging, full);
-        Some(BatteryStatus {
-            millivolts: 0,
-            percent,
-            charging: self.charging,
+        crate::publish_gauge_sample(gauge.map(|g| (g.raw, g.percent)), charging, full);
+        // `percent` stays the decoded gauge level. `full` (`0x71[3]`, the
+        // datasheet-confirmed charge-complete bit) goes out beside it rather
+        // than being folded in, so the cutoff keeps the measurement and only
+        // the displays apply `Snapshot::shown_percent`. A failed read is
+        // `None` — "not known to be complete", never "not full".
+        Reading::Observed(Observation {
+            charging,
+            charge_complete: full,
+            percent: gauge.and_then(|g| g.percent),
+            millivolts: None,
         })
     }
 }
@@ -361,6 +399,13 @@ pub struct BoardPins {
     pub status: StatusIndicator,
     pub power: Power,
     pub rumble: Rumble,
+    /// The SPIM pair, trigger and clock pins for the hardware reply capture
+    /// (`maple::spim_capture`). This board's only RX capture backend, so
+    /// always `Some` — `board-pulsarv1` implies `spim-capture`. `None`
+    /// only on a board with no pins to spare for the clocks, which reads
+    /// replies with the CPU sampling loop instead (dk).
+    #[cfg(feature = "spim-capture")]
+    pub spim_capture: Option<crate::maple::spim_capture::Parts>,
 }
 
 /// Board-specific Embassy config: enable the DC/DC regulator (REG1).
@@ -419,6 +464,25 @@ pub fn init(p: Peripherals) -> BoardPins {
     // Rumble motor on P0.29 (D3), driven by PWM1.
     let rumble = Rumble::new(p.PWM1, p.P0_29);
 
+    // Hardware reply capture : SPIM1/SPIM2 listen on the Maple
+    // lines by PSEL; their clocks go out on P1.01 and P1.02, which the XIAO
+    // nRF52840 module routes to no pad (Seeed's schematic for the module lists
+    // P1.11–P1.15 as the only port-1 pins, and the Sense variant's mic and
+    // IMU sit on P1.00, P0.16, P0.07, P0.27, P0.11 and P1.08; the Plus, whose
+    // pads do include P1.01, is not this module). SPIM0 is the IP5306's I²C,
+    // SPIM3 has anomaly 198.
+    #[cfg(feature = "spim-capture")]
+    let spim_capture = Some(crate::maple::spim_capture::Parts {
+        spim_a: p.TWISPI1,
+        spim_b: p.SPI2,
+        gpiote: p.GPIOTE_CH0,
+        ppi: p.PPI_CH0,
+        ppi_oneshot: p.PPI_CH1,
+        ppi_group: p.PPI_GROUP0,
+        sck_a: p.P1_01.into(),
+        sck_b: p.P1_02.into(),
+    });
+
     BoardPins {
         sdcka,
         sdckb,
@@ -431,6 +495,8 @@ pub fn init(p: Peripherals) -> BoardPins {
             powered: false,
         },
         rumble,
+        #[cfg(feature = "spim-capture")]
+        spim_capture,
     }
 }
 

@@ -357,42 +357,60 @@ pub fn composite_battery(frame: &mut [u8; LCD_BYTES], percent: u8, charging: boo
     }
 }
 
+// ── Saving icon ────────────────────────────────────────────────────────────
+
+/// The disk is 7×7, drawn one pixel in from the top-left corner so its
+/// one-pixel cleared halo has room on the inner sides — the corner opposite
+/// the battery, and the one a game's art is least likely to be using.
+const SAVING_ORIGIN: usize = 1;
+const SAVING_SIZE: usize = 7;
+
+/// A floppy: the shutter with its window at the top, the label at the bottom,
+/// the top-right corner cut. 7 bits per row in the high bits, like the font.
+#[rustfmt::skip]
+const SAVING_DISK: [u8; SAVING_SIZE] = [
+    0b1111110_0, // XXXXXX.
+    0b1001010_0, // X..X.X.
+    0b1001011_0, // X..X.XX
+    0b1111111_0, // XXXXXXX
+    0b1000001_0, // X.....X
+    0b1011101_0, // X.XXX.X
+    0b1111111_0, // XXXXXXX
+];
+
+/// Composite the saving icon onto a VMU framebuffer at the top-left corner.
+///
+/// Drawn onto the outgoing copy, as the battery is, so the frame underneath —
+/// a parked game's art included — is untouched and comes back the moment the
+/// icon stops being drawn. The halo is cleared first so the disk reads over
+/// art; nothing else is masked.
+pub fn composite_saving(frame: &mut [u8; LCD_BYTES]) {
+    clear_rect(
+        frame,
+        SAVING_ORIGIN - 1,
+        SAVING_ORIGIN - 1,
+        SAVING_ORIGIN + SAVING_SIZE + 1,
+        SAVING_ORIGIN + SAVING_SIZE + 1,
+    );
+    for (iy, row) in SAVING_DISK.iter().enumerate() {
+        for ix in 0..SAVING_SIZE {
+            if row & (0x80 >> ix) != 0 {
+                let x = SAVING_ORIGIN + ix;
+                let y = SAVING_ORIGIN + iy;
+                fill_rect(frame, x, y, x + 1, y + 1);
+            }
+        }
+    }
+}
+
 // ── Rotating pulsar animation ──────────────────────────────────────────────
 
-/// Number of rotation frames in the animation.
+mod pulsar_frames;
+
+/// Number of rotation frames in the animation. Must match the render
+/// (`tools/vmu-pulsar/README.md`); the table's length is checked below.
 pub const ROTATION_FRAMES: u8 = 12;
-
-const STAR_CENTER_X: i16 = 24; // Center of 48px wide screen
-const STAR_CENTER_Y: i16 = 16; // Center of 32px tall screen
-const STAR_RADIUS_X: i16 = 8;
-const STAR_RADIUS_Y: i16 = 5;
-
-/// Jet cone definitions for each animation frame (12 frames = 30° steps).
-/// Each entry is (`tip_dx`, `tip_dy`, `spread_dx`, `spread_dy`):
-///   - (`tip_dx`, `tip_dy`): center of the cone's far end, relative to star center
-///   - (`spread_dx`, `spread_dy`): offset from tip center to each edge of the cone
-///
-/// The cone is a filled triangle: star center → tip+spread → tip-spread.
-/// Lower jet mirrors the upper: negate all offsets.
-///
-/// Scaled to reach screen edges (48x32), accounting for the wider aspect ratio.
-#[rustfmt::skip]
-const JET_CONES: [(i16, i16, i16, i16); 12] = [
-    // (tip_dx, tip_dy, spread_dx, spread_dy)
-    // Screen is 48x32, center at (24,16). Max reach: ±23 horiz, ±15 vert.
-    (  3, -15,  4,  0),  //   0° — nearly vertical, up
-    ( 15, -15,  4,  2),  //  30° — stretched diagonal
-    ( 21, -13,  2,  4),  //  60° — stretched diagonal
-    ( 22,  -3,  0,  4),  //  90° — horizontal right (was good)
-    ( 21,  13,  2,  4),  // 120° — stretched diagonal
-    ( 15,  15,  4,  2),  // 150° — stretched diagonal
-    (  3,  15,  4,  0),  // 180° — nearly vertical, down
-    (-15,  15, -4,  2),  // 210° — stretched diagonal
-    (-21,  13, -2,  4),  // 240° — stretched diagonal
-    (-22,  -3,  0,  4),  // 270° — horizontal left (was good)
-    (-21, -13, -2,  4),  // 300° — stretched diagonal
-    (-15, -15, -4,  2),  // 330° — stretched diagonal
-];
+const _: () = assert!(pulsar_frames::PULSAR_FRAMES.len() == ROTATION_FRAMES as usize);
 
 /// Set a pixel in the framebuffer. x=0 is leftmost, y=0 is topmost.
 #[expect(
@@ -483,61 +501,17 @@ fn fill_triangle(frame: &mut [u8; LCD_BYTES], verts: [(i16, i16); 3]) {
     }
 }
 
-/// Draw the star ellipse at the center.
-fn draw_star(frame: &mut [u8; LCD_BYTES]) {
-    for y in -STAR_RADIUS_Y..=STAR_RADIUS_Y {
-        let ry2 = STAR_RADIUS_Y * STAR_RADIUS_Y;
-        let rx2 = STAR_RADIUS_X * STAR_RADIUS_X;
-        let x_max_sq = rx2 * (ry2 - y * y) / ry2;
-        let mut x = 0i16;
-        while x * x <= x_max_sq {
-            set_pixel(frame, STAR_CENTER_X + x, STAR_CENTER_Y + y);
-            set_pixel(frame, STAR_CENTER_X - x, STAR_CENTER_Y + y);
-            x += 1;
-        }
-    }
-}
-
 /// Build an animated pulsar frame for the given rotation step.
 ///
 /// `step` should be 0..ROTATION_FRAMES-1, cycling to create the animation.
-/// Jets are drawn as filled cones (triangles) that reach the screen edges.
+/// The frames are rendered in Blender and baked to 1-bit by
+/// `tools/vmu-pulsar/` into `vmu/pulsar_frames.rs`.
 ///
 /// Returns raw content — battery overlay and 180° rotation are applied by the
 /// generic VMU writer so they work regardless of content source.
 #[must_use]
-pub fn build_animated_frame(step: u8) -> [u8; LCD_BYTES] {
-    let mut frame = [0u8; LCD_BYTES];
-    let idx = (step % ROTATION_FRAMES) as usize;
-    let (tdx, tdy, sdx, sdy) = JET_CONES[idx];
-
-    let cx = STAR_CENTER_X;
-    let cy = STAR_CENTER_Y;
-
-    // Upper jet cone: triangle from star center to two spread points at tip
-    fill_triangle(
-        &mut frame,
-        [
-            (cx, cy),
-            (cx + tdx + sdx, cy + tdy + sdy),
-            (cx + tdx - sdx, cy + tdy - sdy),
-        ],
-    );
-
-    // Lower jet cone: mirror
-    fill_triangle(
-        &mut frame,
-        [
-            (cx, cy),
-            (cx - tdx - sdx, cy - tdy - sdy),
-            (cx - tdx + sdx, cy - tdy + sdy),
-        ],
-    );
-
-    // Draw star on top of jets
-    draw_star(&mut frame);
-
-    frame
+pub const fn build_animated_frame(step: u8) -> [u8; LCD_BYTES] {
+    pulsar_frames::PULSAR_FRAMES[(step % ROTATION_FRAMES) as usize]
 }
 
 // ── Profile splash ─────────────────────────────────────────────────────────
@@ -724,6 +698,16 @@ const fn font_5x7(c: u8) -> [u8; 7] {
             0b10001_000,
             0b10001_000,
             0b11110_000,
+        ],
+        // 'A': the SAVE splash when the update gesture is refused mid-drain.
+        b'A' => [
+            0b01110_000,
+            0b10001_000,
+            0b10001_000,
+            0b11111_000,
+            0b10001_000,
+            0b10001_000,
+            0b10001_000,
         ],
         // 'V' and digits: used by the installed-version tag on the BOOT splash.
         b'V' => [

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "maple-protocol"]
+members = [".", "maple-protocol", "battery-policy"]
 
 # Lint policy lives here, not in scripts/ci.sh, so that *every* invocation of
 # `cargo clippy` — in CI or a local shell, from any directory — sees the identical
@@ -99,6 +99,7 @@ workspace = true
 
 [dependencies]
 maple-protocol = { path = "maple-protocol" }
+battery-policy = { path = "battery-policy" }
 # Core
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
@@ -113,7 +114,15 @@ embassy-sync = { git = "https://github.com/embassy-rs/embassy" }
 embassy-futures = { git = "https://github.com/embassy-rs/embassy" }
 
 # SoftDevice BLE stack (git for compatibility)
-nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice", features = ["s140", "nrf52840", "ble-peripheral", "ble-gatt-server", "ble-sec", "critical-section-impl"] }
+# `evt-max-size-256` is load-bearing, not a tuning knob. nrf-softdevice reads
+# each BLE event into a stack buffer that defaults to 128 bytes and *panics*
+# ("BLE_EVT_MAX_SIZE is too low") when `sd_ble_evt_get` reports the event is
+# larger. A GATTS write event carries its payload inline, so with `att_mtu:
+# 247` (see `ble/softdevice.rs`) a 192-byte VMU frame arrives as a ~212-byte
+# event and resets the chip before `accept_write` ever runs. Measured on a
+# pulsarv1 unit at v245: writes to ~108 bytes are fine, 130 and 192 reset. Raising
+# att_mtu without raising this is the bug shipped and then chased.
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice", features = ["s140", "nrf52840", "ble-peripheral", "ble-gatt-server", "ble-sec", "critical-section-impl", "evt-max-size-256"] }
 nrf-softdevice-s140 = { git = "https://github.com/embassy-rs/nrf-softdevice" }
 
 # Flash storage
@@ -135,8 +144,21 @@ debug = 2             # Keep debug info for probe-rs
 default = ["board-dk", "rtt"]
 rtt = ["dep:rtt-target"]
 board-dk = ["rtt"]
-board-xiao = []
-board-pulsarv1 = []
+board-xiao = ["spim-capture"]
+board-pulsarv1 = ["spim-capture"]
+# The hardware reply capture (`maple::spim_capture`): SPIM1/SPIM2,
+# a GPIOTE channel, two PPI channels and a group, two clock pins. Since it
+# it is the *RX capture backend* for the carrier and the XIAO — not an option there
+# but the only way those boards read a Maple reply, so both board features imply it
+# and it is no longer selectable on its own. The DK keeps the CPU sampling loop
+# (decided 2026-09-15) and does not imply it; check_timing_invariants.sh checks the
+# two forms accordingly (`cpu` vs `spim` mode).
+#
+# History, kept because it cost a build: while these parts had no consumer, merely
+# taking them in `board::init` for `main` to drop grew the main task by 14 bytes and
+# rolled the poll loop (v278, 2026-09-15: 34.6 Hz, IQR 27 ms, the v261 signature).
+# Do not take board parts nothing uses.
+spim-capture = []
 
 # Debug-only: stamp a 7-bit sequence counter into report byte 15 (bits 1-7,
 # HID padding) so a host capture can detect reports dropped in transit. Not for

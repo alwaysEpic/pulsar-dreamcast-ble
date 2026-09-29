@@ -45,10 +45,22 @@
 //! - `status`: `StatusIndicator` — logical LED/lighting state.
 //! - `power`: `Power` — 5 V rail, external-power detect, and battery gauge.
 //! - `rumble`: `Rumble` — `set(intensity: u8)` drives a vibration motor (no-op where absent).
+//! - `spim_capture`: `Option<maple::spim_capture::Parts>` — the SPIM pair, trigger
+//!   channel and two clock pins for the hardware reply capture. **The carrier
+//!   (`pulsarv1`) and the XIAO supply it; the DK does not** (: those two
+//!   boards read every Maple reply on the SPIM/EasyDMA capture, the DK keeps the
+//!   CPU sampling loop). `None` therefore means "this board has no pins to spare
+//!   for the clocks and samples with the CPU". Present only with the
+//!   `spim-capture` feature, which `board-xiao` and `board-pulsarv1` imply; the
+//!   field is never populated for no consumer, because taking the parts with
+//!   nothing reading them cost the main task 14 bytes and the poll loop its
+//!   timing (v278).
 //!
 //! ## `StatusIndicator` (logical, not physical — RGB / discrete / WS2812)
 //! - `async fn startup(&mut self)` · `fn searching(&mut self)`
 //! - `fn connected(&mut self)` · `fn off(&mut self)`
+//! - `fn saving(&mut self)` — acked saves draining onto the VMU;
+//!   entered from `connected`, and `connected` is what ends it.
 //! - `fn tx_activity_on(&mut self)` · `fn tx_activity_off(&mut self)`
 //!
 //! ## `Power` (rail + gauge; no-op / `None` where a board has neither)
@@ -62,12 +74,14 @@
 //!   No-op where a board has no rail, or (XIAO) handles rail-off inside
 //!   `enter_sleep` itself.
 //! - `fn is_externally_powered(&self) -> bool` · `fn is_charging(&self) -> bool`
-//! - `async fn refresh_config(&mut self) -> bool` — re-assert whatever rail-up
-//!   configuration the board's power IC holds; `true` if it had drifted.
+//! - `async fn refresh_config(&mut self) -> ConfigRefresh` — re-assert whatever
+//!   rail-up configuration the board's power IC holds, and say what happened.
 //!   **Rail-up phases only** (Phase 2/3): it asserts the rail-on state, so a
-//!   call while disconnected would undo `rail_off`. `false` and no-op where
-//!   there is nothing to drift (xiao, dk).
-//! - `async fn battery(&mut self) -> Option<BatteryStatus>` — `None` = no gauge.
+//!   call while disconnected would undo `rail_off`. `Unchanged` and no-op
+//!   where there is nothing to drift (xiao, dk).
+//! - `async fn battery(&mut self) -> Reading` — `NoGauge` where there is none;
+//!   otherwise an `Observation` whose fields are each `None` when that read
+//!   failed. A board never defaults a field it could not establish.
 //!
 //! Everything is compile-time monomorphized through the one selected module, so
 //! the uniform API is **zero-cost** — no trait objects, no dynamic dispatch.
@@ -95,17 +109,24 @@ pub use pulsarv1::*;
 #[cfg(feature = "board-xiao")]
 pub use xiao::*;
 
-/// Uniform battery snapshot returned by a board's [`Power`] subsystem.
+// What a board's [`Power`] subsystem reports. Defined in `battery-policy` so
+// the policy that consumes them is host-testable; re-exported here because
+// they are part of the board contract.
+pub use battery_policy::{Observation, Reading};
+
+/// What one `refresh_config` call found and did.
 ///
-/// Boards without a fuel gauge return `None` from `battery()` rather than a
-/// synthetic value, so `main.rs` can treat "no battery" and "battery present"
-/// uniformly (the reporting/low-cutoff logic simply skips when `None`).
-#[derive(Clone, Copy, Debug)]
-pub struct BatteryStatus {
-    /// Battery terminal voltage in millivolts.
-    pub millivolts: u32,
-    /// State-of-charge estimate, 0–100 %.
-    pub percent: u8,
-    /// True while charging (report as full / freeze discharge tracking).
-    pub charging: bool,
+/// A `bool` used to carry this, and `false` meant both "already correct" and
+/// "could not tell" — while `true` was returned even when the repair write
+/// failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigRefresh {
+    /// The rail-up configuration was intact, or the board has none to drift.
+    Unchanged,
+    /// It had drifted and the repair write landed.
+    Repaired,
+    /// It could not be read, so nothing is known about it.
+    ReadFailed,
+    /// It had drifted and the repair write failed. Still broken.
+    RepairFailed,
 }

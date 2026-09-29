@@ -15,7 +15,7 @@
 //! indicator and the XIAO-module silicon (QSPI DPD, System Off) come from
 //! [`super::xiao_common`]; this file adds the discrete-power `Power` subsystem.
 
-use super::{xiao_common, BatteryStatus};
+use super::{xiao_common, ConfigRefresh, Observation, Reading};
 use embassy_nrf::gpio::{Flex, Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::saadc::{self, Saadc};
 use embassy_nrf::Peripherals;
@@ -72,6 +72,13 @@ impl StatusIndicator {
         self.led_g.set_low();
     }
 
+    /// Acked saves draining onto the VMU (red + green, the amber this LED
+    /// has). `connected` ends it.
+    pub fn saving(&mut self) {
+        self.led_r.set_low();
+        self.led_g.set_low();
+    }
+
     /// All status LEDs off.
     pub fn off(&mut self) {
         self.led_r.set_high();
@@ -118,8 +125,8 @@ impl Power {
         reason = "the board contract (ADR-013) fixes this signature so all three boards expose \
               one API; this board answers without awaiting"
     )]
-    pub async fn refresh_config(&mut self) -> bool {
-        false
+    pub async fn refresh_config(&mut self) -> ConfigRefresh {
+        ConfigRefresh::Unchanged
     }
 
     /// Boost-off for sleep is handled inside [`enter_sleep`] (P0.28 SHDN held LOW
@@ -139,13 +146,16 @@ impl Power {
     }
 
     /// Sample the battery. Returns voltage, `SoC` %, and charge state.
-    pub async fn battery(&mut self) -> Option<BatteryStatus> {
+    pub async fn battery(&mut self) -> Reading {
         let charging = self.charge_stat.is_low();
         let (millivolts, percent) = self.battery.read(charging).await;
-        Some(BatteryStatus {
-            millivolts,
-            percent,
-            charging,
+        Reading::Observed(Observation {
+            charging: Some(charging),
+            // The BQ25101's STAT pin is charging / not-charging only; it has
+            // no separate "complete" state to report.
+            charge_complete: None,
+            percent: Some(percent),
+            millivolts: Some(millivolts),
         })
     }
 }
@@ -167,6 +177,13 @@ pub struct BoardPins {
     pub status: StatusIndicator,
     pub power: Power,
     pub rumble: Rumble,
+    /// The SPIM pair, trigger and clock pins for the hardware reply capture
+    /// (`maple::spim_capture`). This board's only RX capture backend, so
+    /// always `Some` — `board-xiao` implies `spim-capture`. `None`
+    /// only on a board with no pins to spare for the clocks, which reads
+    /// replies with the CPU sampling loop instead (dk).
+    #[cfg(feature = "spim-capture")]
+    pub spim_capture: Option<crate::maple::spim_capture::Parts>,
 }
 
 /// Board-specific Embassy config: enable the DC/DC regulator (REG1).
@@ -226,6 +243,25 @@ pub fn init(p: Peripherals) -> BoardPins {
 
     let battery = BatteryReader::new(p.P0_14, p.P0_31, p.SAADC);
 
+    // Hardware reply capture — the RX backend on this board: SPIM1/SPIM2 listen on the Maple lines by PSEL; their clocks go
+    // out on P1.01 and P1.02, which the XIAO nRF52840 module routes to no pad
+    // (Seeed's schematic for the module lists P1.11–P1.15 as the only port-1
+    // pins, and the Sense variant's mic and IMU sit on P1.00, P0.16, P0.07, P0.27, P0.11
+    // and P1.08; the Plus, whose pads do include P1.01, is not this module).
+    // SPIM0 is TWISPI0, left free for a carrier's I²C; SPIM3 has anomaly 198.
+    // Identical to pulsarv1's block — same module, same silicon.
+    #[cfg(feature = "spim-capture")]
+    let spim_capture = Some(crate::maple::spim_capture::Parts {
+        spim_a: p.TWISPI1,
+        spim_b: p.SPI2,
+        gpiote: p.GPIOTE_CH0,
+        ppi: p.PPI_CH0,
+        ppi_oneshot: p.PPI_CH1,
+        ppi_group: p.PPI_GROUP0,
+        sck_a: p.P1_01.into(),
+        sck_b: p.P1_02.into(),
+    });
+
     BoardPins {
         sdcka,
         sdckb,
@@ -238,6 +274,8 @@ pub fn init(p: Peripherals) -> BoardPins {
             battery,
         },
         rumble: Rumble,
+        #[cfg(feature = "spim-capture")]
+        spim_capture,
     }
 }
 

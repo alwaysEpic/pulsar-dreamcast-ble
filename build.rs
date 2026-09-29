@@ -22,6 +22,11 @@ const BYTES: usize = WIDTH * HEIGHT / 8;
 // diagnostics are no worse than a panic's — and the failure paths are explicit.
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
+    // memory.x is a linker input, not a rustc one, so without this line an edit
+    // to it never relinks: cargo re-uplifts the cached ELF and ci.sh checks a
+    // binary built from the previous script (2026-09-15 — the
+    // .maple_text section was absent from one of five "fresh" builds).
+    println!("cargo:rerun-if-changed=memory.x");
 
     let out_dir = env::var("OUT_DIR")?;
     let out_path = Path::new(&out_dir).join("glyph_dreamcast.rs");

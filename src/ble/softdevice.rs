@@ -4,7 +4,7 @@
 //! `SoftDevice` initialization and BLE advertising.
 
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
-use nrf_softdevice::ble::{peripheral, Connection};
+use nrf_softdevice::ble::{peripheral, Address, AddressType, Connection, TxPower};
 use nrf_softdevice::{raw, Softdevice};
 
 use crate::ble::hid::GamepadServer;
@@ -85,7 +85,26 @@ fn softdevice_config(gap_name: &'static [u8]) -> nrf_softdevice::Config {
             conn_count: 1,
             event_length: 6, // Allow short events for fast intervals
         }),
-        conn_gatt: Some(raw::ble_gatt_conn_cfg_t { att_mtu: 64 }),
+        // 247, up from the 64 set in the first HID commit (`01b9883`) with no
+        // recorded reason. A VMU frame is 192 bytes and an ATT write command
+        // spends 3 on the opcode and handle, so 195 is the floor for pushing a
+        // whole frame in one write; 247 is the largest MTU that
+        // still fits a 251-byte link-layer payload, so asking for more would
+        // only fragment.
+        //
+        // The MTU is a ceiling, not a promise: the host proposes its own in the
+        // Exchange MTU procedure and the smaller of the two wins. A sender that
+        // ends up under 195 falls back to four 49-byte row writes, which is why
+        // that shape exists and must keep working — 0.5.0 and earlier
+        // requested an MTU of 64, and a host may still offer less than 195.
+        //
+        // Without Data Length Extension a 192-byte write still fragments into
+        // 27-byte LL packets — ~8 packets, ~2 connection events. That is fine at
+        // LCD rates and deliberately not "fixed" with DLE: longer LL packets
+        // mean longer connection events, and the Maple poll lives in the quiet
+        // gap between them (see the poll pacer in main.rs). Do not raise this
+        // without a capture.
+        conn_gatt: Some(raw::ble_gatt_conn_cfg_t { att_mtu: 247 }),
         gatts_attr_tab_size: Some(raw::ble_gatts_cfg_attr_tab_size_t {
             attr_tab_size: 2048,
         }),
@@ -107,6 +126,18 @@ fn softdevice_config(gap_name: &'static [u8]) -> nrf_softdevice::Config {
                 raw::BLE_GATTS_VLOC_STACK as u8,
             ),
         }),
+        // GAP + GATT must end at handle 0x0008, as on a real Xbox One S, so our
+        // services land on its handles (see `HidService`). That
+        // means GAP without the Central Address Resolution characteristic (a
+        // peripheral has no use for it) and GATT without Service Changed. The
+        // cost of the second: a host that bonded before a GATT layout change
+        // keeps a stale table and must re-pair — as a real pad's hosts do.
+        gap_car_incl: Some(raw::ble_gap_cfg_car_incl_cfg_t {
+            include_cfg: raw::BLE_GAP_CHAR_INCL_CONFIG_EXCLUDE_WITHOUT_SPACE as u8,
+        }),
+        gatts_service_changed: Some(raw::ble_gatts_cfg_service_changed_t {
+            _bitfield_1: raw::ble_gatts_cfg_service_changed_t::new_bitfield_1(0),
+        }),
         ..Default::default()
     }
 }
@@ -121,7 +152,15 @@ fn softdevice_config(gap_name: &'static [u8]) -> nrf_softdevice::Config {
 #[must_use]
 pub fn init_softdevice(profile: &Profile) -> &'static mut Softdevice {
     let config = softdevice_config(profile.gap_name);
-    Softdevice::enable(&config)
+    let sd = Softdevice::enable(&config);
+    if let Some(prefix) = profile.public_prefix {
+        // Keep the chip's own low three bytes so units still differ from each
+        // other; `Address` bytes are little-endian, so the prefix is the top three.
+        let own = nrf_softdevice::ble::get_address(sd).bytes();
+        let bytes = [own[0], own[1], own[2], prefix[2], prefix[1], prefix[0]];
+        nrf_softdevice::ble::set_address(sd, &Address::new(AddressType::Public, bytes));
+    }
+    sd
 }
 
 /// Initialize the SoftDevice for the isolated configuration personality.
@@ -215,6 +254,15 @@ pub enum AdvertiseMode {
 /// Tracks last advertise mode to log only on change.
 static LAST_ADV_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
 
+/// Transmit power for advertising — and so for the connection, which S140
+/// documents as inheriting the power of the advertiser that led to it.
+///
+/// Nothing set this before 0.6.0: advertising took the 0 dBm default and
+/// the connection inherited it, on a part that offers +8. The cost is TX current during a
+/// 16-byte notify every ~11 ms — a fraction of a milliamp averaged, against a
+/// 5 V boost feeding a Dreamcast controller.
+pub const TX_POWER: TxPower = TxPower::Plus8dBm;
+
 /// Start BLE advertising based on mode.
 ///
 /// - `SyncMode`: General Discoverable, visible in Bluetooth menus, accepts any pairing
@@ -234,6 +282,7 @@ pub async fn advertise(
             let config = peripheral::Config {
                 interval: 32, // 32 * 0.625ms = 20ms (fast)
                 timeout: None,
+                tx_power: TX_POWER,
                 ..Default::default()
             };
             (
@@ -248,6 +297,7 @@ pub async fn advertise(
             let config = peripheral::Config {
                 interval: 32,        // 32 * 0.625ms = 20ms (fast for quick reconnection)
                 timeout: Some(1000), // 1000 * 10ms = 10s
+                tx_power: TX_POWER,
                 ..Default::default()
             };
             (
@@ -263,6 +313,7 @@ pub async fn advertise(
             let config = peripheral::Config {
                 interval: 800,       // 800 * 0.625ms = 500ms (saves ~22uA vs 100ms)
                 timeout: Some(1000), // 1000 * 10ms = 10s
+                tx_power: TX_POWER,
                 ..Default::default()
             };
             (

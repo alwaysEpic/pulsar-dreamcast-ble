@@ -16,16 +16,33 @@ pub mod commands {
     pub const DEVICE_INFO_REQUEST: u8 = 0x01;
     /// Device info response.
     pub const DEVICE_INFO_RESPONSE: u8 = 0x05;
+    /// The device's acknowledgement of a command that returns no data: an
+    /// LCD frame or a storage write phase taken, a commit accepted.
+    pub const ACK: u8 = 0x07;
     /// Get condition (read controller state).
     pub const GET_CONDITION: u8 = 0x09;
+    /// Get last error — the storage function's commit, addressed to phase 4
+    /// of the block whose four `BLOCK_WRITE` phases precede it.
+    pub const GET_LAST_ERROR: u8 = 0x0D;
+    /// The storage function's error reply; the payload word says which.
+    pub const FILE_ERROR: u8 = 0xFB;
     /// Condition response.
     pub const CONDITION_RESPONSE: u8 = 0x08;
+    /// Data transfer response.
+    ///
+    /// The reply to a storage `BLOCK_READ`. Shares its code with
+    /// `CONDITION_RESPONSE`; the function word in the payload is what tells the
+    /// two apart, which is why `block_read` checks the location as well as the
+    /// command.
+    pub const DATA_TRANSFER: u8 = 0x08;
 }
 
 /// Maple Bus function codes (device types).
 pub mod functions {
     /// Standard controller.
     pub const CONTROLLER: u32 = maple_protocol::controller_state::CONTROLLER_FUNCTION;
+    /// Memory card storage — the VMU's block-addressed flash.
+    pub const STORAGE: u32 = 0x0000_0002;
 }
 
 /// Maple Bus addressing.
@@ -211,12 +228,16 @@ impl MapleHost {
     /// sub-peripheral, so a bare port-1 controller answers as `0x20` and one
     /// with a VMU in slot 1 answers as `0x21`.
     ///
-    /// Presence therefore rides the controller's own device-info reply — the RX
-    /// path this firmware already decodes reliably on every detect. The previous
-    /// approach, addressing the VMU directly at `0x01`, never decoded a single
-    /// reply: the sub-peripheral answers with different latency than the
-    /// controller, so `read_packet_bulk`'s sample-index alignment heuristic
-    /// started mid-start-pattern and every frame parsed as noise.
+    /// Presence rides the controller's own device-info reply, which reports
+    /// every slot and costs no transaction addressed to the VMU itself.
+    ///
+    /// That is *not* because addressing the VMU at `0x01` fails. It did when
+    /// this method was written: `read_packet_bulk` then took alignment from a
+    /// sample-index latency threshold calibrated to the controller, and the
+    /// VMU's replies parsed as noise. `e8ee520` replaced the threshold with
+    /// `wire::find_data_start` the same day, and a bench run on 2026-09-11
+    ///  decoded the VMU's device-info reply at `0x01` 20/20, against
+    /// 18/20 for the controller in the same run.
     pub fn sub_peripheral_mask(&self, bus: &mut MapleBus) -> Option<u8> {
         let packet = MaplePacket {
             sender: addressing::HOST,
@@ -236,11 +257,11 @@ impl MapleHost {
 
     /// Send a `DEVICE_INFO` request to the VMU sub-peripheral to enumerate it.
     ///
-    /// The VMU will not accept `BLOCK_WRITE` until it has been enumerated, so
-    /// this is still sent for its side effect. **Do not use the return value to
-    /// decide presence** — use [`Self::sub_peripheral_mask`]. The VMU's reply to
-    /// a direct `0x01` request has never decoded on this firmware (see that
-    /// method's note), so this reports `false` even with a working VMU.
+    /// Sent for its side effect: a freshly docked VMU ignored LCD `BLOCK_WRITE`s
+    /// (no reply at all, nothing drawn) until it was asked for device info, then
+    /// acknowledged every one (bench, 2026-09-11, — not excluded: the VMU
+    /// still waking in the ~1.5 s after dock). The return value is real — the
+    /// reply decodes — but presence comes from [`Self::sub_peripheral_mask`].
     pub fn enumerate_vmu(&self, bus: &mut MapleBus) -> bool {
         let packet = MaplePacket {
             sender: addressing::HOST,

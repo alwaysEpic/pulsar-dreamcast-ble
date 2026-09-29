@@ -23,6 +23,9 @@ enum HoldResult {
     ShortPress,
     /// Held 2s — sync mode triggered.
     SyncMode,
+    /// Held 2s while acked saves were draining onto the VMU — pairing refused.
+    /// Counts as no press, like the other hold outcomes.
+    SyncRefused,
     /// Held 7s — goodbye splash + System Off in progress.
     Goodbye,
     /// The DFU gesture was taken. Distinct from `ShortPress` on purpose: the
@@ -100,7 +103,22 @@ async fn handle_button_hold(
             crate::GOODBYE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
 
             // Wait for release (LED stays solid as visual confirmation).
+            //
+            // Main may be *deferring* the goodbye it was just handed: while
+            // the VMU storage service is draining acked saves onto the card,
+            // sleeping would lose them. Holding on to `FORCE_OFF_MS` is the
+            // person's way of saying "I do not care" — the escape a unit with
+            // no power switch has to have. Stored once and left set; the main
+            // task acts on it at its next pass.
+            let mut forced = false;
             while button.is_low() {
+                if !forced
+                    && press_start.elapsed().as_millis() >= maple_protocol::sync_hold::FORCE_OFF_MS
+                {
+                    log!("SYNC: 15s hold — forcing shutdown, drain or no drain");
+                    crate::SHUTDOWN_FORCED.store(true, core::sync::atomic::Ordering::Relaxed);
+                    forced = true;
+                }
                 Timer::after(Duration::from_millis(50)).await;
             }
             return HoldResult::Goodbye;
@@ -138,12 +156,17 @@ async fn handle_button_hold(
             );
             crate::DFU_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
             // Distinct confirmation: a fast triple flash (the reset usually
-            // lands mid-flash — that's fine, the flag is already set).
-            for _ in 0..3 {
-                led.set_low();
-                Timer::after(Duration::from_millis(40)).await;
-                led.set_high();
-                Timer::after(Duration::from_millis(40)).await;
+            // lands mid-flash — that's fine, the flag is already set). Not
+            // while saves are draining: main refuses the update then, and the
+            // flash would say it was taken. Main still gets the flag, to log
+            // and show SAVE.
+            if !crate::ble::host_vmu::draining() {
+                for _ in 0..3 {
+                    led.set_low();
+                    Timer::after(Duration::from_millis(40)).await;
+                    led.set_high();
+                    Timer::after(Duration::from_millis(40)).await;
+                }
             }
         }
 
@@ -159,9 +182,21 @@ async fn handle_button_hold(
             && !config_requested
         {
             config_requested = true;
-            log!("SYNC: configuration gesture — requesting isolated personality");
-            if !crate::reboot_into_config() {
-                log!("SYNC: GPREGRET2 configuration marker write failed");
+            // Refused while acked saves are draining onto the VMU, as the
+            // update gesture is in main: this reset is immediate and loses the
+            // queue, and it is not the 15 s hold that says the person accepts
+            // that. Asked directly rather than handed to
+            // main: the service's mutex is thread-mode and this task runs on
+            // the same executor as the poll loop and the GATT dispatch, so
+            // the answer cannot change under the call. `config_requested`
+            // stays latched so release does not fall through into pairing.
+            if crate::ble::host_vmu::draining() {
+                log!("SYNC: configuration gesture refused — saves still draining to the VMU");
+            } else {
+                log!("SYNC: configuration gesture — requesting isolated personality");
+                if !crate::reboot_into_config() {
+                    log!("SYNC: GPREGRET2 configuration marker write failed");
+                }
             }
         }
 
@@ -169,8 +204,8 @@ async fn handle_button_hold(
     }
 
     // Only signal sync mode on release — not if held through to sleep, and not
-    // once the DFU gesture has been recognised. Sync clears the flash bond, and
-    // the user asking to update firmware has not asked to be unpaired; without
+    // once the DFU gesture has been recognised. Sync opens a replacement window,
+    // and the user asking to update firmware has not asked to re-pair; without
     // this guard, a DFU request that the low-battery check refuses still costs
     // them their pairing on release.
     if config_requested {
@@ -178,14 +213,26 @@ async fn handle_button_hold(
     }
 
     match gesture.release() {
+        // Refused while acked saves are draining onto the VMU, as sleep, the
+        // update and the configuration gestures are. Pairing mode drops the
+        // link at once, and a drop in `SyncMode` does not hold the poll loop
+        // for the drain, so every staged block would come back DISCARDED —
+        // from a gesture the manual describes as harmless. The check also
+        // closes write admission when it passes: the BLE task drops the link
+        // only once it takes the signal, and a save acked in between would be
+        // lost the same way.
+        Release::SyncMode if !crate::ble::host_vmu::pause_writes_unless_draining() => {
+            log!("SYNC: pairing gesture refused — saves still draining to the VMU");
+            HoldResult::SyncRefused
+        }
         Release::SyncMode => {
             log!("SYNC: Entering pairing mode (60s)");
             SYNC_MODE.signal(());
             HoldResult::SyncMode
         }
-        // Deliberately not SyncMode: pairing clears the bond, and asking for a
-        // firmware update is not asking to be unpaired. Covered by
-        // `sync_hold::tests::dfu_gesture_does_not_clear_the_bond`.
+        // Deliberately not SyncMode: pairing opens a replacement window, and
+        // asking for a firmware update is not asking to re-pair. Covered by
+        // `sync_hold::tests::dfu_gesture_does_not_open_a_pairing_window`.
         Release::DfuRequested => HoldResult::DfuRequested,
         Release::ShortPress => HoldResult::ShortPress,
     }
@@ -212,6 +259,15 @@ async fn blink_wait(button: &Input<'static>, ms: u64) -> bool {
 
 /// Handle triple-press detection and profile toggle.
 async fn handle_triple_press(led: &mut Output<'static>) {
+    // Refused while acked saves are draining onto the VMU, as pairing is: the
+    // BLE task resets the chip as soon as it takes the signal, which loses the
+    // queue. Tapping sync to reconnect mid-drain is the documented move, and
+    // three taps inside the window get here. The check also closes write
+    // admission when it passes, so no save is acked before the reset.
+    if !crate::ble::host_vmu::pause_writes_unless_draining() {
+        log!("PROFILE: triple-press refused — saves still draining to the VMU");
+        return;
+    }
     let current = crate::ble::prefs::load_prefs().profile_id;
     let next = current.next();
     log!(
@@ -308,6 +364,7 @@ pub async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) 
                         // we are already in, and DfuRequested must not count as a
                         // press — all three just reset the run.
                         HoldResult::SyncMode
+                        | HoldResult::SyncRefused
                         | HoldResult::Goodbye
                         | HoldResult::DfuRequested
                         | HoldResult::ConfigRequested => {
@@ -347,6 +404,7 @@ pub async fn sync_button_task(button: Input<'static>, mut led: Output<'static>) 
             // counter is already at 2 — counting this release would make it 3 and
             // toggle the profile as a parting gift for a refused update.
             HoldResult::SyncMode
+            | HoldResult::SyncRefused
             | HoldResult::Goodbye
             | HoldResult::DfuRequested
             | HoldResult::ConfigRequested => {

@@ -12,3 +12,10 @@ workspace = true
 
 [dependencies]
 heapless = "0.8.0"
+
+[features]
+# Per-edge instrumentation on the block decoder — run lengths, double
+# transitions, pause positions, the last edge, the skipped count. Read only by
+# the read diagnostic; it costs cycles at every edge, so production builds
+# leave it off.
+decode-stats = []

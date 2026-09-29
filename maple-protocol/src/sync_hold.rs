@@ -36,8 +36,8 @@
 //! Two release rules are load-bearing and are the reason this is tested rather
 //! than trusted:
 //!
-//! - **Holding through to sleep does not pair.** Sync clears the bond, and
-//!   someone putting the device away has not asked to be unpaired.
+//! - **Holding through to sleep does not pair.** Sync opens a replacement
+//!   window, and someone putting the device away has not asked to re-pair.
 //! - **Taking the DFU gesture does not pair either.** Asking for a firmware
 //!   update is not asking to be unpaired. This matters most when the caller's
 //!   battery gate then *refuses* the update: before this rule, a refused update
@@ -49,6 +49,14 @@ pub const SYNC_MS: u64 = 2_000;
 pub const DFU_MS: u64 = 3_500;
 /// Hold duration that commits to sleep.
 pub const SLEEP_MS: u64 = 7_000;
+/// Hold duration past the sleep commit that makes it unconditional.
+///
+/// The commit at [`SLEEP_MS`] is *deferred* while acked saves are still
+/// draining onto the VMU. A drain that will not finish
+/// needs a physical way out on a unit with no power switch, so holding on to
+/// here forces the shutdown: the queue is lost and the generation moves, and
+/// that is the documented cost of the escape, not a timeout.
+pub const FORCE_OFF_MS: u64 = 15_000;
 
 /// Short presses that must immediately precede the hold to arm DFU without a
 /// controller — "tap, tap, hold".
@@ -109,7 +117,8 @@ pub enum Release {
     /// Released before [`SYNC_MS`] — treat as a short press (wake / reconnect).
     ShortPress,
     /// Released after [`SYNC_MS`] without taking the DFU gesture — enter
-    /// pairing mode. **This clears the bond.**
+    /// pairing mode. **This opens a replacement window**: the stored bond is
+    /// kept and is replaced only if a new host completes pairing.
     SyncMode,
     /// Released after requesting DFU. Deliberately *not* `SyncMode`: the bond
     /// must survive, including when the caller refuses the update.
@@ -218,9 +227,11 @@ mod tests {
     }
 
     /// The regression this module exists for: a hold that takes the DFU gesture
-    /// must not also pair, because pairing clears the bond.
+    /// must not also open a pairing window. Asking for a firmware update is not
+    /// asking to re-pair, and a window offers the bond to whatever else is
+    /// listening for the next 60 s.
     #[test]
-    fn dfu_gesture_does_not_clear_the_bond() {
+    fn dfu_gesture_does_not_open_a_pairing_window() {
         let (g, ticks) = hold_to(DFU_MS + 100, true);
         assert!(ticks.contains(&Tick::RequestDfu));
         assert!(g.dfu_requested());

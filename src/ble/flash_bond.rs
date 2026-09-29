@@ -37,7 +37,13 @@ const PAGE_SIZE: u32 = 4096;
 /// (e.g. the 2026-06-10/11 SoftDevice assert reboot loops, which saved the
 /// bond on every reconnect cycle) left valid-magic records with garbage
 /// LTK/identity that were then fed to the SoftDevice on every boot.
-const BOND_MAGIC: u32 = 0xB00D_DB02;
+///
+/// V3 (`…DB03`) keeps V2's record layout; only the magic moved. The
+/// GATT table was re-laid out and GATT Service Changed removed, so a host
+/// bonded before the change could never learn its cached table is stale. A
+/// Generic-profile host would reconnect on the unchanged address and read the
+/// wrong handles. Discarding every V2 record makes each unit re-pair once.
+const BOND_MAGIC: u32 = 0xB00D_DB03;
 
 /// FNV-1a over the record body (everything after `magic` and `crc`), used to
 /// reject torn or bit-rotted bond records at load.
@@ -166,7 +172,10 @@ pub fn load_bond() -> Option<(MasterId, EncryptionInfo, IdentityKey, &'static [u
     Some((master_id, enc_info, peer_id, sys_attrs))
 }
 
-/// Clear bonding data from flash (for sync/pairing mode)
+/// Clear bonding data from flash.
+///
+/// Not called on entry to pairing mode any more — the bond is retained through
+/// the window and replaced only on a successful `on_bonded`.
 pub async fn clear_bond(flash: &mut Flash) -> Result<(), ()> {
     // Erase the flash page - this invalidates the magic number
     flash

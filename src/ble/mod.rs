@@ -9,6 +9,15 @@
 pub mod config;
 pub mod flash_bond;
 pub mod hid;
+pub mod host_lcd;
+// the host side of VMU storage — READ in, DATA out.
+//
+// Not behind `spim-capture`, although only a board with the capture can serve
+// a read: the GATT table is one table for every board and every personality
+// (see `hid::HostService`), and the `gatt_service` macro does not carry a
+// `cfg` on a characteristic through anyway. A board that cannot read answers
+// `NO_VMU`, which is a better thing for a dongle to hear than silence.
+pub mod host_vmu;
 pub mod prefs;
 pub mod profile;
 pub mod security;
