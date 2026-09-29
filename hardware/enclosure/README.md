@@ -9,7 +9,7 @@ hand-wired XIAO build and the Pulsar v1 carrier are different shapes inside.
 
 | Folder | For | Notes |
 |---|---|---|
-| `dreamcast_vmu_*.stl` (loose, at the top of `Edited_VMU_stls/`) | **[The hand-wired XIAO build](../docs/build/xiao.md)** | Front plus three back variants — plain, `_cutout`, and `_w_cutout` — differing in the opening for your wiring. Print the front and whichever back suits how you routed the cable |
+| `dreamcast_vmu_*.stl` (loose, at the top of `Edited_VMU_stls/`) | **[The hand-wired XIAO build](../../docs/build/xiao.md)** | Front plus three back variants — plain, `_cutout`, and `_w_cutout` — differing in the opening for your wiring. Print the front and whichever back suits how you routed the cable |
 | `PulsarFit_703035/` | **Pulsar v1 carrier**, 703035 cell | The baseline fit: a 7.0 × 30 × 35 mm, ~800 mAh pouch. Clearance at the dome crown is ~0.5 mm, so it wants that cell. Ships a `PRINT_PLATE.stl` with the parts laid out |
 | `PulsarFit_bigcell/` | **Pulsar v1 carrier**, larger cells | Same rear and plunger; the **front** hollows the dome to a constant 1.0 mm wall, raising crown clearance to ~1.5 mm so taller pouches fit. Includes `pulsar_bigcell.3mf` — the slicer project with orientation, supports and settings the STLs alone do not carry |
 | `PulsarFit_bigcell_cable_relief/` | **Pulsar v1 carrier**, big cell, cable-corner relief | ⚠️ **Experimental — not yet fit-tested.** Adds a filleted relief cut at the cable corner of *both* halves, for a pinch between the shell corner and the controller's connector housing. Print it only if you hit that pinch. Includes `pulsar_bigcell_cable_relief.3mf` |
