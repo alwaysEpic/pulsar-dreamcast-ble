@@ -158,7 +158,7 @@ so a failure on a debug build tells you nothing.
 
 | Field | Value |
 |-------|-------|
-| **Steps** | 1. Flash DUT with cleared flash (or hold sync 3s to clear bond). 2. Power on. 3. Observe LED enters sync mode (blink) automatically. 4. Open Bluetooth settings on host, scan for "Xbox Wireless Controller". 5. Pair. |
+| **Steps** | 1. Flash DUT with cleared flash — the sync gesture no longer clears a bond. 2. Power on. 3. Observe LED enters sync mode (blink) automatically. 4. Open Bluetooth settings on host, scan for "Xbox Wireless Controller". 5. Pair. |
 | **Expected** | DUT auto-enters sync mode when no bond exists. Host discovers device, pairing completes with JustWorks. LED goes solid on connect. |
 | **Pass/Fail** | Pairing completes within 30 seconds. LED behavior matches spec. |
 | **Equipment** | DUT, laptop or phone |
@@ -177,8 +177,8 @@ so a failure on a debug build tells you nothing.
 | Field | Value |
 |-------|-------|
 | **Steps** | 1. Power on DUT with existing bond. 2. Hold sync button for 2 seconds. 3. Observe LED behavior (slow blink -> fast blink at 2s). 4. Release button. |
-| **Expected** | After 2s hold, DUT clears bond, enters sync mode (discoverable), LED blinks. RTT log shows "SYNC: Entering pairing mode (60s)". |
-| **Pass/Fail** | Bond cleared, new host can discover and pair. |
+| **Expected** | After 2s hold, DUT enters sync mode (discoverable), LED blinks, and **retains the stored bond**. RTT log shows "SYNC: Entering pairing mode (60s)". |
+| **Pass/Fail** | New host can discover and pair; the stored bond is replaced only once that pairing completes. Letting the window lapse returns the DUT to the original host. |
 | **Equipment** | DUT, SWD debugger (RTT), host device |
 
 ### BLE-04: Sync Mode Timeout (60 Seconds)
@@ -644,8 +644,8 @@ so a failure on a debug build tells you nothing.
 | Field | Value |
 |-------|-------|
 | **Steps** | 1. DUT connected and operating normally. 2. Hold sync button for 2 seconds. |
-| **Expected** | Enters sync mode, clears bond, disconnects from current host, becomes discoverable. |
-| **Pass/Fail** | Clean transition to sync mode. Old host cannot reconnect without re-pairing. |
+| **Expected** | Enters sync mode, disconnects from the current host, becomes discoverable, and keeps the stored bond. |
+| **Pass/Fail** | Clean transition to sync mode. The old host cannot reconnect on its stored key while the window is open; if the window lapses, it reconnects normally. |
 | **Equipment** | DUT, host |
 
 ### EDGE-08: Simultaneous Sleep and BLE Activity

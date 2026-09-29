@@ -84,9 +84,14 @@ a docked VMU is blank. That is normal, not a fault.**
 The adapter remembers your host and reconnects on its own from then on. Just press sync to
 wake it.
 
-**Pulsar holds one pairing at a time**, like an Xbox controller. Pairing to a new host
-means the old one still lists the adapter and won't reconnect to it — forget the adapter
-there before pairing it back.
+**Pulsar holds one pairing at a time**, like an Xbox controller, and while paired it turns
+away any other device that tries to pair. Pairing mode does not forget your current host: let the 60 seconds lapse and the adapter goes straight back to it.
+The old pairing is replaced only once a new host finishes pairing — and from then on the old
+host still lists the adapter and won't reconnect to it, so forget the adapter there before
+pairing it back.
+
+A brief drop at the edge of range does not reset the controller: the adapter keeps it and the
+VMU powered for 10 seconds after the link drops, so a quick reconnect carries on.
 
 ---
 
@@ -124,20 +129,22 @@ Guide in Steam Input if you want the overlay there.
 
 ## 4. The sync button
 
-One button, five gestures. The LED blinks while you hold, and **blinks faster once you pass
+One button, several gestures. The LED blinks while you hold, and **blinks faster once you pass
 2 seconds**, so you can see the next step coming and release in time.
 
 | Gesture | What happens |
 |---|---|
 | **Short press** | Wake, or ask to reconnect |
-| **Hold 2 s** | Pairing mode for 60 s — clears the current pairing |
+| **Hold 2 s** | Pairing mode for 60 s — keeps the current pairing until a new host pairs. Refused while a VMU save is being written |
 | **Triple-press** | Switch profile (Xbox ⇄ Dreamcast), then reboot |
 | **Hold 3.5 s, with the controller's Start held** | Firmware update mode |
 | **Tap, tap, then hold 3.5 s** | Firmware update mode, no controller needed |
 | **Tap once, then hold 3.5 s** | [Browser configuration mode](#remapping-your-buttons) — remap buttons |
-| **Hold 7 s** | Sleep — shows `BYE`, then powers down |
+| **Hold 7 s** | Sleep — shows `BYE`, then powers down. Waits for a [VMU save](#6-the-vmu-display) still being written |
+| **Hold 15 s** | Sleep now, even mid-save — the blocks not yet written are lost |
 
-Entering update mode does **not** clear your pairing. Only the 2-second hold does that.
+Entering update mode does **not** clear your pairing. Only a new host finishing pairing
+replaces it.
 
 The three tap-then-hold gestures differ only in **how many taps come before the hold**: one
 tap is configuration, two is the controller-free update, and three short presses with no
@@ -192,6 +199,7 @@ gauge. They're deliberately dim to avoid glare.
 | Blue sweep across the bar | Starting up |
 | Dim red | Looking for the controller |
 | Dim green | Controller connected |
+| Dim amber | Writing a save to the VMU — leave it docked |
 | Blue, blinking | Sync button held, or in pairing mode |
 | Blue, blinking faster | You're past 2 seconds — keep holding and it sleeps |
 | Five quick flashes | Profile switched, rebooting |
@@ -199,7 +207,9 @@ gauge. They're deliberately dim to avoid glare.
 
 **LEDs 1–4 are the battery gauge**, in magenta — a different color from the status LED so
 the two can't be confused. They stay lit through status changes, so losing the controller
-doesn't blank your battery reading.
+doesn't blank your battery reading. **LED 1 in dim red means the battery is empty** — beside
+a red status LED, that is a cell too low to power the controller, not a faulty controller.
+Charge it.
 
 A lit bar means the battery is connected. It does not tell you the controller has power —
 that only happens once a host connects.
@@ -231,6 +241,13 @@ exactly like an unpowered one. The chirp on connect is the reliable sign it has 
 Animating the display costs roughly 5–10% of battery life against running with no VMU
 docked.
 
+**Programs on your host can use the VMU too** — draw their own screen, and read and write
+your saves — over a Bluetooth service Pulsar publishes for anyone to build against
+([host_integration.md](host_integration.md)). Reads happen only while the pad is put down.
+While a save is being written, a small **disk icon** shows in the LCD's top-left corner and
+the status LED turns amber: **don't pull the VMU until it clears.** Sleep waits for the save
+to finish, and pairing mode is refused until it does; hold sync 15 seconds to sleep anyway.
+
 ---
 
 ## 7. Battery and charging
@@ -252,6 +269,9 @@ bars.** That is not a fifth level — it replaces the reading, and the level com
 moment you unplug. A charger holds the battery's voltage up, so any level measured while
 charging reads high; the bolt says the number would be misleading rather than showing you a
 wrong one. If the icon is completely empty, charge it now.
+
+Once charging finishes with the cable still in, the gauge reads **full**. (The chip reads a
+rested full battery as 75 %; Pulsar shows 100 % when the charger says it is done.)
 
 ---
 
@@ -286,6 +306,11 @@ install.
 4. Open the update page in a supported browser and follow it through.
 
 Updates are signed, so the adapter only accepts official firmware.
+
+> **Updating to v0.6.0: pair again, once.** Old pairings are not carried across this update.
+> The adapter will not reconnect on its own, even though your host may still list it as
+> paired. Forget it in the host's Bluetooth settings, hold sync for 2 seconds, and pair fresh.
+> It may appear as a new device; remove the old entry. Later updates keep your pairing.
 
 ### Your browser has to support Web Bluetooth
 
@@ -329,7 +354,8 @@ controller only once a Bluetooth host connects. Connect your host: the VMU chirp
 status LED goes green. If it stays dark *after* connecting, keep reading.
 
 **The status LED stays red — the controller is never found**
-Check the lead is fully seated at both ends. On a self-wired unit, re-check your splice:
+First look at LED 1. If it is dim red, the battery is too low to power the controller:
+charge it and try again. Otherwise, check the lead is fully seated at both ends. On a self-wired unit, re-check your splice:
 continuity end to end on all five conductors, and no shorts between them. A miswired data
 line looks exactly like a dead controller.
 
@@ -337,6 +363,10 @@ line looks exactly like a dead controller.
 Hold sync for 2 seconds to force pairing mode — it's only discoverable for 60 seconds at a
 time. Stay within about 10 m. If this host paired with it before, forget the adapter there
 first, then pair fresh.
+
+**It won't reconnect after updating to v0.6.0**
+Expected, once. Forget the adapter on your host, hold sync 2 seconds, and pair fresh — see
+[§9](#9-updating-the-firmware).
 
 **It won't reconnect after I paired it to something else**
 Pulsar holds one pairing. Forget it on the device you're trying to return to, then hold sync

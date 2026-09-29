@@ -54,6 +54,10 @@ After the first pairing, the adapter reconnects automatically:
 
 No need to re-pair each time.
 
+A short drop — walking to the edge of range, a host that blinks its Bluetooth — does not
+power-cycle the controller. The adapter keeps the controller, VMU and rumble pack powered for
+10 seconds after the link drops, so a quick reconnect picks up where it left off.
+
 ## Button Mapping
 
 | Dreamcast | Xbox Equivalent |
@@ -85,12 +89,13 @@ The Dreamcast pad has no Guide button, so it's a chord: **pull Left Trigger + Ri
 | Action | Result |
 |---|---|
 | Short press | Wake / request reconnect |
-| Hold 2s | Pairing mode (60s) — clears the current bond |
-| Hold 3.5s **+ controller Start** | Firmware update mode (OTA) — *Pulsar v1 only* |
+| Hold 2s | Pairing mode (60s) — keeps the current bond until a new host pairs. Refused while a [VMU save](#host-programs-the-screen-and-your-saves) is being written |
+| Hold 3.5s **+ controller Start** | Firmware update mode (OTA) — *Pulsar v1 only*. Refused while a [VMU save](#host-programs-the-screen-and-your-saves) is being written |
 | Tap, tap, then hold 3.5s | Same update mode, **no controller needed** — *Pulsar v1 only* |
-| **Tap once, then hold 3.5s** | **Browser configuration mode** — [remap buttons](#remapping-buttons-from-your-browser) |
-| Hold 7s | Sleep — shows `BYE`, releases into deep sleep (the DK halts instead) |
-| Triple-press | Switch profile (Xbox ⇄ Dreamcast) and reboot |
+| **Tap once, then hold 3.5s** | **Browser configuration mode** — [remap buttons](#remapping-buttons-from-your-browser). Refused while a [VMU save](#host-programs-the-screen-and-your-saves) is being written |
+| Hold 7s | Sleep — shows `BYE`, releases into deep sleep (the DK halts instead). Waits for any [VMU save still being written](#host-programs-the-screen-and-your-saves) |
+| Hold 15s | Sleep **now**, even mid-save — the blocks not yet written are lost |
+| Triple-press | Switch profile (Xbox ⇄ Dreamcast) and reboot. Refused while a [VMU save](#host-programs-the-screen-and-your-saves) is being written |
 
 The three tap-then-hold gestures are told apart by the **number of taps before the hold**:
 one tap is configuration, two is controller-free update, three short presses (no hold at
@@ -99,13 +104,27 @@ counts as an ordinary hold.
 
 The sync LED blinks faster once you pass 2s, so you can see the next step coming before you reach it. Release at that point to pair; keep holding to sleep.
 
-**Firmware update** has two routes. The usual one needs both hands: hold the sync button past 3.5s *while* the Dreamcast controller's **Start** button is held. Three fast flashes confirm it. It is refused **below 50% battery** unless you are charging — the display shows `CHRG` if so. Holding past 3.5s with Start down does **not** clear your pairing.
+**Firmware update** has two routes. The usual one needs both hands: hold the sync button past 3.5s *while* the Dreamcast controller's **Start** button is held. Three fast flashes confirm it. It is refused **below 50% battery** unless you are charging — the display shows `CHRG` if so. It is also refused while a VMU save is being written: no flashes, and the display shows `SAVE` (unless a program owns the screen) — try again once the disk icon is gone. Holding past 3.5s with Start down does **not** clear your pairing.
 
 The second route needs no controller at all: **tap the sync button twice, then hold it past 3.5s**. Begin the hold within about two seconds of the first tap, or it counts as an ordinary hold. Two taps rather than three keeps it distinct from the profile toggle, which is three *short* presses. This exists so an adapter with nothing plugged in — or with a controller that has stopped responding — can still be updated.
 
 This gesture is for **Pulsar v1**, which updates wirelessly. On a XIAO or DK build the gesture does nothing useful — those boards are reflashed over USB or a probe instead. See [Updating the firmware](#updating-the-firmware).
 
-After holding 2s and pairing fresh, the **old** host still has us in its Bluetooth list. Forget the adapter there before it'll let you pair again — same as any single-bond controller (Xbox, etc.).
+Entering pairing mode does **not** forget the host you already have. Change your mind — let
+the 60 seconds lapse, or just walk away — and the adapter goes back to the host it was paired
+with and reconnects as though nothing happened. The bond is replaced only once a new host
+actually finishes pairing.
+
+Once a new host does pair, the **old** host still has the adapter in its Bluetooth list, and
+that entry is now stale. Forget the adapter there — same as any single-bond controller (Xbox,
+etc.). While the 60-second window is open the old host cannot reconnect on the pairing it
+already has; if it keeps interrupting, turn its Bluetooth off until the new host is paired.
+
+**If the computer forgets the adapter first**, the adapter does not know: it still holds its
+side of the pairing and keeps quietly trying to reconnect to a device that has stopped
+answering, then sleeps to save battery. It will **not** re-appear in the Bluetooth list on its
+own. Hold sync for 2 seconds to offer it up again — and start the computer's scan *before* the
+gesture, because the adapter is only discoverable for 60 seconds after it.
 
 ### Profiles
 
@@ -177,6 +196,32 @@ The profile splash holds for ~30 seconds after connect, then transitions to the 
 > **Battery note:** the VMU advances the pulsar animation about 4 times per second (every
 > ~260 ms), plus extra writes on splash transitions. This costs roughly 5–10% of battery life vs. running with no LCD activity. Worth it for the visual feedback, but worth knowing.
 
+### Host programs: the screen and your saves
+
+The adapter also offers a Bluetooth service that lets a program on the host reach the docked
+VMU: draw its own screen on the LCD, and read and write the memory card's save blocks. With
+no such program running, nothing changes — the adapter draws its own screens as above. The
+service is published for anyone to build against in
+[host_integration.md](host_integration.md), with reference scripts that push a frame and read
+a card.
+
+What you will notice when a program uses it:
+
+- **Its screen wins.** A host's frame replaces the pulsar while that host is connected, and
+  the adapter's own animation returns when the link drops.
+- **Reads wait for you to put the pad down.** The card is only read while the controller has
+  been untouched for about a second, so a transfer never costs you an input mid-game.
+- **Saves show a disk icon.** While a save is being written to the card, a small disk icon
+  sits in the top-left corner of the LCD and the status LED turns amber
+  ([LED Indicators](#led-indicators)). **Don't pull the VMU while it's showing.**
+- **Saves finish before sleep.** A save already accepted keeps being written for up to 30
+  seconds if the link drops, and the 7-second sleep hold waits for it — `BYE` appears once
+  the card is up to date. Hold for 15 seconds to sleep regardless; the blocks not yet
+  written are lost. The 2-second pairing hold, the update and configuration gestures and the
+  profile triple-press are all refused until the save is done.
+- **Only your paired host gets in.** While the adapter is paired, another device that tries
+  to pair with it is disconnected. To pair something new, hold sync for 2 seconds first.
+
 ## Battery & Charging
 
 The adapter monitors the LiPo battery and reports the level over Bluetooth (visible in your host device's Bluetooth settings or supported games), and draws it on the VMU.
@@ -195,6 +240,16 @@ How the level is measured depends on the board:
 
 Because the Pulsar v1 gauge moves in 25% steps, its indicator jumps between four states
 rather than sliding down gradually. That's the gauge, not a fault.
+
+On Pulsar v1:
+
+- **An empty gauge is dim red on LED 1**, not a dark bar — so "the battery is flat" can't be
+  mistaken for "no gauge". A cell too low to power the controller shows this beside the red
+  searching light: charge it, the controller is fine.
+- **The gauge is lit while searching for the controller** too, from two seconds into the
+  search, so a flat cell is visible even when nothing answers on the bus.
+- **A finished charge reads 100 %** while the cable is still in. The chip's own gauge reads a
+  rested full cell as 75 %; the adapter shows full once the charger reports it has finished.
 
 <p align="center"><img src="images/pulsar/edited/controller-underside-usbc.jpg" width="420" alt="USB-C port reachable through the slot opening on the controller underside, with a VMU in the second slot"></p>
 
@@ -248,19 +303,22 @@ The **DK** has no battery and no power management, so it halts on the sleep gest
 
 ## Updating the firmware
 
-> **Updating from v0.3.0 or earlier: you will need to pair again.**
+> **Updating to v0.6.0: you will need to pair again, once.**
 >
-> This release moves where the adapter stores its Bluetooth pairing, so the old bond is not
-> carried across. After updating, the adapter will not reconnect to your host on its own.
-> Forget the adapter in your host's Bluetooth settings, hold sync for 2 seconds, and pair
-> fresh. This is a one-time step — future updates keep your pairing.
+> v0.6.0 changes how the adapter presents itself over Bluetooth (so it works with the 8BitDo
+> USB Wireless Adapter 2), and old pairings are not carried across. The same was true of
+> updates from v0.3.0 or earlier. After updating, the adapter will not reconnect to your
+> host on its own, and the host may still list it as paired. Forget the adapter in your
+> host's Bluetooth settings, hold sync for 2 seconds, and pair fresh. It may appear as a new
+> device; remove the old entry. This is a one-time step — later updates keep your pairing.
 
 How you update depends on the board:
 
 **Pulsar v1 — wireless.** Hold sync past 3.5s with the controller's **Start** held; three fast
 flashes confirm it and the adapter reboots into update mode advertising as `PulsarDFU`. It is
 refused **below 50% battery** unless you're charging, showing `CHRG` on the VMU — charge first
-and retry. The update is signed, so the adapter only accepts official firmware.
+and retry — and while a VMU save is being written, showing `SAVE` — wait for the disk icon to
+clear and retry. The update is signed, so the adapter only accepts official firmware.
 
 > **There is no reset-button route into update mode on Pulsar v1, and no USB drive.**
 > Double-tapping reset does nothing, holding a button while powering on does nothing, and no
@@ -324,7 +382,10 @@ colours are deliberately dim to avoid glare through the shell window.
 |---|---|
 | Dim red | Searching for controller |
 | Dim green | Controller found / connected |
+| Dim amber | Writing a save to the VMU — leave it docked |
 | All dark | Sleeping, or idle and waiting for a host to connect |
+
+LED 1 lit dim red is the gauge reading empty — charge the battery.
 
 <p align="center"><img src="images/pulsar/edited/controller-back-led-bar.jpg" width="360" alt="Adapter in the VMU slot, status LED lighting the shell green"></p>
 
@@ -341,6 +402,7 @@ activity. LED1 is the sync LED.
 | Starting up | Green blink ×3 | — | Boot |
 | Searching | Solid red | LED4 on | Looking for the controller |
 | Connected | Solid green | LED3 on | Controller found |
+| Saving | Amber (red + green) | — (the DK does not write to a VMU) | Writing a save to the VMU |
 | Pairing mode | Fast blue blink | Sync LED blinking | Discoverable for 60s |
 | Sync held | Blink | Sync LED blink | Button held, action pending |
 | Past sync point | Faster blink | Faster blink | Approaching sleep |
@@ -360,6 +422,7 @@ status light, on the DK it's LED1.
   through the entry below.
 
 **Controller not detected (status stays on *searching* — red, or LED4 on the DK)**
+- On Pulsar v1, look at LED 1 first: dim red there means the battery is too low to power the controller. Charge it.
 - Check that the controller cable is securely connected to the adapter.
 - Make sure the controller is receiving 5V power.
 - Try unplugging and re-plugging the controller.
@@ -378,7 +441,7 @@ status light, on the DK it's LED1.
 - Use the controller-free chord instead: tap sync twice, then hold it past 3.5s, starting the hold within about two seconds of the first tap. If the firmware itself is broken or missing, the adapter enters update mode on its own at power-on without any gesture.
 
 **It won't reconnect after a firmware update**
-- Expected when coming from v0.3.0 or earlier — the pairing does not survive that update. Forget the adapter on your host, hold sync for 2 seconds, and pair fresh. See [Updating the firmware](#updating-the-firmware).
+- Expected after updating to v0.6.0 (or from v0.3.0 or earlier) — the pairing does not survive that update, even if your host still lists the adapter as paired. Forget the adapter on your host, hold sync for 2 seconds, and pair fresh. See [Updating the firmware](#updating-the-firmware).
 
 **Battery indicator jumps in big steps (Pulsar v1)**
 - Normal. The IP5306 gauge reports four levels, so the bar moves 100 → 75 → 50 → 25 rather than sliding down continuously.

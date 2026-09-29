@@ -28,6 +28,7 @@ yourself? [Start here](docs/build/xiao.md); everything you need is in this repo.
 - Works with any BLE HID host (PC, iOS, Android, Switch, Dreamcast via iBlueControlMod)
 - Two switchable identities for broad host compatibility: **Xbox** (default), or a plain **generic BLE HID gamepad** (labeled "Dreamcast" — neutral identity, not controller emulation)
 - VMU LCD display: profile splash, rotating pulsar with battery indicator, mode splashes
+- Host integration service: a program on the host can draw on the VMU LCD and read and write the docked VMU's saves over BLE — an open, documented protocol ([spec](docs/host_integration.md))
 - 60Hz controller polling with continuous BLE reporting
 - Pairing persists across power cycles (flash-based bonding)
 - Battery powered (~7-8 hrs on 500mAh, ~14-16 hrs on 1000mAh) with sleep/wake support
@@ -137,7 +138,7 @@ If you need RTT debug logging, flash via SWD instead. The SoftDevice must be fla
 
 **Sync button:**
 - Short press → wake / request reconnect
-- Hold 2s → clear bond and start pairing
+- Hold 2s → pairing mode (keeps the current bond until a new host pairs)
 - Hold 3.5s **while holding the controller's Start** → firmware update (OTA) mode
 - Tap, tap, then hold 3.5s → the same update mode, no controller needed
 - **Tap once, then hold 3.5s → browser configuration mode ([remap your buttons](docs/users_guide.md#remapping-buttons-from-your-browser))**
@@ -154,7 +155,7 @@ See the [user guide](docs/users_guide.md) for all screens, profile choice, and t
 
 ### Enclosure
 
-A 3D-printable VMU-shaped case is included in [`3d_files/`](3d_files/). See [3d_files/README.md](3d_files/README.md) for print tips and attribution.
+A 3D-printable VMU-shaped case is included in [`hardware/enclosure/`](hardware/enclosure/). See [hardware/enclosure/README.md](hardware/enclosure/README.md) for print tips and attribution.
 
 <table>
   <tr>
@@ -239,6 +240,7 @@ inner loop to run after every change; `ci.sh` is the gate before a commit.
 | [Pin Mapping](docs/pin_mapping.md) | Complete wiring reference for all three boards |
 | [Flash Commands](docs/flash-commands.md) | Flashing and debugging cheat sheet |
 | [Maple Bus Protocol](docs/maple_bus_protocol.md) | Protocol reference and implementation details |
+| [Host Integration](docs/host_integration.md) | The BLE service a host uses to drive the VMU's screen and saves |
 | [Input Quality Testing](docs/input_quality_testing.md) | Measuring latency and packet loss |
 | [Battery Optimization](docs/battery_optimization.md) | Power management strategy |
 | [Learnings](docs/learnings.md) | Implementation lessons learned |
@@ -264,4 +266,4 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for build inst
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0 or later](LICENSE). 3D model files have separate licensing — see [3d_files/README.md](3d_files/README.md).
+This project is licensed under the [GNU General Public License v3.0 or later](LICENSE). 3D model files have separate licensing — see [hardware/enclosure/README.md](hardware/enclosure/README.md).

@@ -68,7 +68,11 @@ Don't worry about getting everything perfect — feedback on PRs is part of the 
 - **`src/`** — Firmware: BLE stack, Maple Bus GPIO, board support, button handling.
 - **`src/board/`** — Board-specific pin mappings, LEDs, battery, and power management.
 - **`docs/`** — Build guides (`docs/build/`), user guide, protocol reference, learnings; `docs/MOC.md` is the index.
-- **`3d_files/`** — Enclosure models (not covered by GPL, see [3d_files/README.md](3d_files/README.md)).
+- **`hardware/enclosure/`** — Enclosure models (not covered by GPL, see [hardware/enclosure/README.md](hardware/enclosure/README.md)).
+- **`scripts/`, `tools/`, `tests/`** — host-side scripts, the VMU animation's render pipeline (`tools/vmu-pulsar/`), and capture references.
+
+The Pulsar v1 board design (KiCad project and fab outputs) and the maintainer's browser DFU
+test tools are not published.
 
 ### Decision records
 
@@ -95,7 +99,7 @@ The firmware is designed to make adding new boards straightforward. Each board g
 
 We're also open to supporting other chips in the nRF52 family (nRF52833, nRF5340) — the Embassy and SoftDevice ecosystem covers these, so much of the firmware would carry over. Support for non-Nordic chips (ESP32, RP2040) would be a bigger effort since it means replacing the BLE stack, but the `maple-protocol` crate is fully portable.
 
-The current Maple Bus implementation (`src/maple/gpio_bus.rs`) uses CPU bit-banging with bulk sampling because the nRF52840 doesn't have a hardware peripheral suited to the 2Mbps alternating-clock protocol. Other chips may handle this differently — for example, the RP2040's PIO state machines could implement the protocol timing in hardware rather than software. A port would replace `gpio_bus.rs` while keeping the rest of the stack intact.
+The Maple Bus implementation (`src/maple/gpio_bus.rs`) bit-bangs transmission on the CPU, because the nRF52840 has no hardware peripheral suited to the 2Mbps alternating-clock protocol. Reception differs by board: Pulsar v1 and the XIAO capture replies on a pair of SPIM instances via EasyDMA (`src/maple/spim_capture.rs`), which keeps reply capture off the cycle-counted path; the DK has no capture backend and keeps the CPU sampling loop. Other chips may handle this differently — for example, the RP2040's PIO state machines could implement the protocol timing in hardware rather than software. A port would replace `gpio_bus.rs` while keeping the rest of the stack intact.
 
 If you're thinking about a port, open an issue first so we can discuss the approach.
 

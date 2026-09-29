@@ -36,6 +36,8 @@ Three boards, three build paths. Pick the one that matches what you have:
 - [`input_quality_testing.md`](input_quality_testing.md) — measuring packet loss and
   input latency; the issue #5 investigation end to end
 - [`test_plan.md`](test_plan.md) — the full adapter test plan
+- [`host_integration.md`](host_integration.md) — the vendor GATT service a host uses
+  to drive the docked VMU — LCD frames in both wire shapes, and the VMU storage protocol v1
 
 ## Power
 

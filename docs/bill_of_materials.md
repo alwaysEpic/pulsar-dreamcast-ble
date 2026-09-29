@@ -83,4 +83,4 @@ same. Pin assignments for all three boards are in [pin mapping](pin_mapping.md).
 
 | Component | Notes | Link |
 |-----------|-------|------|
-| VMU enclosure (3D printed) | See print tips in 3d_files/ | [3d_files/README.md](../3d_files/README.md) |
+| VMU enclosure (3D printed) | See print tips in hardware/enclosure/ | [hardware/enclosure/README.md](../hardware/enclosure/README.md) |

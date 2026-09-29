@@ -234,14 +234,15 @@ controller is unpowered and the light stays red. **Pair first.**
    green.
 3. Test the stick and a few buttons in a gamepad tester before closing anything up.
 
-If it never pairs, hold sync for 2 seconds to clear the bond and re-enter pairing mode.
+If it never pairs, hold sync for 2 seconds to re-enter pairing mode. The existing bond is
+kept until a new host finishes pairing, so an abandoned window leaves it as it was.
 
 ---
 
 ## 7. Enclosure
 
-A 3D-printable VMU-shaped shell is in [`3d_files/`](../../3d_files/) — see
-[`3d_files/README.md`](../../3d_files/README.md) for which family fits this build and for
+A 3D-printable VMU-shaped shell is in [`hardware/enclosure/`](../../hardware/enclosure/) — see
+[`hardware/enclosure/README.md`](../../hardware/enclosure/README.md) for which family fits this build and for
 print settings.
 
 The controller shell needs a small trim for cable clearance, and the cable routes through
