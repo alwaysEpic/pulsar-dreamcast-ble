@@ -25,7 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: [board-dk, board-xiao, board-pulsarv1]
+        # `poll-period-debug` is implied by no board and built by no release
+        # variant, so without its own entry here `src/poll_period.rs` is never
+        # compiled in CI and rots unnoticed. Mirrors scripts/ci.sh.
+        features:
+          [board-dk, board-xiao, board-pulsarv1, "board-pulsarv1,poll-period-debug"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,6 +50,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cd maple-protocol && cargo clippy --target x86_64-unknown-linux-gnu -- -W clippy::all -W clippy::pedantic
 
+  test-hid-capture:
+    name: Test (bench-tool decoders)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r tests/hid_capture/requirements.txt
+      # The bench tool's arithmetic decides what a gate run is taken to have
+      # measured. A diagnostic build shipped a reading of 45,636 polls with zero
+      # failures that never happened, because a counter reset was subtracted as
+      # a wrap — these hold the decoder to reporting nothing instead.
+      - run: pytest tests/hid_capture -v
+      # The reference reader's protocol half: STATUS/DATA decoding and the
+      # card fingerprint, the same contract the dongle is held to. Stdlib-only
+      # at import (bleak loads lazily), so the same pytest install covers it.
+      - run: pytest tests/vmu_read -v
+
   test:
     name: Test (maple-protocol)
     runs-on: ubuntu-latest
@@ -54,6 +77,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cd maple-protocol && cargo test --target x86_64-unknown-linux-gnu
+
+  test-battery-policy:
+    name: Test (battery-policy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cd battery-policy && cargo test --target x86_64-unknown-linux-gnu
 
   build:
     name: Build (${{ matrix.features }})
@@ -78,6 +110,11 @@ jobs:
       # sampling loop or the hardware TX path regressed — the same check
       # scripts/ci.sh runs locally, so a green badge means the same thing.
       - name: Timing invariants
-        run: ./scripts/check_timing_invariants.sh
-             target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble
-             "${{ matrix.features }}"
+        # The DK samples with the CPU loop (check 1 as always); the carrier and
+        # the XIAO capture on the SPIM pair, so for them the loop's
+        # presence is the failure.
+        run: |
+          case "${{ matrix.features }}" in *board-dk*) mode=cpu ;; *) mode=spim ;; esac
+          ./scripts/check_timing_invariants.sh \
+            target/thumbv7em-none-eabihf/release/pulsar-dreamcast-ble \
+            "${{ matrix.features }}" "$mode"

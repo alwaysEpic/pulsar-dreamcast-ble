@@ -41,11 +41,25 @@ fail() { echo -e "${RED}FAIL${NC} $1"; exit 1; }
 # fastest and its errors block the firmware crate anyway.
 echo "=== maple-protocol: tests ==="
 (cd maple-protocol && cargo test -q) && pass "tests" || fail "tests"
+# The block decoder's statistics are a feature; the reference test asserts
+# them only when it is on, so both configurations run.
+(cd maple-protocol && cargo test -q --features decode-stats) \
+    && pass "tests (decode-stats)" || fail "tests (decode-stats)"
+
+# battery-policy: the other host-native crate. It holds the rule that decides
+# when a unit powers itself off, and the firmware crate cannot test it.
+echo ""
+echo "=== battery-policy: tests ==="
+(cd battery-policy && cargo test -q) && pass "tests (battery-policy)" || fail "tests (battery-policy)"
+(cd battery-policy && cargo clippy -q --all-targets -- -D warnings) \
+    && pass "clippy (battery-policy)" || fail "clippy (battery-policy)"
 
 echo ""
 echo "=== maple-protocol: clippy ==="
 (cd maple-protocol && cargo clippy -q --all-targets -- -D warnings) \
     && pass "clippy (maple-protocol)" || fail "clippy (maple-protocol)"
+(cd maple-protocol && cargo clippy -q --all-targets --features decode-stats -- -D warnings) \
+    && pass "clippy (maple-protocol, decode-stats)" || fail "clippy (maple-protocol, decode-stats)"
 
 echo ""
 echo "=== firmware: clippy (board-$BOARD) ==="

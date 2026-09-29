@@ -1,0 +1,3 @@
+# The poll-period decoder tests import scripts/hid_capture.py directly and
+# exercise only its pure-Python analysis half, so no `hid` and no device.
+pytest>=7.0
