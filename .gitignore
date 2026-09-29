@@ -8,7 +8,10 @@ vendor/
 *.rar
 *.hex
 *.uf2
-tools/
+tools/*
+!tools/vmu-pulsar/
+# VMU pulsar renders are regenerable (tools/vmu-pulsar/README.md)
+tools/vmu-pulsar/renders/
 __pycache__/
 *.pyc
 rtt_logs/
@@ -18,6 +21,9 @@ rtt_logs/
 
 # Scratch: screen recordings, ad-hoc test files
 *.mov
+# Demo/bench videos stay local (734 MB). Explicit, since *.mov only catches the .MOV files
+# while core.ignorecase is on.
+docs/videos/
 /test
 
 # PCB/fab: commit the extracted dirs, not the zip bundles; skip the obsolete
@@ -25,8 +31,11 @@ rtt_logs/
 *.zip
 *.lck
 docs/LIB_TPS61099DRVR/
-pulsar-dreamcast-carrier/pulsar-dreamcast-carrier-backups/
+hardware/carrier/pulsar-dreamcast-carrier-backups/
 
 # Secure DFU bootloader build products (sources in bootloader/ are tracked)
 bootloader/_out/
 bootloader/pulsar_s140_ble/armgcc/_build/
+
+# Release artifacts: reproducible from source, and some are large.
+/dist/
